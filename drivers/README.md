@@ -62,6 +62,7 @@
 - [storage/ided](storage/ided/) - PATA (IDE) driver
 - [storage/nvmed](storage/nvmed/) - NVMe driver
 - [storage/virtio-blkd](storage/virtio-blkd/) - VirtIO block device driver
+- [storage/virtio-fsd](storage/virtio-fsd/) - VirtIO shared file system driver
 - [storage/usbscsid](storage/usbscsid/) - USB SCSI driver
 
 ### Graphics

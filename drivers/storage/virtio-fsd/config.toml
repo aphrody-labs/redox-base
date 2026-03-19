@@ -1,0 +1,6 @@
+[[drivers]]
+name = "virtio-fs"
+class = 0x01
+vendor = 0x1AF4
+device = 0x105A
+command = ["virtio-fsd"]

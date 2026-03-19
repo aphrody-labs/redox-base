@@ -889,6 +889,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a06f77d526c1a601b7c4cdd98f54b5eaabffc14d5f2f0296febdc7f357c6d3ba"
 
 [[package]]
+name = "fuse-abi"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19976a6994b6ebda45b4d02a46dc5a9b2af17d46a43d9f76404c333f0b38f7d7"
+dependencies = [
+ "num_enum",
+ "zerocopy",
+ "zerocopy-derive",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1554,6 +1565,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2826,6 +2858,26 @@ dependencies = [
  "redox_syscall 0.9.5",
  "static_assertions",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "virtio-fsd"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "common",
+ "daemon",
+ "fuse-abi",
+ "futures",
+ "libredox",
+ "log",
+ "pcid",
+ "redox-scheme",
+ "redox_event",
+ "redox_syscall 0.7.3",
+ "thiserror 2.0.18",
+ "virtio-core",
+ "zerocopy",
 ]
 
 [[package]]
