@@ -15,6 +15,7 @@ daemon = { path = "../../../daemon" }
 virtio-core = { path = "../../virtio-core" }
 pcid = { path = "../../pcid" }
 common = { path = "../../common" }
+scheme-utils = { path = "../../../scheme-utils" }
 
 log.workspace = true
 libredox.workspace = true

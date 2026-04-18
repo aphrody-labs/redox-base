@@ -3,7 +3,7 @@ use redox_scheme::scheme::{SchemeAsync, SchemeState};
 use redox_scheme::{
     CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
 };
-use std::collections::BTreeMap;
+use scheme_utils::HandleMap;
 use std::io;
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, ENOENT, EOPNOTSUPP, ESPIPE, Error, Result};
@@ -24,8 +24,7 @@ enum Handle {
 
 pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
     socket: &'sock Socket,
-    next_id: usize, // TODO: atomic?
-    handles: BTreeMap<usize, Handle>,
+    handles: HandleMap<Handle>,
     fuse_session: FuseSession<T>,
 }
 
@@ -38,8 +37,7 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
     pub fn new(socket: &'sock Socket, fuse_session: FuseSession<T>) -> Self {
         let inner = VirtioFsSchemeInner {
             socket,
-            next_id: 0,
-            handles: BTreeMap::new(),
+            handles: HandleMap::new(),
             fuse_session,
         };
 
@@ -52,7 +50,7 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
     pub fn on_close(&mut self, id: usize) {
         // TODO: send 'FUSE_RELEASE' and 'FUSE_RELEASEDIR', and
         // 'FUSE_FORGET' (for all types) based on close handle's type
-        if self.inner.handles.remove(&id).is_none() {
+        if self.inner.handles.remove(id).is_none() {
             warn!("virtio-fsd: on_close: key '{id}' was not found in handles");
         };
     }
@@ -119,11 +117,8 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
 
 impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     fn scheme_root(&mut self) -> Result<usize> {
-        // `scheme_root` creates a scheme root handles and returns its corresponding ID
-        let new_id = self.next_id;
-        self.handles.insert(new_id, Handle::SchemeRoot);
-        self.next_id += 1;
-        Ok(new_id)
+        let id = self.handles.insert(Handle::SchemeRoot);
+        Ok(id)
     }
 
     async fn openat(
@@ -145,7 +140,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
         // TODO: revalidate path evaluation
         if !path.starts_with("/") {
-            match self.handles.get(&fd).ok_or(Error::new(EBADF))? {
+            match self.handles.get(fd)? {
                 Handle::File { .. } => return Err(Error::new(ENOTDIR)),
                 Handle::Directory { nodeid, .. } => {
                     node_id = *nodeid;
@@ -197,19 +192,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if flags & O_STAT == O_STAT {
-            let new_fd = self.next_id;
-
-            self.handles.insert(
-                new_fd,
-                Handle::StatOnly {
-                    nodeid: node_id,
-                    dir: is_dir,
-                },
-            );
-            self.next_id += 1;
+            let fd = self.handles.insert(Handle::StatOnly {
+                nodeid: node_id,
+                dir: is_dir,
+            });
 
             return Ok(OpenResult::ThisScheme {
-                number: new_fd,
+                number: fd,
                 flags: NewFdFlags::POSITIONED,
             });
         }
@@ -218,8 +207,6 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
         match self.fuse_session.open(node_id, flags as u32, is_dir).await {
             Ok(response) => {
-                let new_fd = self.next_id;
-
                 let fh = response
                     .out_payload
                     .ok_or_else(|| {
@@ -240,11 +227,10 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                     }
                 };
 
-                self.handles.insert(new_fd, handle);
-                self.next_id += 1;
+                let fd = self.handles.insert(handle);
 
                 return Ok(OpenResult::ThisScheme {
-                    number: new_fd,
+                    number: fd,
                     flags: NewFdFlags::POSITIONED,
                 });
             }
@@ -353,11 +339,9 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn fstat(&mut self, id: usize, stat: &mut Stat, ctx: &CallerCtx) -> Result<()> {
-        let (nodeid, fh) = match self.handles.get(&id) {
-            Some(Handle::File { nodeid, fh } | Handle::Directory { nodeid, fh }) => {
-                (*nodeid, Some(*fh))
-            }
-            Some(Handle::StatOnly { nodeid, .. }) => (*nodeid, None),
+        let (nodeid, fh) = match self.handles.get(id)? {
+            Handle::File { nodeid, fh } | Handle::Directory { nodeid, fh } => (*nodeid, Some(*fh)),
+            Handle::StatOnly { nodeid, .. } => (*nodeid, None),
             _ => {
                 warn!("virtio-fsd: fstat is called on an invalid id: {id}");
                 return Err(Error::new(EBADF));
@@ -462,8 +446,8 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         mut buf: DirentBuf<&'buf mut [u8]>,
         opaque_offset: u64,
     ) -> Result<DirentBuf<&'buf mut [u8]>> {
-        let (nodeid, fh) = match self.handles.get(&id) {
-            Some(Handle::File { nodeid, fh } | Handle::Directory { nodeid, fh }) => (*nodeid, *fh),
+        let (nodeid, fh) = match self.handles.get(id)? {
+            Handle::File { nodeid, fh } | Handle::Directory { nodeid, fh } => (*nodeid, *fh),
             _ => {
                 warn!("virtio-fsd: getdents was called with invalid id: {id}");
                 return Err(Error::new(EBADF));
