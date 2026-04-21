@@ -1,9 +1,10 @@
 use fuse_abi::linux::{
-    FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_ROOT_ID,
-    fuse_attr_out, fuse_entry_out, fuse_getattr_in, fuse_in_header, fuse_init_in, fuse_init_out,
-    fuse_opcode, fuse_open_in, fuse_open_out, fuse_out_header, fuse_read_in,
+    FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+    FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out, fuse_entry_out,
+    fuse_getattr_in, fuse_in_header, fuse_init_in, fuse_init_out, fuse_opcode, fuse_open_in,
+    fuse_open_out, fuse_out_header, fuse_read_in,
 };
-use log::warn;
+use log::{info, warn};
 use std::{mem, sync::atomic::AtomicU64};
 use thiserror::Error;
 
@@ -94,7 +95,7 @@ where
             padding: 0,
         };
 
-        let flags = FUSE_MAX_PAGES;
+        let flags: u64 = FUSE_MAX_PAGES as u64;
 
         let init_in = fuse_init_in {
             major: FUSE_KERNEL_VERSION,
@@ -157,6 +158,23 @@ where
             ret.init.flags2,
             ret.init.max_stack_depth,
         );
+
+        // TODO: check response flags and change behaviour accordingly
+
+        let init_flags = ret.init.flags as u64 | (ret.init.flags2 as u64) << 32;
+
+        let use_local_parent_resolution = (init_flags & FUSE_NO_EXPORT_SUPPORT) != 0
+            || (init_flags & FUSE_EXPORT_SUPPORT as u64) == 0;
+
+        // currently we use parent_map for both scenarios, as
+        // virtiofsd does not support `FUSE_NO_EXPORT_SUPPORT` flag
+        if use_local_parent_resolution {
+            info!(
+                "Host disabled export support (or is old). lookup('..') must be resolved locally."
+            );
+        } else {
+            info!("Host enabled full export support. lookup('..') can be forwarded to host.");
+        }
 
         return ret;
     }

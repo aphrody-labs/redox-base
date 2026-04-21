@@ -4,7 +4,9 @@ use redox_scheme::{
     CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
 };
 use scheme_utils::HandleMap;
+use std::collections::BTreeMap;
 use std::io;
+use std::time::{Duration, Instant};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, ENOENT, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
@@ -13,7 +15,7 @@ use syscall::{
     MapFlags, MunmapFlags, O_STAT, Stat, StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
 };
 
-use crate::fuse::{FUSE_ROOT_ID, FuseError, FuseSession, FuseTransporter};
+use crate::fuse::{FUSE_ROOT_ID, FuseAttr, FuseError, FuseSession, FuseTransporter};
 
 enum Handle {
     File { nodeid: u64, fh: u64 },
@@ -26,6 +28,12 @@ pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
     socket: &'sock Socket,
     handles: HandleMap<Handle>,
     fuse_session: FuseSession<T>,
+    /// Maps `child nodeid` -> `parent nodeid`. This is used to resolve `nodeid` for `..`.
+    parent_map: BTreeMap<u64, u64>,
+    /// Directory cache: Maps `parent nodeid` to a map of its `child name as Vec<u8>` -> `(child nodeid, expiration)`.
+    dcache: BTreeMap<u64, BTreeMap<Vec<u8>, (u64, Instant)>>,
+    /// Attribute cache: Maps `nodeid` -> `(attrs, expiration)`.
+    acache: BTreeMap<u64, (FuseAttr, Instant)>,
 }
 
 pub struct VirtioFsScheme<'sock, T: FuseTransporter> {
@@ -35,10 +43,18 @@ pub struct VirtioFsScheme<'sock, T: FuseTransporter> {
 
 impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
     pub fn new(socket: &'sock Socket, fuse_session: FuseSession<T>) -> Self {
+        // we don't have the authority to look into the parent of root,
+        // hence when cwd is `/scheme/virtio-fsd`, `ls ..` is same as `ls .`.
+        let mut parent_map = BTreeMap::new();
+        parent_map.insert(FUSE_ROOT_ID, FUSE_ROOT_ID);
+
         let inner = VirtioFsSchemeInner {
+            fuse_session,
             socket,
             handles: HandleMap::new(),
-            fuse_session,
+            parent_map,
+            dcache: BTreeMap::new(),
+            acache: BTreeMap::new(),
         };
 
         Self {
@@ -50,6 +66,9 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
     pub fn on_close(&mut self, id: usize) {
         // TODO: send 'FUSE_RELEASE' and 'FUSE_RELEASEDIR', and
         // 'FUSE_FORGET' (for all types) based on close handle's type
+        // - parent_map cleanup
+        // - dcache cleanup
+        // - acache cleanup
         if self.inner.handles.remove(id).is_none() {
             warn!("virtio-fsd: on_close: key '{id}' was not found in handles");
         };
@@ -129,8 +148,6 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         fcntl_flags: u32,
         ctx: &CallerCtx,
     ) -> Result<OpenResult> {
-        warn!("virtio-fsd: openat called with fd '{fd}' and path '{path}'");
-
         if ctx.uid != 0 {
             return Err(Error::new(EACCES));
         }
@@ -154,16 +171,26 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             };
         }
 
-        // Do fuse lookup to find the nodeid of the requested file/dir relative to current nodeid.
-
         if !path.is_empty() && path != "/" {
             for name in path.split("/") {
                 if name.is_empty() || name == "." {
                     continue;
                 }
 
-                // TODO: implement a ddirectory cache for performance and parent resolution
-                if name == ".." && node_id == FUSE_ROOT_ID {
+                if name == ".." {
+                    node_id = *self.parent_map.get(&node_id).unwrap_or(&FUSE_ROOT_ID);
+                    is_dir = true;
+                    continue;
+                }
+
+                if let Some(child_map) = self.dcache.get(&node_id)
+                    && let Some((child_nodeid, dexp)) = child_map.get(name.as_bytes())
+                    && Instant::now() < *dexp
+                    && let Some((attr, aexp)) = self.acache.get(child_nodeid)
+                    && Instant::now() < *aexp
+                {
+                    node_id = *child_nodeid;
+                    is_dir = (attr.mode as u16 & MODE_TYPE) == MODE_DIR;
                     continue;
                 }
 
@@ -174,7 +201,20 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                             return Error::new(EIO);
                         })?;
 
-                        // TODO: save attrs and valid durations, etc.
+                        self.parent_map.insert(payload.nodeid, node_id);
+
+                        let owned_name = name.as_bytes().to_vec();
+                        let dexp = Instant::now()
+                            + Duration::new(payload.entry_valid, payload.entry_valid_nsec);
+                        self.dcache
+                            .entry(node_id)
+                            .or_insert_with(BTreeMap::new)
+                            .insert(owned_name, (payload.nodeid, dexp));
+
+                        let aexp = Instant::now()
+                            + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
+                        self.acache.insert(payload.nodeid, (payload.attr, aexp));
+
                         node_id = payload.nodeid;
                         is_dir = (payload.attr.mode as u16 & MODE_TYPE) == MODE_DIR;
                     }
@@ -348,53 +388,59 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
         };
 
-        match self.fuse_session.getattr(nodeid, fh).await {
-            Ok(response) => {
-                let getattr_out = response.out_payload.ok_or_else(|| {
-                    warn!("virtio-fsd: FUSE GETATTR response is missing the payload.");
-                    Error::new(EIO)
-                })?;
+        let attrs = if let Some((attr, exp)) = self.acache.get(&nodeid)
+            && Instant::now() < *exp
+        {
+            *attr
+        } else {
+            match self.fuse_session.getattr(nodeid, fh).await {
+                Ok(response) => {
+                    let payload = response.out_payload.ok_or_else(|| {
+                        warn!("virtio-fsd: FUSE GETATTR response is missing the payload for nodeid '{nodeid}' - fh '{fh:?}'.");
+                        Error::new(EIO)
+                    })?;
 
-                // TODO:
-                // pub attr_valid: u64, /* Cache timeout for the attributes */
-                // pub attr_valid_nsec: u32,
+                    let exp =
+                        Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
+                    self.acache.insert(nodeid, (payload.attr, exp));
 
-                let host_attr = getattr_out.attr;
-
-                *stat = Stat {
-                    // the device ID of the filesystem itself. we are the filesystem, so we just invent a unique id.
-                    // if multiple instances of this filesystem are possible, an atomically incremented value is needed.
-                    st_dev: 1,
-                    st_ino: host_attr.ino,
-                    st_mode: host_attr.mode as u16,
-
-                    st_nlink: host_attr.nlink,
-                    st_uid: host_attr.uid,
-                    st_gid: host_attr.gid,
-                    st_size: host_attr.size,
-                    st_blksize: host_attr.blksize,
-                    st_blocks: host_attr.blocks,
-
-                    st_atime: host_attr.atime,
-                    st_atime_nsec: host_attr.atimensec,
-                    st_mtime: host_attr.mtime,
-                    st_mtime_nsec: host_attr.mtimensec,
-                    st_ctime: host_attr.ctime,
-                    st_ctime_nsec: host_attr.ctimensec,
-                };
-
-                return Ok(());
+                    payload.attr
+                }
+                Err(err) => match err {
+                    FuseError::HostError(code) => {
+                        return Err(Error::new((-code) as i32));
+                    }
+                    FuseError::Transport(_) | FuseError::MalformedPayload => {
+                        warn!("virtio-fsd: FUSE GETATTR transport/protocol err: {}", err);
+                        return Err(Error::new(EIO));
+                    }
+                },
             }
-            Err(err) => match err {
-                FuseError::HostError(code) => {
-                    return Err(Error::new((-code) as i32));
-                }
-                FuseError::Transport(_) | FuseError::MalformedPayload => {
-                    warn!("virtio-fsd: FUSE GETATTR transport/protocol err: {}", err);
-                    return Err(Error::new(EIO));
-                }
-            },
-        }
+        };
+
+        *stat = Stat {
+            // the device ID of the filesystem itself. we are the filesystem, so we just invent a unique id.
+            // if multiple instances of this filesystem are possible, an atomically incremented value is needed.
+            st_dev: 1,
+            st_ino: attrs.ino,
+            st_mode: attrs.mode as u16,
+
+            st_nlink: attrs.nlink,
+            st_uid: attrs.uid,
+            st_gid: attrs.gid,
+            st_size: attrs.size,
+            st_blksize: attrs.blksize,
+            st_blocks: attrs.blocks,
+
+            st_atime: attrs.atime,
+            st_atime_nsec: attrs.atimensec,
+            st_mtime: attrs.mtime,
+            st_mtime_nsec: attrs.mtimensec,
+            st_ctime: attrs.ctime,
+            st_ctime_nsec: attrs.ctimensec,
+        };
+
+        return Ok(());
     }
 
     async fn fstatvfs(&mut self, id: usize, stat: &mut StatVfs, ctx: &CallerCtx) -> Result<()> {
