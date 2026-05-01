@@ -11,16 +11,18 @@ use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, ENOENT, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EACCES, EAGAIN, EBADMSG, EINTR, EIO, ENOTDIR, EWOULDBLOCK, EventFlags, MODE_DIR, MODE_TYPE,
-    MapFlags, MunmapFlags, O_STAT, Stat, StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
+    EACCES, EAGAIN, EBADMSG, EINTR, EIO, EISDIR, ELOOP, ENOTDIR, EROFS, EWOULDBLOCK, EventFlags,
+    MODE_DIR, MODE_SYMLINK, MODE_TYPE, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind,
+    StdFsCallMeta, TimeSpec,
 };
 
 use crate::fuse::{FUSE_ROOT_ID, FuseAttr, FuseError, FuseSession, FuseTransporter};
+use crate::linux_abi;
 
 enum Handle {
     File { nodeid: u64, fh: u64 },
     Directory { nodeid: u64, fh: u64 },
-    StatOnly { nodeid: u64, dir: bool },
+    StatOnly { nodeid: u64, mode: u16 },
     SchemeRoot,
 }
 
@@ -152,20 +154,29 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             return Err(Error::new(EACCES));
         }
 
+        if (flags & syscall::O_CREAT) != 0 {
+            warn!("virtio-fsd: O_CREAT requested but FUSE_CREATE is not implemented yet.");
+            return Err(Error::new(EROFS));
+        }
+
         let mut node_id = FUSE_ROOT_ID;
-        let mut is_dir = node_id == FUSE_ROOT_ID;
+        let mut node_mode = MODE_DIR;
 
         // TODO: revalidate path evaluation
         if !path.starts_with("/") {
             match self.handles.get(fd)? {
-                Handle::File { .. } => return Err(Error::new(ENOTDIR)),
+                Handle::File { nodeid, fh } => {
+                    // TODO
+                    warn!("virtio-fsd: file op not suported yet - nodeid: '{nodeid}' - fh: '{fh}'");
+                    return Err(Error::new(EOPNOTSUPP));
+                }
                 Handle::Directory { nodeid, .. } => {
                     node_id = *nodeid;
-                    is_dir = true;
+                    node_mode = MODE_DIR;
                 }
-                Handle::StatOnly { nodeid, dir } => {
+                Handle::StatOnly { nodeid, mode } => {
                     node_id = *nodeid;
-                    is_dir = *dir;
+                    node_mode = *mode;
                 }
                 Handle::SchemeRoot => {}
             };
@@ -179,7 +190,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
                 if name == ".." {
                     node_id = *self.parent_map.get(&node_id).unwrap_or(&FUSE_ROOT_ID);
-                    is_dir = true;
+                    node_mode = MODE_DIR;
                     continue;
                 }
 
@@ -190,10 +201,11 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                     && Instant::now() < *aexp
                 {
                     node_id = *child_nodeid;
-                    is_dir = (attr.mode as u16 & MODE_TYPE) == MODE_DIR;
+                    node_mode = attr.mode as u16 & MODE_TYPE;
                     continue;
                 }
 
+                // cache miss
                 match self.fuse_session.lookup(node_id, name).await {
                     Ok(response) => {
                         let payload = response.out_payload.ok_or_else(|| {
@@ -216,7 +228,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                         self.acache.insert(payload.nodeid, (payload.attr, aexp));
 
                         node_id = payload.nodeid;
-                        is_dir = (payload.attr.mode as u16 & MODE_TYPE) == MODE_DIR;
+                        node_mode = payload.attr.mode as u16 & MODE_TYPE;
                     }
                     Err(err) => match err {
                         FuseError::HostError(code) => {
@@ -231,10 +243,24 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
         }
 
-        if flags & O_STAT == O_STAT {
+        if node_mode == MODE_SYMLINK {
+            // fall thorugh if stat only
+            if flags & syscall::O_STAT == 0 {
+                if flags & syscall::O_NOFOLLOW != 0 {
+                    warn!("virtio-fsd: O_NOFOLLOW enforced. Refusing to open symlink.");
+                    return Err(Error::new(ELOOP));
+                } else {
+                    // TODO: implement FUSE_READLINK
+                    warn!("virtio-fsd: symlink following not implemented yet.");
+                    return Err(Error::new(EOPNOTSUPP));
+                }
+            }
+        }
+
+        if flags & syscall::O_STAT != 0 {
             let fd = self.handles.insert(Handle::StatOnly {
                 nodeid: node_id,
-                dir: is_dir,
+                mode: node_mode,
             });
 
             return Ok(OpenResult::ThisScheme {
@@ -243,9 +269,11 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             });
         }
 
-        // TODO: 'O_CREAT'
+        let is_dir = node_mode == MODE_DIR;
 
-        match self.fuse_session.open(node_id, flags as u32, is_dir).await {
+        let open_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
+
+        match self.fuse_session.open(node_id, open_flags, is_dir).await {
             Ok(response) => {
                 let fh = response
                     .out_payload
@@ -492,54 +520,59 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         mut buf: DirentBuf<&'buf mut [u8]>,
         opaque_offset: u64,
     ) -> Result<DirentBuf<&'buf mut [u8]>> {
-        let (nodeid, fh) = match self.handles.get(id)? {
-            Handle::File { nodeid, fh } | Handle::Directory { nodeid, fh } => (*nodeid, *fh),
+        match self.handles.get(id)? {
+            Handle::File { nodeid, fh } => {
+                warn!("file op not suported yet - nodeid: '{nodeid}' - fh: '{fh}'");
+                return Err(Error::new(EBADF));
+            }
+            Handle::Directory { nodeid, fh } => {
+                let (nodeid, fh) = (*nodeid, *fh);
+                match self.fuse_session.readdir(nodeid, fh, opaque_offset).await {
+                    Ok(response) => {
+                        if let Some(payload) = response.out_payload {
+                            for dir in payload.into_iter(response.written_len as usize) {
+                                let name = match str::from_utf8(dir.name) {
+                                    Ok(n) => n,
+                                    Err(err) => {
+                                        warn!(
+                                            "virtio-fsd: FUSE READDIR: name is not valid to utf8: {}",
+                                            err
+                                        );
+                                        return Err(Error::new(EBADMSG));
+                                    }
+                                };
+
+                                let kind = DirentKind::try_from_raw(dir.typ as u8)
+                                    .unwrap_or(DirentKind::Unspecified);
+
+                                buf.entry(DirEntry {
+                                    inode: dir.ino,
+                                    next_opaque_id: dir.off,
+                                    name,
+                                    kind,
+                                })?;
+                            }
+                            Ok(buf)
+                        } else {
+                            warn!("virtio-fsd: FUSE READDIR returned empty payload.");
+                            Err(Error::new(EIO))
+                        }
+                    }
+                    Err(err) => match err {
+                        FuseError::HostError(code) => {
+                            return Err(Error::new((-code) as i32));
+                        }
+                        FuseError::Transport(_) | FuseError::MalformedPayload => {
+                            warn!("virtio-fsd: FUSE READDIR transport/protocol err: {}", err);
+                            return Err(Error::new(EIO));
+                        }
+                    },
+                }
+            }
             _ => {
                 warn!("virtio-fsd: getdents was called with invalid id: {id}");
                 return Err(Error::new(EBADF));
             }
-        };
-
-        match self.fuse_session.readdir(nodeid, fh, opaque_offset).await {
-            Ok(response) => {
-                if let Some(payload) = response.out_payload {
-                    for dir in payload.into_iter(response.written_len as usize) {
-                        let name = match str::from_utf8(dir.name) {
-                            Ok(n) => n,
-                            Err(err) => {
-                                warn!(
-                                    "virtio-fsd: FUSE READDIR: name is not valid to utf8: {}",
-                                    err
-                                );
-                                return Err(Error::new(EBADMSG));
-                            }
-                        };
-
-                        let kind = DirentKind::try_from_raw(dir.typ as u8)
-                            .unwrap_or(DirentKind::Unspecified);
-
-                        buf.entry(DirEntry {
-                            inode: dir.ino,
-                            next_opaque_id: dir.off,
-                            name,
-                            kind,
-                        })?;
-                    }
-                    Ok(buf)
-                } else {
-                    warn!("virtio-fsd: FUSE READDIR returned empty payload.");
-                    Err(Error::new(EIO))
-                }
-            }
-            Err(err) => match err {
-                FuseError::HostError(code) => {
-                    return Err(Error::new((-code) as i32));
-                }
-                FuseError::Transport(_) | FuseError::MalformedPayload => {
-                    warn!("virtio-fsd: FUSE READDIR transport/protocol err: {}", err);
-                    return Err(Error::new(EIO));
-                }
-            },
         }
     }
 
@@ -574,4 +607,39 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         );
         Err(Error::new(EOPNOTSUPP))
     }
+}
+
+fn translate_redox_flags_to_fuse(redox_flags: usize, is_dir: bool) -> Result<u32> {
+    let accmode = redox_flags & syscall::O_ACCMODE;
+
+    if is_dir && accmode != syscall::O_RDONLY {
+        return Err(Error::new(EISDIR));
+    }
+
+    if (redox_flags & syscall::O_DIRECTORY != 0) && !is_dir {
+        return Err(Error::new(ENOTDIR));
+    }
+
+    let mut linux_flags: u32 = match accmode {
+        syscall::O_RDWR => linux_abi::O_RDWR,
+        syscall::O_WRONLY => linux_abi::O_WRONLY,
+        _ => linux_abi::O_RDONLY,
+    };
+
+    if !is_dir {
+        if redox_flags & syscall::O_APPEND != 0 {
+            linux_flags |= linux_abi::O_APPEND;
+        }
+
+        // TODO: needs FUSE_ATOMIC_O_TRUNC flag negotiated
+        if redox_flags & syscall::O_TRUNC != 0 {
+            linux_flags |= linux_abi::O_TRUNC;
+        }
+
+        if redox_flags & syscall::O_NONBLOCK != 0 {
+            linux_flags |= linux_abi::O_NONBLOCK;
+        }
+    }
+
+    Ok(linux_flags)
 }

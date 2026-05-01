@@ -9,6 +9,7 @@ use crate::scheme::VirtioFsScheme;
 use crate::virtio::VirtioFsSession;
 
 mod fuse;
+mod linux_abi;
 mod scheme;
 mod virtio;
 
