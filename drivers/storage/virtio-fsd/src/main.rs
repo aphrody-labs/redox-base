@@ -49,10 +49,6 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         "virtio-fsd: device has {} request queues",
         virtio_fs_session.num_request_queues
     );
-    warn!(
-        "virtio-fsd: {} bytes required for each buffer in the notification queue.",
-        virtio_fs_session.notify_buf_size
-    );
     warn!("virtio-fsd: device is up and running!");
 
     // FUSE

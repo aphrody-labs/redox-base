@@ -2864,8 +2864,9 @@ dependencies = [
 name = "virtio-fsd"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags 2.11.1",
  "common",
+ "crossbeam-queue",
  "daemon",
  "fuse-abi",
  "futures",
@@ -2874,7 +2875,7 @@ dependencies = [
  "pcid",
  "redox-scheme",
  "redox_event",
- "redox_syscall 0.7.4",
+ "redox_syscall 0.7.5",
  "scheme-utils",
  "thiserror 2.0.18",
  "virtio-core",
