@@ -58,7 +58,6 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     scheme_start(daemon, fuse_session);
 }
 
-//TODO: fuse_session?
 fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSession<T>) -> ! {
     let scheme_file = Socket::create().expect("virtio-fsd: failed to create the scheme socket.");
 
@@ -91,6 +90,12 @@ fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSe
             .user_data
         {
             Source::Scheme => {
+                // TODO: Spawn a separate task for each scheme call. This would however require the
+                // use of a smarter buffer pool (or direct IO, or a buffer per fd) in order to do
+                // parallel IO. It might also require async-aware locks so that a close() is
+                // correctly ordered wrt IO on the same fd.
+                // When it comes to event parsing, current implementation is sequential because we
+                // block on each event.
                 if let Err(err) = futures::executor::block_on(scheme.tick()) {
                     warn!("virtio-fsd: error processing scheme requests: {err}");
                 }

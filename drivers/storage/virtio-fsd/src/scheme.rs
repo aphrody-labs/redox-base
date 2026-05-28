@@ -78,31 +78,42 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
         }
     }
 
-    pub fn on_close(&mut self, id: usize) {
-        // TODO: send 'FUSE_RELEASE' and 'FUSE_RELEASEDIR', and
-        // 'FUSE_FORGET' (for all types) based on close handle's type
-        // - parent_map cleanup
-        // - dcache cleanup
-        // - acache cleanup
-        // warn!("closing {id}");
-        if self.inner.handles.remove(id).is_none() {
-            warn!("virtio-fsd: on_close: key '{id}' was not found in handles");
+    pub async fn on_close(&mut self, id: usize) {
+        match self.inner.handles.remove(id) {
+            Some(handle) => match handle {
+                Handle::File { nodeid, fh, .. } => {
+                    if let Err(err) = self.inner.fuse_session.release(nodeid, fh, false).await {
+                        match err {
+                            FuseError::HostError(code) => {
+                                warn!("virtio-fsd: FUSE_LOOKUP host err: {}", -code);
+                            }
+                            FuseError::Transport(_) | FuseError::MalformedPayload => {
+                                warn!("virtio-fsd: FUSE_LOOKUP transport/protocol err: {}", err);
+                            }
+                        }
+                    }
+                }
+                Handle::Directory { nodeid, fh, .. } => {
+                    if let Err(err) = self.inner.fuse_session.release(nodeid, fh, true).await {
+                        match err {
+                            FuseError::HostError(code) => {
+                                warn!("virtio-fsd: FUSE_LOOKUP host err: {}", -code);
+                            }
+                            FuseError::Transport(_) | FuseError::MalformedPayload => {
+                                warn!("virtio-fsd: FUSE_LOOKUP transport/protocol err: {}", err);
+                            }
+                        }
+                    }
+                }
+                Handle::StatOnly { .. } | Handle::SchemeRoot => {}
+            },
+            None => {
+                warn!("virtio-fsd: on_close: key '{id}' was not found in handles");
+            }
         };
     }
 
-    // pub fn on_sendfd(&mut self, sendfd_request: &SendFdRequest) -> Result<usize> {
-    //     warn!(
-    //         "virtio-fsd: sendfd is not supported on id {}",
-    //         sendfd_request.id()
-    //     );
-    //     Err(Error::new(EOPNOTSUPP))
-    // }
-
-    /// Process pending and new requests.
-    ///
-    /// This needs to be called each time there is a new event on the scheme.
     pub async fn tick(&mut self) -> io::Result<()> {
-        // Handle new scheme requests
         loop {
             let request = match self.inner.socket.next_request(SignalBehavior::Interrupt) {
                 Ok(Some(request)) => request,
@@ -118,28 +129,34 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
 
             let response = match request.kind() {
                 RequestKind::Call(call_request) => {
-                    // TODO: Spawn a separate task for each scheme call. This would however require the
-                    // use of a smarter buffer pool (or direct IO, or a buffer per fd) in order to do
-                    // parallel IO. It might also require async-aware locks so that a close() is
-                    // correctly ordered wrt IO on the same fd.
                     call_request
                         .handle_async(&mut self.inner, &mut self.state)
                         .await
                 }
-                RequestKind::SendFd(request) => Response::err(EOPNOTSUPP, request),
-                RequestKind::RecvFd(request) => Response::err(EOPNOTSUPP, request),
+                RequestKind::SendFd(request) => {
+                    warn!("virtio-fsd: RequestKind::SendFd not supported");
+                    Response::err(EOPNOTSUPP, request)
+                }
+                RequestKind::RecvFd(request) => {
+                    warn!("virtio-fsd: RequestKind::RecvFd not supported");
+                    Response::err(EOPNOTSUPP, request)
+                }
                 RequestKind::Cancellation(_cancellation_request) => {
-                    // FIXME implement cancellation
+                    warn!("virtio-fsd: RequestKind::Cancellation not supported");
                     continue;
                 }
                 RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {
-                    unreachable!()
-                }
-                RequestKind::OnClose { id } => {
-                    self.on_close(id);
+                    warn!("virtio-fsd: RequestKind::MsyncMsg | MunmapMsg | MmapMsg not supported");
                     continue;
                 }
-                RequestKind::OnDetach { id, pid } => todo!(),
+                RequestKind::OnClose { id } => {
+                    self.on_close(id).await;
+                    continue;
+                }
+                RequestKind::OnDetach { .. } => {
+                    warn!("virtio-fsd: RequestKind::OnDetach not supported");
+                    continue;
+                }
             };
             self.inner
                 .socket
@@ -210,15 +227,24 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                     continue;
                 }
 
-                if let Some(child_map) = self.dcache.get(&node_id)
+                if let Some(child_map) = self.dcache.get_mut(&node_id)
                     && let Some((child_nodeid, dexp)) = child_map.get(name.as_bytes())
-                    && Instant::now() < *dexp
-                    && let Some((attr, aexp)) = self.acache.get(child_nodeid)
-                    && Instant::now() < *aexp
                 {
-                    node_id = *child_nodeid;
-                    node_mode = attr.mode as u16 & MODE_TYPE;
-                    continue;
+                    let dexpired = Instant::now() >= *dexp;
+
+                    if let Some((attr, aexp)) = self.acache.get(child_nodeid) {
+                        let aexpired = Instant::now() >= *aexp;
+
+                        if !dexpired && !aexpired {
+                            node_id = *child_nodeid;
+                            node_mode = attr.mode as u16 & MODE_TYPE;
+                            continue;
+                        } else {
+                            self.acache.remove(child_nodeid);
+                            self.parent_map.remove(child_nodeid);
+                            child_map.remove(name.as_bytes());
+                        }
+                    }
                 }
 
                 // cache miss
@@ -574,6 +600,8 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         {
             *attr
         } else {
+            self.acache.remove(&nodeid);
+
             match self.fuse_session.getattr(nodeid, fh).await {
                 Ok(payload) => {
                     let exp =
