@@ -3,7 +3,7 @@ use redox_scheme::scheme::{SchemeAsync, SchemeState};
 use redox_scheme::{
     CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
 };
-use scheme_utils::HandleMap;
+use scheme_utils::{FpathWriter, HandleMap};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::io;
@@ -49,6 +49,7 @@ pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
     dcache: BTreeMap<u64, BTreeMap<Vec<u8>, (u64, Instant)>>,
     /// Attribute cache: Maps `nodeid` -> `(attrs, expiration)`.
     acache: BTreeMap<u64, (FuseAttr, Instant)>,
+    scheme_name: String,
 }
 
 pub struct VirtioFsScheme<'sock, T: FuseTransporter> {
@@ -70,6 +71,7 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
             parent_map,
             dcache: BTreeMap::new(),
             acache: BTreeMap::new(),
+            scheme_name: "virtio-fsd".to_owned(),
         };
 
         Self {
@@ -183,49 +185,47 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     ) -> Result<OpenResult> {
         // TODO: check permissions
 
-        let mut node_id = FUSE_ROOT_ID;
-        let mut node_mode = MODE_DIR;
-
         // TODO: revalidate path evaluation
-        if !path.starts_with("/") {
+        let (mut node_id, mut node_mode, mut rel_path) = if path.starts_with('/') {
+            (FUSE_ROOT_ID, MODE_DIR, Vec::new())
+        } else {
             match self.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } => {
-                    // TODO
-                    warn!("virtio-fsd: file op not suported yet - nodeid: '{nodeid}' - fh: '{fh}'");
-                    return Err(Error::new(EOPNOTSUPP));
+                Handle::File { .. } => {
+                    return Err(Error::new(ENOTDIR));
                 }
-                Handle::Directory { nodeid, .. } => {
-                    node_id = *nodeid;
-                    node_mode = MODE_DIR;
+                Handle::Directory { nodeid, path, .. } => {
+                    (*nodeid, MODE_DIR, path_components(path))
                 }
-                Handle::StatOnly { nodeid, mode, .. } => {
-                    node_id = *nodeid;
-                    node_mode = *mode;
+                Handle::StatOnly { nodeid, mode, path } => {
+                    if *mode & MODE_TYPE != MODE_DIR {
+                        return Err(Error::new(ENOTDIR));
+                    }
+                    (*nodeid, *mode, path_components(path))
                 }
-                Handle::SchemeRoot => {}
-            };
-        }
+                Handle::SchemeRoot => (FUSE_ROOT_ID, MODE_DIR, Vec::new()),
+            }
+        };
 
-        let path_parts: Vec<&str> = path
-            .split('/')
-            .filter(|s| !s.is_empty() && *s != ".")
-            .collect();
+        let path_parts: Vec<&str> = path_components(path);
         let mut target_name_to_create = None;
 
         if !path.is_empty() && path != "/" {
-            for (i, name) in path_parts.iter().enumerate() {
+            for (i, name) in path_parts.iter().copied().enumerate() {
                 let is_last_element = i == path_parts.len() - 1;
 
-                if name.is_empty() || *name == "." {
+                if name.is_empty() || name == "." {
                     continue;
                 }
 
-                if *name == ".." {
+                if name == ".." {
                     // TODO: teleport to root can happen if driver restarts
                     node_id = *self.parent_map.get(&node_id).unwrap_or(&FUSE_ROOT_ID);
                     node_mode = MODE_DIR;
+                    rel_path.pop();
                     continue;
                 }
+
+                rel_path.push(name.to_owned());
 
                 if let Some(child_map) = self.dcache.get_mut(&node_id)
                     && let Some((child_nodeid, dexp)) = child_map.get(name.as_bytes())
@@ -271,7 +271,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                         FuseError::HostError(code) => {
                             if code == -ENOENT && is_last_element && (flags & syscall::O_CREAT != 0)
                             {
-                                target_name_to_create = Some(*name);
+                                target_name_to_create = Some(name);
                                 break;
                             }
                             return Err(Error::new((-code) as i32));
@@ -303,7 +303,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             let fd = self.handles.insert(Handle::StatOnly {
                 nodeid: node_id,
                 mode: node_mode,
-                path: path.to_owned(),
+                path: rel_path.join("/"),
             });
 
             return Ok(OpenResult::ThisScheme {
@@ -357,7 +357,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                     let handle = Handle::File {
                         nodeid: payload.entry.nodeid,
                         fh: payload.open.fh,
-                        path: path.to_owned(),
+                        path: rel_path.join("/"),
                     };
 
                     let fd = self.handles.insert(handle);
@@ -390,13 +390,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                         Handle::Directory {
                             nodeid: node_id,
                             fh,
-                            path: path.to_owned(),
+                            path: rel_path.join("/"),
                         }
                     } else {
                         Handle::File {
                             nodeid: node_id,
                             fh,
-                            path: path.to_owned(),
+                            path: rel_path.join("/"),
                         }
                     };
 
@@ -562,20 +562,17 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn fpath(&mut self, id: usize, buf: &mut [u8], ctx: &CallerCtx) -> Result<usize> {
-        // TODO: openat must construct and save absolute paths.
         match self.handles.get(id)? {
             Handle::File { path, .. }
             | Handle::Directory { path, .. }
             | Handle::StatOnly { path, .. } => {
-                let path_bytes = path.as_bytes();
-                buf[..path_bytes.len()].copy_from_slice(path_bytes);
-                return Ok(path_bytes.len());
+                return FpathWriter::with(buf, self.scheme_name.as_ref(), |w| {
+                    w.push_str(path);
+                    Ok(())
+                });
             }
-            _ => {
-                warn!("virtio-fsd: fpath: id '{id}' is not associated with a valid file.");
-                return Err(Error::new(EBADF));
-            }
-        };
+            Handle::SchemeRoot => FpathWriter::with(buf, self.scheme_name.as_ref(), |_| Ok(())),
+        }
     }
 
     async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
@@ -801,6 +798,8 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 }
 
+// Helpers
+
 fn translate_redox_flags_to_fuse(redox_flags: usize, is_dir: bool) -> Result<u32> {
     let accmode = redox_flags & syscall::O_ACCMODE;
 
@@ -848,4 +847,12 @@ fn translate_redox_flags_to_fuse(redox_flags: usize, is_dir: bool) -> Result<u32
     }
 
     Ok(linux_flags)
+}
+
+fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
+    // assumes that there is no '.' or '..' in the path
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(T::from)
+        .collect()
 }
