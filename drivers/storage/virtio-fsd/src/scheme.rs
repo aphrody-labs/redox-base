@@ -12,7 +12,7 @@ use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, ENOENT, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EINTR, EIO, EISDIR, ELOOP, ENOTDIR, EWOULDBLOCK, EventFlags, MODE_DIR,
+    EAGAIN, EBADMSG, EINTR, EIO, EISDIR, ELOOP, ENOTDIR, ESTALE, EWOULDBLOCK, EventFlags, MODE_DIR,
     MODE_SYMLINK, MODE_TYPE, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta,
     TimeSpec,
 };
@@ -218,8 +218,14 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                 }
 
                 if name == ".." {
-                    // TODO: teleport to root can happen if driver restarts
-                    node_id = *self.parent_map.get(&node_id).unwrap_or(&FUSE_ROOT_ID);
+                    // TODO: missing parent returnd ESTALE,
+                    // consider path-stack recovery later.
+                    node_id = if let Some(id) = self.parent_map.get(&node_id) {
+                        *id
+                    } else {
+                        return Err(Error::new(ESTALE));
+                    };
+
                     node_mode = MODE_DIR;
                     rel_path.pop();
                     continue;
