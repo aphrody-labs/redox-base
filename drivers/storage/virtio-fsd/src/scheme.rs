@@ -12,13 +12,29 @@ use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, ENOENT, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EINTR, EIO, EISDIR, ELOOP, ENOTDIR, ESTALE, EWOULDBLOCK, EventFlags, MODE_DIR,
-    MODE_SYMLINK, MODE_TYPE, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta,
-    TimeSpec,
+    EAGAIN, EBADMSG, EINTR, EINVAL, EIO, EISDIR, ELOOP, ENODEV, ENOMEM, ENOTDIR, ESTALE,
+    EWOULDBLOCK, EventFlags, MODE_DIR, MODE_SYMLINK, MODE_TYPE, MapFlags, MunmapFlags, Stat,
+    StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
 };
 
-use crate::fuse::{FUSE_ROOT_ID, FuseAttr, FuseError, FuseSession, FuseTransporter};
+use crate::fuse::{
+    FUSE_ROOT_ID, FuseAttr, FuseError, FuseSession, FuseTransporter, TransportError,
+};
 use crate::linux_abi;
+
+impl From<FuseError> for Error {
+    fn from(err: FuseError) -> Self {
+        match err {
+            FuseError::Host(errno) => Error::new(errno),
+            FuseError::Transport(TransportError::OutOfMemory) => Error::new(ENOMEM),
+            FuseError::Transport(TransportError::Busy) => Error::new(EAGAIN),
+            FuseError::Transport(TransportError::DeviceOffline) => Error::new(ENODEV),
+            FuseError::Transport(TransportError::Generic) | FuseError::MalformedPayload => {
+                Error::new(EIO)
+            }
+        }
+    }
+}
 
 enum Handle {
     File {
@@ -85,26 +101,12 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
             Some(handle) => match handle {
                 Handle::File { nodeid, fh, .. } => {
                     if let Err(err) = self.inner.fuse_session.release(nodeid, fh, false).await {
-                        match err {
-                            FuseError::HostError(code) => {
-                                warn!("virtio-fsd: FUSE_LOOKUP host err: {}", -code);
-                            }
-                            FuseError::Transport(_) | FuseError::MalformedPayload => {
-                                warn!("virtio-fsd: FUSE_LOOKUP transport/protocol err: {}", err);
-                            }
-                        }
+                        warn!("virtio-fsd: FUSE_RELEASE: {err}");
                     }
                 }
                 Handle::Directory { nodeid, fh, .. } => {
                     if let Err(err) = self.inner.fuse_session.release(nodeid, fh, true).await {
-                        match err {
-                            FuseError::HostError(code) => {
-                                warn!("virtio-fsd: FUSE_LOOKUP host err: {}", -code);
-                            }
-                            FuseError::Transport(_) | FuseError::MalformedPayload => {
-                                warn!("virtio-fsd: FUSE_LOOKUP transport/protocol err: {}", err);
-                            }
-                        }
+                        warn!("virtio-fsd: FUSE_RELEASE: {err}");
                     }
                 }
                 Handle::StatOnly { .. } | Handle::SchemeRoot => {}
@@ -273,20 +275,17 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                         node_id = payload.nodeid;
                         node_mode = payload.attr.mode as u16 & MODE_TYPE;
                     }
-                    Err(err) => match err {
-                        FuseError::HostError(code) => {
-                            if code == -ENOENT && is_last_element && (flags & syscall::O_CREAT != 0)
-                            {
-                                target_name_to_create = Some(name);
-                                break;
-                            }
-                            return Err(Error::new((-code) as i32));
+                    Err(err) => {
+                        if let FuseError::Host(code) = &err
+                            && *code == ENOENT
+                            && is_last_element
+                            && (flags & syscall::O_CREAT != 0)
+                        {
+                            target_name_to_create = Some(name);
+                            break;
                         }
-                        FuseError::Transport(_) | FuseError::MalformedPayload => {
-                            warn!("virtio-fsd: FUSE_LOOKUP transport/protocol err: {}", err);
-                            return Err(Error::new(EIO));
-                        }
-                    },
+                        return Err(map_fuse_err("FUSE_LOOKUP")(err));
+                    }
                 }
             }
         }
@@ -325,107 +324,89 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             let is_dir = false;
             let open_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
 
-            let name = CString::new(file_name)
-                .expect("virtio-fsd: openat: file name contained an internal 0 byte.");
+            let name = CString::new(file_name).map_err(|_| {
+                warn!("virtio-fsd: openat: file name contained an internal 0 byte.");
+                Error::new(EINVAL)
+            })?;
 
             //TODO: clean
             let redox_mode = (flags & 0xFFFF) as u32;
             const S_IFREG: u32 = 0o100000;
             let final_mode = redox_mode | S_IFREG;
 
-            match self
+            let payload = self
                 .fuse_session
                 .create(node_id, name, open_flags, final_mode)
                 .await
-            {
-                Ok(payload) => {
-                    //TODO: DRY it
+                .map_err(map_fuse_err("FUSE_CREATE"))?;
 
-                    // eq to lookup
+            //TODO: DRY it
 
-                    self.parent_map.insert(payload.entry.nodeid, node_id);
+            // eq to lookup
 
-                    let owned_name = file_name.as_bytes().to_vec();
-                    let dexp = Instant::now()
-                        + Duration::new(payload.entry.entry_valid, payload.entry.entry_valid_nsec);
-                    self.dcache
-                        .entry(node_id)
-                        .or_insert_with(BTreeMap::new)
-                        .insert(owned_name, (payload.entry.nodeid, dexp));
+            self.parent_map.insert(payload.entry.nodeid, node_id);
 
-                    let aexp = Instant::now()
-                        + Duration::new(payload.entry.attr_valid, payload.entry.attr_valid_nsec);
-                    self.acache
-                        .insert(payload.entry.nodeid, (payload.entry.attr, aexp));
+            let owned_name = file_name.as_bytes().to_vec();
+            let dexp = Instant::now()
+                + Duration::new(payload.entry.entry_valid, payload.entry.entry_valid_nsec);
+            self.dcache
+                .entry(node_id)
+                .or_insert_with(BTreeMap::new)
+                .insert(owned_name, (payload.entry.nodeid, dexp));
 
-                    // eq to open
+            let aexp = Instant::now()
+                + Duration::new(payload.entry.attr_valid, payload.entry.attr_valid_nsec);
+            self.acache
+                .insert(payload.entry.nodeid, (payload.entry.attr, aexp));
 
-                    let handle = Handle::File {
-                        nodeid: payload.entry.nodeid,
-                        fh: payload.open.fh,
-                        path: rel_path.join("/"),
-                    };
+            // eq to open
 
-                    let fd = self.handles.insert(handle);
+            let handle = Handle::File {
+                nodeid: payload.entry.nodeid,
+                fh: payload.open.fh,
+                path: rel_path.join("/"),
+            };
 
-                    return Ok(OpenResult::ThisScheme {
-                        number: fd,
-                        flags: NewFdFlags::POSITIONED,
-                    });
-                }
-                Err(err) => match err {
-                    FuseError::HostError(code) => {
-                        warn!("virtio-fsd: FUSE_CREATE HostError {code}");
-                        return Err(Error::new((-code) as i32));
-                    }
-                    FuseError::Transport(_) | FuseError::MalformedPayload => {
-                        warn!("virtio-fsd: FUSE_CREATE transport/protocol err: {}", err);
-                        return Err(Error::new(EIO));
-                    }
-                },
-            }
+            let fd = self.handles.insert(handle);
+
+            return Ok(OpenResult::ThisScheme {
+                number: fd,
+                flags: NewFdFlags::POSITIONED,
+            });
         } else {
             let is_dir = node_mode == MODE_DIR;
             let open_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
 
-            match self.fuse_session.open(node_id, open_flags, is_dir).await {
-                Ok(payload) => {
-                    let fh = payload.fh;
+            let opcode = if is_dir { "FUSE_OPENDIR" } else { "FUSE_OPEN" };
 
-                    let handle = if is_dir {
-                        Handle::Directory {
-                            nodeid: node_id,
-                            fh,
-                            path: rel_path.join("/"),
-                        }
-                    } else {
-                        Handle::File {
-                            nodeid: node_id,
-                            fh,
-                            path: rel_path.join("/"),
-                        }
-                    };
+            let payload = self
+                .fuse_session
+                .open(node_id, open_flags, is_dir)
+                .await
+                .map_err(map_fuse_err(opcode))?;
 
-                    let fd = self.handles.insert(handle);
+            let fh = payload.fh;
 
-                    return Ok(OpenResult::ThisScheme {
-                        number: fd,
-                        flags: NewFdFlags::POSITIONED,
-                    });
+            let handle = if is_dir {
+                Handle::Directory {
+                    nodeid: node_id,
+                    fh,
+                    path: rel_path.join("/"),
                 }
-                Err(err) => match err {
-                    FuseError::HostError(code) => {
-                        let op = if is_dir { "FUSE_OPENDIR" } else { "FUSE_OPEN" };
-                        warn!("virtio-fsd: {op} HostError {code}");
-                        return Err(Error::new((-code) as i32));
-                    }
-                    FuseError::Transport(_) | FuseError::MalformedPayload => {
-                        let op = if is_dir { "FUSE_OPENDIR" } else { "FUSE_OPEN" };
-                        warn!("virtio-fsd: {op} transport/protocol err: {}", err);
-                        return Err(Error::new(EIO));
-                    }
-                },
-            }
+            } else {
+                Handle::File {
+                    nodeid: node_id,
+                    fh,
+                    path: rel_path.join("/"),
+                }
+            };
+
+            let fd = self.handles.insert(handle);
+
+            return Ok(OpenResult::ThisScheme {
+                number: fd,
+                flags: NewFdFlags::POSITIONED,
+            });
         }
     }
 
@@ -437,7 +418,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         ctx: &CallerCtx,
     ) -> Result<()> {
         warn!("virtio-fsd: unlinkat is not supported on path {path}");
-        Err(Error::new(ENOENT))
+        Err(Error::new(EOPNOTSUPP))
     }
 
     /* Resource operations */
@@ -461,25 +442,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if let Handle::File { nodeid, fh, .. } = self.handles.get(id)? {
-            match self
+            let bytes_read = self
                 .fuse_session
                 .read(*nodeid, *fh, offset, buf, 0, 0)
                 .await
-            {
-                Ok(bytes_read) => {
-                    return Ok(bytes_read);
-                }
-                Err(err) => match err {
-                    FuseError::HostError(code) => {
-                        warn!("virtio-fsd: FUSE_READ HostError {code}");
-                        return Err(Error::new((-code) as i32));
-                    }
-                    FuseError::Transport(_) | FuseError::MalformedPayload => {
-                        warn!("virtio-fsd: FUSE_READ transport/protocol err: {}", err);
-                        return Err(Error::new(EIO));
-                    }
-                },
-            }
+                .map_err(map_fuse_err("FUSE_READ"))?;
+
+            return Ok(bytes_read);
         } else {
             warn!("virtio-fsd: read: id '{id}' is not associated with a valid file.");
             return Err(Error::new(EBADF));
@@ -501,25 +470,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if let Handle::File { nodeid, fh, .. } = self.handles.get(id)? {
-            match self
+            let payload = self
                 .fuse_session
                 .write(*nodeid, *fh, offset, buf, 0, 0)
                 .await
-            {
-                Ok(response) => {
-                    return Ok(response.size as usize);
-                }
-                Err(err) => match err {
-                    FuseError::HostError(code) => {
-                        warn!("virtio-fsd: FUSE_WRITE HostError {code}");
-                        return Err(Error::new((-code) as i32));
-                    }
-                    FuseError::Transport(_) | FuseError::MalformedPayload => {
-                        warn!("virtio-fsd: FUSE_WRITE transport/protocol err: {}", err);
-                        return Err(Error::new(EIO));
-                    }
-                },
-            }
+                .map_err(map_fuse_err("FUSE_WRITE"))?;
+
+            return Ok(payload.size as usize);
         } else {
             warn!("virtio-fsd: write: id '{id}' is not associated with a valid file.");
             return Err(Error::new(EBADF));
@@ -605,25 +562,16 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         } else {
             self.acache.remove(&nodeid);
 
-            match self.fuse_session.getattr(nodeid, fh).await {
-                Ok(payload) => {
-                    let exp =
-                        Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
-                    self.acache.insert(nodeid, (payload.attr, exp));
+            let payload = self
+                .fuse_session
+                .getattr(nodeid, fh)
+                .await
+                .map_err(map_fuse_err("FUSE_GETATTR"))?;
 
-                    payload.attr
-                }
-                Err(err) => match err {
-                    FuseError::HostError(code) => {
-                        warn!("virtio-fsd: FUSE_GETATTR HostError {code}");
-                        return Err(Error::new((-code) as i32));
-                    }
-                    FuseError::Transport(_) | FuseError::MalformedPayload => {
-                        warn!("virtio-fsd: FUSE_GETATTR transport/protocol err: {}", err);
-                        return Err(Error::new(EIO));
-                    }
-                },
-            }
+            let exp = Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
+            self.acache.insert(nodeid, (payload.attr, exp));
+
+            payload.attr
         };
 
         *stat = Stat {
@@ -666,19 +614,16 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
         };
 
-        match self.fuse_session.fsync(nodeid, fh, is_dir).await {
-            Ok(_) => Ok(()),
-            Err(err) => match err {
-                FuseError::HostError(code) => {
-                    warn!("virtio-fsd: FUSE_FSYNC HostError {code}");
-                    return Err(Error::new((-code) as i32));
-                }
-                FuseError::Transport(_) | FuseError::MalformedPayload => {
-                    warn!("virtio-fsd: FUSE_FSYNC transport/protocol err: {}", err);
-                    return Err(Error::new(EIO));
-                }
-            },
-        }
+        let opcode = if is_dir {
+            "FUSE_FSYNCDIR"
+        } else {
+            "FUSE_FSYNC"
+        };
+
+        self.fuse_session
+            .fsync(nodeid, fh, is_dir)
+            .await
+            .map_err(map_fuse_err(opcode))
     }
 
     async fn ftruncate(&mut self, id: usize, len: u64, ctx: &CallerCtx) -> Result<()> {
@@ -727,42 +672,34 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
             Handle::Directory { nodeid, fh, .. } => {
                 let (nodeid, fh) = (*nodeid, *fh);
-                match self.fuse_session.readdir(nodeid, fh, opaque_offset).await {
-                    Ok(payload) => {
-                        for dir in payload.iter() {
-                            let name = match str::from_utf8(dir.name) {
-                                Ok(n) => n,
-                                Err(err) => {
-                                    warn!(
-                                        "virtio-fsd: FUSE_READDIR: name is not valid to utf8: {}",
-                                        err
-                                    );
-                                    return Err(Error::new(EBADMSG));
-                                }
-                            };
-                            let kind = DirentKind::try_from_raw(dir.typ as u8)
-                                .unwrap_or(DirentKind::Unspecified);
+                let payload = self
+                    .fuse_session
+                    .readdir(nodeid, fh, opaque_offset)
+                    .await
+                    .map_err(map_fuse_err("FUSE_READDIR"))?;
 
-                            buf.entry(DirEntry {
-                                inode: dir.ino,
-                                next_opaque_id: dir.off,
-                                name,
-                                kind,
-                            })?;
+                for dir in payload.iter() {
+                    let name = match str::from_utf8(dir.name) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            warn!(
+                                "virtio-fsd: FUSE_READDIR: name is not valid to utf8: {}",
+                                err
+                            );
+                            return Err(Error::new(EBADMSG));
                         }
-                        Ok(buf)
-                    }
-                    Err(err) => match err {
-                        FuseError::HostError(code) => {
-                            warn!("virtio-fsd: FUSE_READDIR HostError {code}");
-                            return Err(Error::new((-code) as i32));
-                        }
-                        FuseError::Transport(_) | FuseError::MalformedPayload => {
-                            warn!("virtio-fsd: FUSE_READDIR transport/protocol err: {}", err);
-                            return Err(Error::new(EIO));
-                        }
-                    },
+                    };
+                    let kind =
+                        DirentKind::try_from_raw(dir.typ as u8).unwrap_or(DirentKind::Unspecified);
+
+                    buf.entry(DirEntry {
+                        inode: dir.ino,
+                        next_opaque_id: dir.off,
+                        name,
+                        kind,
+                    })?;
                 }
+                Ok(buf)
             }
             _ => {
                 warn!("virtio-fsd: getdents was called with invalid id: {id}");
@@ -861,4 +798,13 @@ fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
         .filter(|s| !s.is_empty())
         .map(T::from)
         .collect()
+}
+
+fn map_fuse_err(op: &'static str) -> impl FnOnce(FuseError) -> Error {
+    move |err| {
+        if !matches!(err, FuseError::Host(_)) {
+            warn!("virtio-fsd: {op}: {err}");
+        }
+        Error::from(err)
+    }
 }

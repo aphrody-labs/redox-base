@@ -53,7 +53,12 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     // FUSE
 
-    let fuse_session = futures::executor::block_on(FuseSession::new(virtio_fs_session));
+    let fuse_session = match futures::executor::block_on(FuseSession::new(virtio_fs_session)) {
+        Ok(s) => s,
+        Err(err) => {
+            panic!("virtio-fsd: FUSE_INIT failed: {err}");
+        }
+    };
 
     scheme_start(daemon, fuse_session);
 }
