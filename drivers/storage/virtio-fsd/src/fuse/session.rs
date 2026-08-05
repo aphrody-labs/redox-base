@@ -61,7 +61,6 @@ pub enum OutPayload<O> {
 
 pub struct FuseResponse<O> {
     pub fuse_out_header: fuse_out_header,
-    pub payload_size: usize,
     pub payload: OutPayload<O>,
 }
 

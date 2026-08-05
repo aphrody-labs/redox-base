@@ -18,7 +18,8 @@ use syscall::{
 };
 
 use crate::fuse::{
-    FUSE_ROOT_ID, FuseAttr, FuseError, FuseSession, FuseTransporter, TransportError,
+    FUSE_ROOT_ID, FuseError, FuseSession, FuseTransporter, TransportError, fuse_attr,
+    fuse_attr_out, fuse_entry_out,
 };
 use crate::linux_abi;
 
@@ -55,16 +56,97 @@ enum Handle {
     SchemeRoot,
 }
 
+struct NodeCache {
+    /// Directory cache: Maps `parent nodeid` to a map of its `child name as Vec<u8>` -> `(child nodeid, expiration)`.
+    dcache: BTreeMap<u64, BTreeMap<Vec<u8>, (u64, Instant)>>,
+    /// Attribute cache: Maps `nodeid` -> `(attrs, expiration)`.
+    acache: BTreeMap<u64, (fuse_attr, Instant)>,
+}
+
+impl NodeCache {
+    fn new() -> Self {
+        Self {
+            dcache: BTreeMap::new(),
+            acache: BTreeMap::new(),
+        }
+    }
+
+    fn insert_attr_by_name(
+        &mut self,
+        parent_nodeid: u64,
+        child_name: &str,
+        child_lookup_payload: fuse_entry_out,
+    ) {
+        let owned_name = child_name.as_bytes().to_vec();
+        let dexp = Instant::now()
+            + Duration::new(
+                child_lookup_payload.entry_valid,
+                child_lookup_payload.entry_valid_nsec,
+            );
+        self.dcache
+            .entry(parent_nodeid)
+            .or_insert_with(BTreeMap::new)
+            .insert(owned_name, (child_lookup_payload.nodeid, dexp));
+
+        let aexp = Instant::now()
+            + Duration::new(
+                child_lookup_payload.attr_valid,
+                child_lookup_payload.attr_valid_nsec,
+            );
+        self.acache.insert(
+            child_lookup_payload.nodeid,
+            (child_lookup_payload.attr, aexp),
+        );
+    }
+
+    fn get_attr_by_name(
+        &mut self,
+        parent_nodeid: u64,
+        child_name: &str,
+    ) -> Option<(u64, fuse_attr)> {
+        let child_map = self.dcache.get_mut(&parent_nodeid)?;
+        let (child_nodeid, dexp) = child_map.get(child_name.as_bytes())?;
+        let dexpired = Instant::now() >= *dexp;
+
+        let Some((attr, aexp)) = self.acache.get(child_nodeid) else {
+            child_map.remove(child_name.as_bytes());
+            return None;
+        };
+
+        let aexpired = Instant::now() >= *aexp;
+
+        if dexpired || aexpired {
+            self.acache.remove(&child_nodeid);
+            child_map.remove(child_name.as_bytes());
+            return None;
+        }
+
+        Some((*child_nodeid, *attr))
+    }
+
+    fn insert_attr_by_id(&mut self, node_id: u64, payload: fuse_attr_out) {
+        let exp = Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
+        self.acache.insert(node_id, (payload.attr, exp));
+    }
+
+    fn get_attr_by_id(&mut self, node_id: &u64) -> Option<fuse_attr> {
+        let (attr, exp) = self.acache.get(node_id)?;
+        if Instant::now() >= *exp {
+            self.acache.remove(node_id);
+            return None;
+        }
+        Some(*attr)
+    }
+}
+
 pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
     socket: &'sock Socket,
     handles: HandleMap<Handle>,
     fuse_session: FuseSession<T>,
     /// Maps `child nodeid` -> `parent nodeid`. This is used to resolve `nodeid` for `..`.
+    /// Inserted on LOOKUP/CREATE and not removed on name/attr cache expiry.
     parent_map: BTreeMap<u64, u64>,
-    /// Directory cache: Maps `parent nodeid` to a map of its `child name as Vec<u8>` -> `(child nodeid, expiration)`.
-    dcache: BTreeMap<u64, BTreeMap<Vec<u8>, (u64, Instant)>>,
-    /// Attribute cache: Maps `nodeid` -> `(attrs, expiration)`.
-    acache: BTreeMap<u64, (FuseAttr, Instant)>,
+    cache: NodeCache,
     scheme_name: String,
 }
 
@@ -85,8 +167,7 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
             socket,
             handles: HandleMap::new(),
             parent_map,
-            dcache: BTreeMap::new(),
-            acache: BTreeMap::new(),
+            cache: NodeCache::new(),
             scheme_name: "virtio-fsd".to_owned(),
         };
 
@@ -220,7 +301,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                 }
 
                 if name == ".." {
-                    // TODO: missing parent returnd ESTALE,
+                    // TODO: missing parent returns ESTALE,
                     // consider path-stack recovery later.
                     node_id = if let Some(id) = self.parent_map.get(&node_id) {
                         *id
@@ -235,42 +316,17 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
                 rel_path.push(name.to_owned());
 
-                if let Some(child_map) = self.dcache.get_mut(&node_id)
-                    && let Some((child_nodeid, dexp)) = child_map.get(name.as_bytes())
-                {
-                    let dexpired = Instant::now() >= *dexp;
-
-                    if let Some((attr, aexp)) = self.acache.get(child_nodeid) {
-                        let aexpired = Instant::now() >= *aexp;
-
-                        if !dexpired && !aexpired {
-                            node_id = *child_nodeid;
-                            node_mode = attr.mode as u16 & MODE_TYPE;
-                            continue;
-                        } else {
-                            self.acache.remove(child_nodeid);
-                            self.parent_map.remove(child_nodeid);
-                            child_map.remove(name.as_bytes());
-                        }
-                    }
+                if let Some((id, attr)) = self.cache.get_attr_by_name(node_id, name) {
+                    node_id = id;
+                    node_mode = attr.mode as u16 & MODE_TYPE;
+                    continue;
                 }
 
                 // cache miss
                 match self.fuse_session.lookup(node_id, name).await {
                     Ok(payload) => {
                         self.parent_map.insert(payload.nodeid, node_id);
-
-                        let owned_name = name.as_bytes().to_vec();
-                        let dexp = Instant::now()
-                            + Duration::new(payload.entry_valid, payload.entry_valid_nsec);
-                        self.dcache
-                            .entry(node_id)
-                            .or_insert_with(BTreeMap::new)
-                            .insert(owned_name, (payload.nodeid, dexp));
-
-                        let aexp = Instant::now()
-                            + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
-                        self.acache.insert(payload.nodeid, (payload.attr, aexp));
+                        self.cache.insert_attr_by_name(node_id, name, payload);
 
                         node_id = payload.nodeid;
                         node_mode = payload.attr.mode as u16 & MODE_TYPE;
@@ -317,14 +373,14 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             });
         }
 
-        if let Some(file_name) = target_name_to_create {
+        if let Some(name) = target_name_to_create {
             // We broke out of the loop early, so `node_id` is currently
             // the parent directory where the new file should be created.
 
             let is_dir = false;
             let open_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
 
-            let name = CString::new(file_name).map_err(|_| {
+            let name_cstring = CString::new(name).map_err(|_| {
                 warn!("virtio-fsd: openat: file name contained an internal 0 byte.");
                 Error::new(EINVAL)
             })?;
@@ -336,31 +392,15 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
             let payload = self
                 .fuse_session
-                .create(node_id, name, open_flags, final_mode)
+                .create(node_id, name_cstring, open_flags, final_mode)
                 .await
                 .map_err(map_fuse_err("FUSE_CREATE"))?;
 
-            //TODO: DRY it
-
             // eq to lookup
-
             self.parent_map.insert(payload.entry.nodeid, node_id);
-
-            let owned_name = file_name.as_bytes().to_vec();
-            let dexp = Instant::now()
-                + Duration::new(payload.entry.entry_valid, payload.entry.entry_valid_nsec);
-            self.dcache
-                .entry(node_id)
-                .or_insert_with(BTreeMap::new)
-                .insert(owned_name, (payload.entry.nodeid, dexp));
-
-            let aexp = Instant::now()
-                + Duration::new(payload.entry.attr_valid, payload.entry.attr_valid_nsec);
-            self.acache
-                .insert(payload.entry.nodeid, (payload.entry.attr, aexp));
+            self.cache.insert_attr_by_name(node_id, name, payload.entry);
 
             // eq to open
-
             let handle = Handle::File {
                 nodeid: payload.entry.nodeid,
                 fh: payload.open.fh,
@@ -555,21 +595,16 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
         };
 
-        let attrs = if let Some((attr, exp)) = self.acache.get(&nodeid)
-            && Instant::now() < *exp
-        {
-            *attr
+        let attrs = if let Some(attr) = self.cache.get_attr_by_id(&nodeid) {
+            attr
         } else {
-            self.acache.remove(&nodeid);
-
             let payload = self
                 .fuse_session
                 .getattr(nodeid, fh)
                 .await
                 .map_err(map_fuse_err("FUSE_GETATTR"))?;
 
-            let exp = Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
-            self.acache.insert(nodeid, (payload.attr, exp));
+            self.cache.insert_attr_by_id(nodeid, payload);
 
             payload.attr
         };

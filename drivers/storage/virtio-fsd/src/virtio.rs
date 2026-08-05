@@ -15,8 +15,8 @@ use virtio_core::{
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fuse::{
-    AllocStrategy, FuseOutHeader, FuseRequest, FuseResponse, FuseTransporter, OutPayload,
-    TransportError,
+    AllocStrategy, FuseRequest, FuseResponse, FuseTransporter, OutPayload, TransportError,
+    fuse_out_header,
 };
 
 pub const VIRTIO_FS_TAG_SIZE: usize = 36;
@@ -279,7 +279,7 @@ impl FuseTransporter for VirtioFsSession<'_> {
             .ok_or(TransportError::OutOfMemory)?;
         let mut rx_offset = 0;
 
-        builder = builder.chain(rx_guard.reserve_rx::<FuseOutHeader>(&mut rx_offset));
+        builder = builder.chain(rx_guard.reserve_rx::<fuse_out_header>(&mut rx_offset));
 
         // decide how to send the data based on AllocStrategy
 
@@ -339,8 +339,8 @@ impl FuseTransporter for VirtioFsSession<'_> {
         // parse the header
 
         // header is always at the begining of the DMA region
-        let out_header_bytes = &rx_guard[..size_of::<FuseOutHeader>()];
-        let (parsed_out_header, _) = FuseOutHeader::read_from_prefix(out_header_bytes)
+        let out_header_bytes = &rx_guard[..size_of::<fuse_out_header>()];
+        let (parsed_out_header, _) = fuse_out_header::read_from_prefix(out_header_bytes)
             .map_err(|_| TransportError::Generic)?;
 
         let fuse_written_claim = parsed_out_header.len;
@@ -355,7 +355,7 @@ impl FuseTransporter for VirtioFsSession<'_> {
         // parse the data
 
         let payload_size =
-            virtio_written.saturating_sub(size_of::<FuseOutHeader>() as u32) as usize;
+            virtio_written.saturating_sub(size_of::<fuse_out_header>() as u32) as usize;
 
         let parsed_out_payload = match strategy {
             AllocStrategy::DmaPool {
@@ -380,7 +380,6 @@ impl FuseTransporter for VirtioFsSession<'_> {
         };
 
         Ok(FuseResponse {
-            payload_size,
             fuse_out_header: parsed_out_header,
             payload: parsed_out_payload,
         })
