@@ -137,6 +137,10 @@ impl NodeCache {
         }
         Some(*attr)
     }
+
+    fn invalidate_attr(&mut self, node_id: u64) {
+        self.acache.remove(&node_id);
+    }
 }
 
 pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
@@ -510,11 +514,15 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if let Handle::File { nodeid, fh, .. } = self.handles.get(id)? {
+            let nodeid = *nodeid;
+            let fh = *fh;
             let payload = self
                 .fuse_session
-                .write(*nodeid, *fh, offset, buf, 0, 0)
+                .write(nodeid, fh, offset, buf, 0, 0)
                 .await
                 .map_err(map_fuse_err("FUSE_WRITE"))?;
+
+            self.cache.invalidate_attr(nodeid);
 
             return Ok(payload.size as usize);
         } else {
