@@ -140,14 +140,13 @@ impl DmaPool {
 }
 
 pub struct VirtioFsSession<'a> {
-    // TODO: we probably don't need all three fields from VirtioFsDeviceConfig.
     tag: [u8; VIRTIO_FS_TAG_SIZE],
-    pub num_request_queues: u32,
-    pub notify_buf_size: u32,
-    // TODO: we currently only support one request queue, but we should support more if the device has them.
-    request_queue: Arc<Queue<'a>>,
-    /// The hiprio queue follows the same request format as the request queues. This queue must only be used for `FUSE_INTERRUPT`, `FUSE_FORGET`, and `FUSE_BATCH_FORGET` requests.
     hiprio_queue: Arc<Queue<'a>>,
+    /// Only exists if VIRTIO_FS_F_NOTIFICATION is set.
+    notif_queue: Option<Arc<Queue<'a>>>,
+    /// Only exists if VIRTIO_FS_F_NOTIFICATION is set.
+    notif_buf_size: Option<u32>,
+    request_queues: Vec<Arc<Queue<'a>>>,
     dma_pool: DmaPool,
 }
 
@@ -157,11 +156,11 @@ impl<'a> VirtioFsSession<'a> {
     /// # Panics
     /// This function panics if the device does not support the required features, or if the device configuration is invalid.
     pub fn new(device: &'a Device) -> Self {
-        let supports_notif = device
+        let notif_supported = device
             .transport
             .check_device_feature(VIRTIO_FS_F_NOTIFICATION);
 
-        if supports_notif {
+        if notif_supported {
             warn!("virtio-fsd: device supports notifications.");
             device
                 .transport
@@ -192,18 +191,27 @@ impl<'a> VirtioFsSession<'a> {
         // - nrq_ptr has alignment of 4, so it's safe to read it.
         let nrq = u32::from_le(unsafe { ptr::read_volatile(nrq_ptr) });
 
-        // SAFETY:
-        // - We use addr_of! to avoid creating a reference to a packed field, that can potentially be unaligned.
-        let nbs_ptr = unsafe { ptr::addr_of!((*config).notify_buf_size) };
-        assert_eq!(
-            nbs_ptr as usize % core::mem::align_of::<u32>(),
-            0,
-            "virtio-fsd: notify_buf_size is not properly aligned."
-        );
+        let nbs = if notif_supported {
+            // SAFETY:
+            // - We use addr_of! to avoid creating a reference to a packed field, that can potentially be unaligned.
+            let nbs_ptr = unsafe { ptr::addr_of!((*config).notify_buf_size) };
+            assert_eq!(
+                nbs_ptr as usize % core::mem::align_of::<u32>(),
+                0,
+                "virtio-fsd: notify_buf_size is not properly aligned."
+            );
 
-        // SAFETY:
-        // - nbs_ptr has alignment of 4, so it's safe to read it.
-        let nbs = u32::from_le(unsafe { ptr::read_volatile(nbs_ptr) });
+            // SAFETY:
+            // - nbs_ptr has alignment of 4, so it's safe to read it.
+            Some(u32::from_le(unsafe { ptr::read_volatile(nbs_ptr) }))
+        } else {
+            None
+        };
+
+        // Virtqueues - https://docs.oasis-open.org/virtio/virtio/v1.2/csd01/virtio-v1.2-csd01.html#x1-4600002
+        // 0 - hiprio
+        // 1 - notification queue which exists if VIRTIO_FS_F_NOTIFICATION is set.
+        // 2…n - request queues
 
         // hiprio queue is only used for FUSE_INTERRUPT, FUSE_FORGET, and FUSE_BATCH_FORGET requests.
         let hiprio_queue = device
@@ -211,20 +219,38 @@ impl<'a> VirtioFsSession<'a> {
             .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
             .expect("virtio-fsd: failed to setup hiprio queue.");
 
-        // TODO: If the device has more than 1 request queues (nrq above), we should use them.
-        let request_queue = device
-            .transport
-            .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
-            .expect("virtio-fsd: failed to setup request queue.");
+        let notif_queue = if notif_supported {
+            let nq = device
+                .transport
+                .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
+                .expect("virtio-fsd: failed to setup notification queue.");
+
+            Some(nq)
+        } else {
+            None
+        };
+
+        assert!(
+            nrq >= 1,
+            "virtio-fsd: at least one request queue is needed."
+        );
+        let request_queues = (0..nrq)
+            .map(|_| {
+                device
+                    .transport
+                    .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
+                    .expect("virtio-fsd: failed to setup request queue.")
+            })
+            .collect();
 
         device.transport.run_device();
 
         Self {
             tag: tag_raw,
-            num_request_queues: nrq,
-            notify_buf_size: nbs,
+            notif_buf_size: nbs,
             hiprio_queue,
-            request_queue,
+            notif_queue,
+            request_queues,
             dma_pool: DmaPool::new(),
         }
     }
@@ -242,12 +268,23 @@ impl<'a> VirtioFsSession<'a> {
 
         core::str::from_utf8(&self.tag[..tag_len]).expect("virtio-fsd: tag is not valid UTF-8.")
     }
+
+    async fn send(&self, chain: Vec<Buffer>) -> u32 {
+        //TODO: round-robin or per-cpu?
+        self.request_queues[0].send(chain).await
+    }
+
+    async fn send_hiprio(&self, chain: Vec<Buffer>) {
+        self.hiprio_queue.send(chain).await;
+    }
 }
 
 impl FuseTransporter for VirtioFsSession<'_> {
+    /// Sends a FUSE request that expects at least a response header into the default queue.
+    ///
     /// # Panics
     /// This function panics if the underlying send operation fails. This happens because `virtio-core`'s `send()` method uses `unwrap()`.
-    async fn send_request<I, O>(
+    async fn send<I, O>(
         &self,
         request: FuseRequest<I>,
         strategy: AllocStrategy<'_>,
@@ -290,12 +327,11 @@ impl FuseTransporter for VirtioFsSession<'_> {
         let mut out_payload_offset = 0;
 
         match strategy {
-            AllocStrategy::DmaPool { has_out_payload } => {
-                if has_out_payload {
-                    out_payload_offset = rx_offset;
-                    builder = builder.chain(rx_guard.reserve_rx::<O>(&mut rx_offset));
-                }
+            AllocStrategy::DmaPool => {
+                out_payload_offset = rx_offset;
+                builder = builder.chain(rx_guard.reserve_rx::<O>(&mut rx_offset));
             }
+            AllocStrategy::DmaPoolHeaderOnly => {}
             AllocStrategy::Send { data } => {
                 let size = data.len();
 
@@ -334,7 +370,7 @@ impl FuseTransporter for VirtioFsSession<'_> {
         // send and wait
 
         let chain = builder.build();
-        let virtio_written = self.request_queue.send(chain).await;
+        let virtio_written = self.send(chain).await;
 
         // parse the header
 
@@ -358,14 +394,8 @@ impl FuseTransporter for VirtioFsSession<'_> {
             virtio_written.saturating_sub(size_of::<fuse_out_header>() as u32) as usize;
 
         let parsed_out_payload = match strategy {
-            AllocStrategy::DmaPool {
-                has_out_payload: false,
-            } => OutPayload::None,
-
-            AllocStrategy::DmaPool {
-                has_out_payload: true,
-            }
-            | AllocStrategy::Send { .. } => {
+            AllocStrategy::DmaPoolHeaderOnly => OutPayload::None,
+            AllocStrategy::DmaPool | AllocStrategy::Send { .. } => {
                 // payload starts right after the begining header
                 let bytes = &rx_guard[out_payload_offset..out_payload_offset + size_of::<O>()];
                 let (payload, _) =
@@ -383,5 +413,40 @@ impl FuseTransporter for VirtioFsSession<'_> {
             fuse_out_header: parsed_out_header,
             payload: parsed_out_payload,
         })
+    }
+
+    /// Sends a FUSE request that does not expect a response, into the high-priority queue.
+    ///
+    /// Opcodes with this behavior:
+    /// - `FUSE_FORGET`
+    /// - `FUSE_BATCH_FORGET`
+    /// - `FUSE_INTERRUPT`
+    ///
+    /// # Panics
+    /// This function panics if the underlying send operation fails. This happens because `virtio-core`'s `send()` method uses `unwrap()`.
+    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), TransportError>
+    where
+        I: IntoBytes + Immutable,
+    {
+        let mut builder = ChainBuilder::new();
+
+        let mut tx_guard = self
+            .dma_pool
+            .get_memory_mut()
+            .ok_or(TransportError::OutOfMemory)?;
+        let mut tx_offset = 0;
+
+        builder = builder.chain(tx_guard.append_tx(&mut tx_offset, &request.fuse_in_header));
+        if let Some(ref fuse_in) = request.fuse_in {
+            builder = builder.chain(tx_guard.append_tx(&mut tx_offset, fuse_in));
+        }
+
+        assert!(tx_offset <= PAGE_SIZE, "virtio-fsd: TX Pool Overflow");
+
+        let chain = builder.build();
+
+        self.send_hiprio(chain).await;
+
+        Ok(())
     }
 }

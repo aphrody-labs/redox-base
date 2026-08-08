@@ -1,9 +1,9 @@
 use fuse_abi::linux::{
     FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
     FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out, fuse_create_in,
-    fuse_entry_out, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_init_in, fuse_init_out,
-    fuse_opcode, fuse_open_in, fuse_open_out, fuse_out_header, fuse_read_in, fuse_release_in,
-    fuse_write_in, fuse_write_out,
+    fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_init_in,
+    fuse_init_out, fuse_opcode, fuse_open_in, fuse_open_out, fuse_out_header, fuse_read_in,
+    fuse_release_in, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
 use std::{
@@ -92,8 +92,10 @@ impl<O> FuseResponse<O> {
 
 /// How the transporter should handle the FUSE data payload.
 pub enum AllocStrategy<'a> {
-    /// When everything fits in PAGE_SIZE (e.g., `FUSE_LOOKUP`, `FUSE_OPEN`)
-    DmaPool { has_out_payload: bool },
+    /// When everything fits in PAGE_SIZE and response has a header and a payload.
+    DmaPool,
+    /// When everything fits in PAGE_SIZE and response only has a header.
+    DmaPoolHeaderOnly,
     /// Massive transmit (e.g. `FUSE_WRITE`).
     /// `data` will directly get copied to DMA memory.
     Send { data: &'a [u8] },
@@ -103,7 +105,7 @@ pub enum AllocStrategy<'a> {
 }
 
 pub trait FuseTransporter {
-    async fn send_request<I, O>(
+    async fn send<I, O>(
         &self,
         request: FuseRequest<I>,
         strategy: AllocStrategy<'_>,
@@ -111,6 +113,10 @@ pub trait FuseTransporter {
     where
         I: IntoBytes + Immutable,
         O: FromBytes + Immutable;
+
+    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), TransportError>
+    where
+        I: IntoBytes + Immutable;
 }
 
 pub struct FuseSession<T: FuseTransporter> {
@@ -163,12 +169,7 @@ where
 
         let init_out = session
             .transporter
-            .send_request::<_, fuse_init_out>(
-                request,
-                AllocStrategy::DmaPool {
-                    has_out_payload: true,
-                },
-            )
+            .send::<_, fuse_init_out>(request, AllocStrategy::DmaPool)
             .await?
             .into_struct()?;
 
@@ -266,12 +267,7 @@ where
         };
 
         self.transporter
-            .send_request(
-                request,
-                AllocStrategy::DmaPool {
-                    has_out_payload: true,
-                },
-            )
+            .send(request, AllocStrategy::DmaPool)
             .await?
             .into_struct()
     }
@@ -303,12 +299,7 @@ where
         };
 
         self.transporter
-            .send_request(
-                request,
-                AllocStrategy::DmaPool {
-                    has_out_payload: true,
-                },
-            )
+            .send(request, AllocStrategy::DmaPool)
             .await?
             .into_struct()
     }
@@ -352,7 +343,7 @@ where
 
         let n = self
             .transporter
-            .send_request::<_, ()>(request, AllocStrategy::Recv { buf: &mut buf })
+            .send::<_, ()>(request, AllocStrategy::Recv { buf: &mut buf })
             .await?
             .into_size()?;
 
@@ -393,12 +384,7 @@ where
         };
 
         self.transporter
-            .send_request(
-                request,
-                AllocStrategy::DmaPool {
-                    has_out_payload: true,
-                },
-            )
+            .send(request, AllocStrategy::DmaPool)
             .await?
             .into_struct()
     }
@@ -446,7 +432,7 @@ where
         };
 
         self.transporter
-            .send_request::<_, ()>(request, AllocStrategy::Recv { buf })
+            .send::<_, ()>(request, AllocStrategy::Recv { buf })
             .await?
             .into_size()
     }
@@ -495,7 +481,7 @@ where
         };
 
         self.transporter
-            .send_request(request, AllocStrategy::Send { data })
+            .send(request, AllocStrategy::Send { data })
             .await?
             .into_struct()
     }
@@ -538,7 +524,7 @@ where
         };
 
         self.transporter
-            .send_request(request, AllocStrategy::Send { data })
+            .send(request, AllocStrategy::Send { data })
             .await?
             .into_struct()
     }
@@ -574,12 +560,7 @@ where
         };
 
         self.transporter
-            .send_request::<_, ()>(
-                request,
-                AllocStrategy::DmaPool {
-                    has_out_payload: false,
-                },
-            )
+            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
             .await?
             .into_unit()
     }
@@ -616,49 +597,33 @@ where
         };
 
         self.transporter
-            .send_request::<_, ()>(
-                request,
-                AllocStrategy::DmaPool {
-                    has_out_payload: false,
-                },
-            )
+            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
             .await?
             .into_unit()
     }
 
-    // TODO: fuse_forget is fire and forget but send_request can't correctly handle that.
-    //
-    // pub async fn forget(&self, nodeid: u64, nlookup: u64) -> Result<(), FuseError> {
-    //     let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
+    pub async fn forget(&self, nodeid: u64, nlookup: u64) -> Result<(), FuseError> {
+        let fuse_in_header = fuse_in_header {
+            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_forget_in>()) as u32,
+            opcode: fuse_opcode::FUSE_FORGET.into(),
+            unique: 0,
+            nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            total_extlen: 0,
+            padding: 0,
+        };
 
-    //     let fuse_in_header = fuse_in_header {
-    //         len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_forget_in>()) as u32,
-    //         opcode: fuse_opcode::FUSE_FORGET.into(),
-    //         unique,
-    //         nodeid,
-    //         uid: 0,
-    //         gid: 0,
-    //         pid: 0,
-    //         total_extlen: 0,
-    //         padding: 0,
-    //     };
+        let fuse_in = fuse_forget_in { nlookup };
 
-    //     let fuse_in = fuse_forget_in { nlookup };
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(fuse_in),
+        };
 
-    //     let request = FuseRequest {
-    //         fuse_in_header,
-    //         fuse_in: Some(fuse_in),
-    //     };
+        self.transporter.send_hiprio_noreply(request).await?;
 
-    //     self.transporter
-    //         .send_request::<_, ()>(
-    //             request,
-    //             AllocStrategy::DmaPool {
-    //                 has_out_payload: false,
-    //             },
-    //         )
-    //         .await?;
-
-    //     Ok(())
-    // }
+        Ok(())
+    }
 }

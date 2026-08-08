@@ -45,10 +45,6 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     let virtio_fs_session = VirtioFsSession::new(&device);
 
     warn!("virtio-fsd: device tag is {}", virtio_fs_session.tag());
-    warn!(
-        "virtio-fsd: device has {} request queues",
-        virtio_fs_session.num_request_queues
-    );
     warn!("virtio-fsd: device is up and running!");
 
     // FUSE
