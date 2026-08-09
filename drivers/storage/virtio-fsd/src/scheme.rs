@@ -124,22 +124,22 @@ impl NodeCache {
         Some((*child_nodeid, *attr))
     }
 
-    fn insert_attr_by_id(&mut self, node_id: u64, payload: fuse_attr_out) {
+    fn insert_attr_by_id(&mut self, nodeid: u64, payload: fuse_attr_out) {
         let exp = Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
-        self.acache.insert(node_id, (payload.attr, exp));
+        self.acache.insert(nodeid, (payload.attr, exp));
     }
 
-    fn get_attr_by_id(&mut self, node_id: &u64) -> Option<fuse_attr> {
-        let (attr, exp) = self.acache.get(node_id)?;
+    fn get_attr_by_id(&mut self, nodeid: &u64) -> Option<fuse_attr> {
+        let (attr, exp) = self.acache.get(nodeid)?;
         if Instant::now() >= *exp {
-            self.acache.remove(node_id);
+            self.acache.remove(nodeid);
             return None;
         }
         Some(*attr)
     }
 
-    fn invalidate_attr(&mut self, node_id: u64) {
-        self.acache.remove(&node_id);
+    fn invalidate_attr(&mut self, nodeid: u64) {
+        self.acache.remove(&nodeid);
     }
 }
 
@@ -273,7 +273,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         // TODO: check permissions
 
         // TODO: revalidate path evaluation
-        let (mut node_id, mut node_mode, mut rel_path) = if path.starts_with('/') {
+        let (mut nodeid, mut node_mode, mut rel_path) = if path.starts_with('/') {
             (FUSE_ROOT_ID, MODE_DIR, Vec::new())
         } else {
             match self.handles.get(fd)? {
@@ -307,7 +307,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                 if name == ".." {
                     // TODO: missing parent returns ESTALE,
                     // consider path-stack recovery later.
-                    node_id = if let Some(id) = self.parent_map.get(&node_id) {
+                    nodeid = if let Some(id) = self.parent_map.get(&nodeid) {
                         *id
                     } else {
                         return Err(Error::new(ESTALE));
@@ -320,19 +320,19 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
                 rel_path.push(name.to_owned());
 
-                if let Some((id, attr)) = self.cache.get_attr_by_name(node_id, name) {
-                    node_id = id;
+                if let Some((id, attr)) = self.cache.get_attr_by_name(nodeid, name) {
+                    nodeid = id;
                     node_mode = attr.mode as u16 & MODE_TYPE;
                     continue;
                 }
 
                 // cache miss
-                match self.fuse_session.lookup(node_id, name).await {
+                match self.fuse_session.lookup(nodeid, name).await {
                     Ok(payload) => {
-                        self.parent_map.insert(payload.nodeid, node_id);
-                        self.cache.insert_attr_by_name(node_id, name, payload);
+                        self.parent_map.insert(payload.nodeid, nodeid);
+                        self.cache.insert_attr_by_name(nodeid, name, payload);
 
-                        node_id = payload.nodeid;
+                        nodeid = payload.nodeid;
                         node_mode = payload.attr.mode as u16 & MODE_TYPE;
                     }
                     Err(err) => {
@@ -366,7 +366,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
         if flags & syscall::O_STAT != 0 {
             let fd = self.handles.insert(Handle::StatOnly {
-                nodeid: node_id,
+                nodeid,
                 mode: node_mode,
                 path: rel_path.join("/"),
             });
@@ -378,7 +378,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if let Some(name) = target_name_to_create {
-            // We broke out of the loop early, so `node_id` is currently
+            // We broke out of the loop early, so `nodeid` is currently
             // the parent directory where the new file should be created.
 
             let is_dir = false;
@@ -396,13 +396,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
             let payload = self
                 .fuse_session
-                .create(node_id, name_cstring, open_flags, final_mode)
+                .create(nodeid, name_cstring, open_flags, final_mode)
                 .await
                 .map_err(map_fuse_err("FUSE_CREATE"))?;
 
             // eq to lookup
-            self.parent_map.insert(payload.entry.nodeid, node_id);
-            self.cache.insert_attr_by_name(node_id, name, payload.entry);
+            self.parent_map.insert(payload.entry.nodeid, nodeid);
+            self.cache.insert_attr_by_name(nodeid, name, payload.entry);
 
             // eq to open
             let handle = Handle::File {
@@ -425,7 +425,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
             let payload = self
                 .fuse_session
-                .open(node_id, open_flags, is_dir)
+                .open(nodeid, open_flags, is_dir)
                 .await
                 .map_err(map_fuse_err(opcode))?;
 
@@ -433,13 +433,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
             let handle = if is_dir {
                 Handle::Directory {
-                    nodeid: node_id,
+                    nodeid,
                     fh,
                     path: rel_path.join("/"),
                 }
             } else {
                 Handle::File {
-                    nodeid: node_id,
+                    nodeid,
                     fh,
                     path: rel_path.join("/"),
                 }
