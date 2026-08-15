@@ -6,11 +6,13 @@ use redox_scheme::scheme::register_async_scheme;
 
 use crate::fuse::{FuseSession, FuseTransporter};
 use crate::scheme::VirtioFsScheme;
+use crate::vfs::Vfs;
 use crate::virtio::VirtioFsSession;
 
 mod fuse;
 mod linux_abi;
 mod scheme;
+mod vfs;
 mod virtio;
 
 fn main() {
@@ -76,7 +78,8 @@ fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSe
         )
         .expect("virtio-fsd: failed to subscribe to the event queue.");
 
-    let mut scheme = VirtioFsScheme::new(&scheme_file, fuse_session);
+    let vfs = Vfs::new(fuse_session);
+    let mut scheme = VirtioFsScheme::new(&scheme_file, vfs);
 
     register_async_scheme(&scheme_file, "virtio-fsd", &mut scheme.inner)
         .expect("virtio-fsd: can't register virtio-fsd scheme");

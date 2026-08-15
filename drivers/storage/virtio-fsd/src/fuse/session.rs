@@ -11,6 +11,7 @@ use std::{
     mem,
     sync::atomic::{AtomicU64, Ordering},
 };
+use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -44,6 +45,19 @@ impl FuseError {
             Ok(())
         } else {
             Err(Self::Host(error.wrapping_neg()))
+        }
+    }
+
+    pub fn into_syscall(self, op: &str) -> Error {
+        if !matches!(self, Self::Host(_)) {
+            warn!("virtio-fsd: {op}: {self}");
+        }
+        match self {
+            Self::Host(errno) => Error::new(errno),
+            Self::Transport(TransportError::OutOfMemory) => Error::new(ENOMEM),
+            Self::Transport(TransportError::Busy) => Error::new(EAGAIN),
+            Self::Transport(TransportError::DeviceOffline) => Error::new(ENODEV),
+            Self::Transport(TransportError::Generic) | Self::MalformedPayload => Error::new(EIO),
         }
     }
 }
