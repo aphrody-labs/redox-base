@@ -23,3 +23,9 @@ libredox.workspace = true
 redox-scheme.workspace = true
 redox_event.workspace = true
 redox_syscall.workspace = true
+
+[features]
+default = []
+# adds '/scheme/virtio-fsd/.lru_evicted' path that
+# logs LRU evictions for testing purposes
+lru-debug = []

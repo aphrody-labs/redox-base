@@ -1,9 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::CString,
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "lru-debug")]
+use log::info;
 use log::warn;
 use scheme_utils::HandleMap;
 use syscall::{
@@ -17,6 +19,16 @@ use crate::fuse::{
     fuse_entry_out,
 };
 
+const INODES_MAX_LEN: usize = 4096;
+const FORGET_QUEUE_MIN_CAP: usize = 1024;
+
+#[cfg(feature = "lru-debug")]
+const EVICT_LOG_CAP: usize = 8192;
+
+#[cfg(feature = "lru-debug")]
+/// Debug node at the scheme root: one evicted dcache name per line, LRU order.
+pub const LRU_EVICTED_NAME: &str = ".lru_evicted";
+
 struct Inode {
     nodeid: u64,
     generation: Option<u64>,
@@ -26,6 +38,8 @@ struct Inode {
     nlookup: u64,
     forget_pending: bool,
     open_fd_count: u64,
+    child_count: u64,
+    used: u64,
 }
 
 impl Inode {
@@ -50,10 +64,23 @@ impl Dentry {
 }
 
 enum Handle {
-    File { nodeid: u64, fh: u64, path: String },
-    Directory { nodeid: u64, fh: u64, path: String },
-    StatOnly { nodeid: u64, path: String },
+    File {
+        nodeid: u64,
+        fh: u64,
+        path: String,
+    },
+    Directory {
+        nodeid: u64,
+        fh: u64,
+        path: String,
+    },
+    StatOnly {
+        nodeid: u64,
+        path: String,
+    },
     SchemeRoot,
+    #[cfg(feature = "lru-debug")]
+    LruLog,
 }
 
 pub struct Vfs<T: FuseTransporter> {
@@ -61,7 +88,10 @@ pub struct Vfs<T: FuseTransporter> {
     inodes: BTreeMap<u64, Inode>,
     dcache: BTreeMap<u64, BTreeMap<String, Dentry>>,
     handles: HandleMap<Handle>,
-    // TODO: add forget queue
+    forget_queue: VecDeque<(u64, u64)>,
+    next_used: u64,
+    #[cfg(feature = "lru-debug")]
+    evicted_names: Vec<String>,
 }
 
 impl<T: FuseTransporter> Vfs<T> {
@@ -82,6 +112,8 @@ impl<T: FuseTransporter> Vfs<T> {
                 nlookup: 0,
                 forget_pending: false,
                 open_fd_count: 0,
+                child_count: 0,
+                used: 0,
             },
         );
 
@@ -90,6 +122,17 @@ impl<T: FuseTransporter> Vfs<T> {
             inodes,
             dcache: BTreeMap::new(),
             handles: HandleMap::new(),
+            forget_queue: VecDeque::with_capacity(FORGET_QUEUE_MIN_CAP),
+            next_used: 0,
+            #[cfg(feature = "lru-debug")]
+            evicted_names: Vec::new(),
+        }
+    }
+
+    fn touch(&mut self, nodeid: u64) {
+        self.next_used += 1;
+        if let Some(inode) = self.inodes.get_mut(&nodeid) {
+            inode.used = self.next_used;
         }
     }
 
@@ -98,38 +141,55 @@ impl<T: FuseTransporter> Vfs<T> {
         let attr_expiry = now + Duration::new(entry.attr_valid, entry.attr_valid_nsec);
         let entry_expiry = now + Duration::new(entry.entry_valid, entry.entry_valid_nsec);
 
-        match self.inodes.get_mut(&entry.nodeid) {
-            Some(inode) => {
-                match inode.generation {
-                    None => inode.generation = Some(entry.generation),
-                    Some(g) if g != entry.generation => {
-                        warn!(
-                            "virtio-fsd: generation mismatch nodeid={} have={g} got={}",
-                            entry.nodeid, entry.generation
-                        );
-                        return Err(Error::new(ESTALE));
-                    }
-                    Some(_) => {}
+        let old_parent = if let Some(inode) = self.inodes.get_mut(&entry.nodeid) {
+            match inode.generation {
+                None => inode.generation = Some(entry.generation),
+                Some(g) if g != entry.generation => {
+                    warn!(
+                        "virtio-fsd: generation mismatch nodeid={} have={g} got={}",
+                        entry.nodeid, entry.generation
+                    );
+                    return Err(Error::new(ESTALE));
                 }
-                inode.nlookup += 1;
-                inode.attr = entry.attr;
-                inode.attr_expiry = attr_expiry;
-                inode.parent = parent;
+                Some(_) => {}
             }
-            None => {
-                self.inodes.insert(
-                    entry.nodeid,
-                    Inode {
-                        nodeid: entry.nodeid,
-                        generation: Some(entry.generation),
-                        parent,
-                        attr: entry.attr,
-                        attr_expiry,
-                        nlookup: 1,
-                        forget_pending: false,
-                        open_fd_count: 0,
-                    },
-                );
+            inode.nlookup += 1;
+            inode.attr = entry.attr;
+            inode.attr_expiry = attr_expiry;
+            let old_parent = inode.parent;
+            inode.parent = parent;
+            Some(old_parent)
+        } else {
+            self.populate_forgets();
+            self.inodes.insert(
+                entry.nodeid,
+                Inode {
+                    nodeid: entry.nodeid,
+                    generation: Some(entry.generation),
+                    parent,
+                    attr: entry.attr,
+                    attr_expiry,
+                    nlookup: 1,
+                    forget_pending: false,
+                    open_fd_count: 0,
+                    child_count: 0,
+                    used: 0,
+                },
+            );
+            if let Some(p) = self.inodes.get_mut(&parent) {
+                p.child_count += 1;
+            }
+            None
+        };
+
+        if let Some(old_parent) = old_parent
+            && old_parent != parent
+        {
+            if let Some(p) = self.inodes.get_mut(&old_parent) {
+                p.child_count = p.child_count.saturating_sub(1);
+            }
+            if let Some(p) = self.inodes.get_mut(&parent) {
+                p.child_count += 1;
             }
         }
 
@@ -140,6 +200,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 entry_expiry,
             },
         );
+        self.touch(entry.nodeid);
         Ok(())
     }
 
@@ -168,6 +229,18 @@ impl<T: FuseTransporter> Vfs<T> {
         Some(dentry.nodeid)
     }
 
+    #[cfg(feature = "lru-debug")]
+    fn dcache_name(&self, nodeid: u64) -> Option<String> {
+        for names in self.dcache.values() {
+            for (name, d) in names {
+                if d.nodeid == nodeid {
+                    return Some(name.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn drop_dentry(&mut self, parent: u64, name: &str) {
         let Some(map) = self.dcache.get_mut(&parent) else {
             return;
@@ -188,12 +261,94 @@ impl<T: FuseTransporter> Vfs<T> {
         mode
     }
 
+    fn pick_lru_victim(&self) -> Option<u64> {
+        self.inodes
+            .iter()
+            .filter(|(id, i)| **id != FUSE_ROOT_ID && i.open_fd_count == 0 && i.child_count == 0)
+            .min_by_key(|(_, i)| i.used)
+            .map(|(id, _)| *id)
+    }
+
+    fn populate_forgets(&mut self) {
+        #[cfg(feature = "lru-debug")]
+        let mut evicted = 0u32;
+        while self.inodes.len() >= INODES_MAX_LEN {
+            let Some(id) = self.pick_lru_victim() else {
+                warn!(
+                    "virtio-fsd: LRU full ({}/{}), nothing evictable",
+                    self.inodes.len(),
+                    INODES_MAX_LEN
+                );
+                break;
+            };
+            let Some(inode) = self.inodes.remove(&id) else {
+                break;
+            };
+            #[cfg(feature = "lru-debug")]
+            {
+                let name = self.dcache_name(id);
+                info!(
+                    "virtio-fsd: LRU evict nodeid={id} name={} nlookup={} used={} parent={} cache={}/{}",
+                    name.as_deref().unwrap_or("?"),
+                    inode.nlookup,
+                    inode.used,
+                    inode.parent,
+                    self.inodes.len(),
+                    INODES_MAX_LEN
+                );
+                if let Some(name) = name {
+                    if self.evicted_names.len() >= EVICT_LOG_CAP {
+                        self.evicted_names.remove(0);
+                    }
+                    self.evicted_names.push(name);
+                }
+            }
+            if let Some(parent) = self.inodes.get_mut(&inode.parent) {
+                parent.child_count = parent.child_count.saturating_sub(1);
+            }
+
+            self.dcache.remove(&id);
+            self.dcache.retain(|_, names| {
+                names.retain(|_, d| d.nodeid != id);
+                !names.is_empty()
+            });
+
+            if inode.nlookup > 0 {
+                self.forget_queue.push_back((id, inode.nlookup));
+            }
+            #[cfg(feature = "lru-debug")]
+            {
+                evicted += 1;
+            }
+        }
+        #[cfg(feature = "lru-debug")]
+        if evicted > 0 {
+            info!(
+                "virtio-fsd: LRU reclaimed {evicted} inode(s), queued {} FORGET(s), cache={}",
+                self.forget_queue.len(),
+                self.inodes.len()
+            );
+        }
+    }
+
+    async fn flush_forgets(&mut self) {
+        while let Some((nodeid, nlookup)) = self.forget_queue.pop_front() {
+            if let Err(err) = self.fuse.forget(nodeid, nlookup).await {
+                warn!("virtio-fsd: FUSE_FORGET: {err}");
+                self.forget_queue.push_front((nodeid, nlookup));
+                break;
+            }
+        }
+    }
+
     pub async fn lookup(&mut self, parent: u64, name: &str) -> Result<(u64, u16)> {
         if let Some(nodeid) = self.cached_child(parent, name) {
             if let Some(inode) = self.inodes.get(&nodeid)
                 && inode.attr_valid()
             {
-                return Ok((nodeid, inode.mode_type()));
+                let mode = inode.mode_type();
+                self.touch(nodeid);
+                return Ok((nodeid, mode));
             }
 
             let payload = match self.fuse.getattr(nodeid, None).await {
@@ -207,7 +362,9 @@ impl<T: FuseTransporter> Vfs<T> {
                 }
             };
 
-            return Ok((nodeid, self.refresh_attr(nodeid, payload)));
+            let mode = self.refresh_attr(nodeid, payload);
+            self.touch(nodeid);
+            return Ok((nodeid, mode));
         }
 
         let payload = self
@@ -218,6 +375,7 @@ impl<T: FuseTransporter> Vfs<T> {
         let nodeid = payload.nodeid;
         let mode = payload.attr.mode as u16 & MODE_TYPE;
         self.merge_entry(parent, name, payload)?;
+        self.flush_forgets().await;
         Ok((nodeid, mode))
     }
 
@@ -257,6 +415,8 @@ impl<T: FuseTransporter> Vfs<T> {
             }
             return Err(err);
         }
+
+        self.flush_forgets().await;
 
         Ok(self.handles.insert(Handle::File {
             nodeid,
@@ -313,12 +473,23 @@ impl<T: FuseTransporter> Vfs<T> {
             }
             Handle::StatOnly { nodeid, .. } => (*nodeid, None),
             Handle::SchemeRoot => (FUSE_ROOT_ID, None),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => {
+                return Ok(fuse_attr {
+                    ino: 0,
+                    size: self.evicted_names.join("\n").len() as u64,
+                    mode: 0o100000,
+                    ..fuse_attr::default()
+                });
+            }
         };
 
         if let Some(inode) = self.inodes.get(&nodeid)
             && inode.attr_valid()
         {
-            return Ok(inode.attr);
+            let attr = inode.attr;
+            self.touch(nodeid);
+            return Ok(attr);
         }
 
         let payload = self
@@ -328,8 +499,8 @@ impl<T: FuseTransporter> Vfs<T> {
             .map_err(|e| e.into_syscall("FUSE_GETATTR"))?;
 
         self.refresh_attr(nodeid, payload);
-
-        return Ok(payload.attr);
+        self.touch(nodeid);
+        Ok(payload.attr)
     }
 
     pub async fn read(&mut self, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -343,6 +514,17 @@ impl<T: FuseTransporter> Vfs<T> {
                 .read(*nodeid, *fh, offset, buf, 0, 0)
                 .await
                 .map_err(|e| e.into_syscall("FUSE_READ")),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => {
+                let data = self.evicted_names.join("\n");
+                let off = offset as usize;
+                if off >= data.len() {
+                    return Ok(0);
+                }
+                let n = (data.len() - off).min(buf.len());
+                buf[..n].copy_from_slice(&data.as_bytes()[off..off + n]);
+                Ok(n)
+            }
             Handle::Directory { .. } => Err(Error::new(EISDIR)),
             _ => {
                 warn!("virtio-fsd: read: fd '{fd}' is not associated with a valid file.");
@@ -417,6 +599,8 @@ impl<T: FuseTransporter> Vfs<T> {
                     self.decrement_fd_count(nodeid);
                 }
                 Handle::SchemeRoot => {}
+                #[cfg(feature = "lru-debug")]
+                Handle::LruLog => {}
             },
             None => {
                 warn!("virtio-fsd: close: fd '{fd}' was not found in handles");
@@ -428,9 +612,16 @@ impl<T: FuseTransporter> Vfs<T> {
         self.handles.insert(Handle::SchemeRoot)
     }
 
+    #[cfg(feature = "lru-debug")]
+    pub fn open_lru_log(&mut self) -> usize {
+        self.handles.insert(Handle::LruLog)
+    }
+
     pub fn walk_start(&self, fd: usize) -> Result<(u64, u16, Vec<String>)> {
         match self.handles.get(fd)? {
             Handle::File { .. } => Err(Error::new(ENOTDIR)),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => Err(Error::new(ENOTDIR)),
             Handle::Directory { nodeid, path, .. } => {
                 let mode = self.inode_mode(*nodeid)?;
                 Ok((*nodeid, mode, path_components(path)))
@@ -476,6 +667,8 @@ impl<T: FuseTransporter> Vfs<T> {
             | Handle::Directory { path, .. }
             | Handle::StatOnly { path, .. } => Ok(path),
             Handle::SchemeRoot => Ok(""),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => Ok(LRU_EVICTED_NAME),
         }
     }
 
@@ -487,16 +680,20 @@ impl<T: FuseTransporter> Vfs<T> {
         }))
     }
 
-    pub fn parent_of(&self, nodeid: u64) -> Result<(u64, u16)> {
+    pub fn parent_of(&mut self, nodeid: u64) -> Result<(u64, u16)> {
         let inode = self.inodes.get(&nodeid).ok_or(Error::new(ESTALE))?;
         let parent_id = inode.parent;
         if parent_id == nodeid {
             // we don't have the authority to look into the parent of root,
             // hence when cwd is `/scheme/virtio-fsd`, `ls ..` is same as `ls .`.
+            self.touch(FUSE_ROOT_ID);
             return Ok((FUSE_ROOT_ID, MODE_DIR));
         }
         let parent = self.inodes.get(&parent_id).ok_or(Error::new(ESTALE))?;
-        Ok((parent.nodeid, parent.mode_type()))
+        let out = (parent.nodeid, parent.mode_type());
+        self.touch(nodeid);
+        self.touch(parent_id);
+        Ok(out)
     }
 
     fn invalidate_attr(&mut self, nodeid: u64) {

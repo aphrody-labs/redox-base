@@ -2864,7 +2864,7 @@ dependencies = [
 name = "virtio-fsd"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.13.1",
  "common",
  "crossbeam-queue",
  "daemon",

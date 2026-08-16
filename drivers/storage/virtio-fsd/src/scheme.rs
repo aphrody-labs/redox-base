@@ -123,6 +123,14 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         };
 
         let path_parts: Vec<&str> = path_components(path);
+        #[cfg(feature = "lru-debug")]
+        if path_parts.as_slice() == [crate::vfs::LRU_EVICTED_NAME] && nodeid == FUSE_ROOT_ID {
+            return Ok(OpenResult::ThisScheme {
+                number: self.vfs.open_lru_log(),
+                flags: NewFdFlags::POSITIONED,
+            });
+        }
+
         let mut target_name_to_create = None;
 
         if !path.is_empty() && path != "/" {
