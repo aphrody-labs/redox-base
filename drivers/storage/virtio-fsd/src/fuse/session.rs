@@ -2,8 +2,8 @@ use fuse_abi::linux::{
     FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
     FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out, fuse_create_in,
     fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_init_in,
-    fuse_init_out, fuse_opcode, fuse_open_in, fuse_open_out, fuse_out_header, fuse_read_in,
-    fuse_release_in, fuse_write_in, fuse_write_out,
+    fuse_init_out, fuse_mkdir_in, fuse_opcode, fuse_open_in, fuse_open_out, fuse_out_header,
+    fuse_read_in, fuse_release_in, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
 use std::{
@@ -149,7 +149,7 @@ where
         let mut session = Self {
             transporter,
             init: fuse_init_out::default(),
-            next_unique: AtomicU64::new(0),
+            next_unique: AtomicU64::new(1),
         };
 
         let unique = session.next_unique.fetch_add(1, Ordering::SeqCst);
@@ -639,5 +639,41 @@ where
         self.transporter.send_hiprio_noreply(request).await?;
 
         Ok(())
+    }
+
+    pub async fn mkdir(
+        &self,
+        nodeid: u64,
+        name: CString,
+        mode: u32,
+    ) -> Result<fuse_entry_out, FuseError> {
+        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
+
+        let data = name.as_bytes_with_nul();
+        let size = data.len();
+
+        let fuse_in_header = fuse_in_header {
+            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_mkdir_in>() + size) as u32,
+            opcode: fuse_opcode::FUSE_MKDIR.into(),
+            unique,
+            nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            total_extlen: 0,
+            padding: 0,
+        };
+
+        let fuse_in = fuse_mkdir_in { mode, umask: 0 };
+
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(fuse_in),
+        };
+
+        self.transporter
+            .send(request, AllocStrategy::Send { data })
+            .await?
+            .into_struct()
     }
 }

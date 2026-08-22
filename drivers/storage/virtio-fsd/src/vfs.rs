@@ -95,39 +95,7 @@ pub struct Vfs<T: FuseTransporter> {
 }
 
 impl<T: FuseTransporter> Vfs<T> {
-    pub fn new(fuse_session: FuseSession<T>) -> Self {
-        let mut inodes = BTreeMap::new();
-        inodes.insert(
-            FUSE_ROOT_ID,
-            Inode {
-                nodeid: FUSE_ROOT_ID,
-                generation: None,
-                parent: FUSE_ROOT_ID,
-                attr: fuse_attr {
-                    ino: FUSE_ROOT_ID,
-                    mode: MODE_DIR as u32,
-                    ..fuse_attr::default()
-                },
-                attr_expiry: Instant::now(),
-                nlookup: 0,
-                forget_pending: false,
-                open_fd_count: 0,
-                child_count: 0,
-                used: 0,
-            },
-        );
-
-        Self {
-            fuse: fuse_session,
-            inodes,
-            dcache: BTreeMap::new(),
-            handles: HandleMap::new(),
-            forget_queue: VecDeque::with_capacity(FORGET_QUEUE_MIN_CAP),
-            next_used: 0,
-            #[cfg(feature = "lru-debug")]
-            evicted_names: Vec::new(),
-        }
-    }
+    // Private API
 
     fn touch(&mut self, nodeid: u64) {
         self.next_used += 1;
@@ -331,6 +299,19 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
+    fn inode_mode(&self, nodeid: u64) -> Result<u16> {
+        self.inodes
+            .get(&nodeid)
+            .map(Inode::mode_type)
+            .ok_or(Error::new(ESTALE))
+    }
+
+    fn invalidate_attr(&mut self, nodeid: u64) {
+        if let Some(inode) = self.inodes.get_mut(&nodeid) {
+            inode.attr_expiry = Instant::now();
+        }
+    }
+
     async fn flush_forgets(&mut self) {
         while let Some((nodeid, nlookup)) = self.forget_queue.pop_front() {
             if let Err(err) = self.fuse.forget(nodeid, nlookup).await {
@@ -338,6 +319,42 @@ impl<T: FuseTransporter> Vfs<T> {
                 self.forget_queue.push_front((nodeid, nlookup));
                 break;
             }
+        }
+    }
+
+    // Public API
+
+    pub fn new(fuse_session: FuseSession<T>) -> Self {
+        let mut inodes = BTreeMap::new();
+        inodes.insert(
+            FUSE_ROOT_ID,
+            Inode {
+                nodeid: FUSE_ROOT_ID,
+                generation: None,
+                parent: FUSE_ROOT_ID,
+                attr: fuse_attr {
+                    ino: FUSE_ROOT_ID,
+                    mode: MODE_DIR as u32,
+                    ..fuse_attr::default()
+                },
+                attr_expiry: Instant::now(),
+                nlookup: 0,
+                forget_pending: false,
+                open_fd_count: 0,
+                child_count: 0,
+                used: 0,
+            },
+        );
+
+        Self {
+            fuse: fuse_session,
+            inodes,
+            dcache: BTreeMap::new(),
+            handles: HandleMap::new(),
+            forget_queue: VecDeque::with_capacity(FORGET_QUEUE_MIN_CAP),
+            next_used: 0,
+            #[cfg(feature = "lru-debug")]
+            evicted_names: Vec::new(),
         }
     }
 
@@ -379,6 +396,30 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok((nodeid, mode))
     }
 
+    pub async fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<(u64, u16)> {
+        let name_cstring = CString::new(name).map_err(|_| {
+            warn!("virtio-fsd: mkdir: dir name contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+
+        let payload = self
+            .fuse
+            .mkdir(parent, name_cstring, mode)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_MKDIR"))?;
+
+        self.invalidate_attr(parent);
+
+        let nodeid = payload.nodeid;
+        let mode = payload.attr.mode as u16 & MODE_TYPE;
+
+        // TODO: FUSE_RMDIR on failure?
+        self.merge_entry(parent, name, payload)?;
+
+        self.flush_forgets().await;
+        Ok((nodeid, mode))
+    }
+
     pub async fn create(
         &mut self,
         parent_nodeid: u64,
@@ -388,7 +429,7 @@ impl<T: FuseTransporter> Vfs<T> {
         path: Vec<String>,
     ) -> Result<usize> {
         let name_cstring = CString::new(name).map_err(|_| {
-            warn!("virtio-fsd: openat: file name contained an internal 0 byte.");
+            warn!("virtio-fsd: create: file name contained an internal 0 byte.");
             Error::new(EINVAL)
         })?;
 
@@ -637,13 +678,6 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    fn inode_mode(&self, nodeid: u64) -> Result<u16> {
-        self.inodes
-            .get(&nodeid)
-            .map(Inode::mode_type)
-            .ok_or(Error::new(ESTALE))
-    }
-
     pub async fn readdir(&mut self, fd: usize, offset: u64) -> Result<FuseReaddirOut> {
         match self.handles.get(fd)? {
             Handle::Directory { nodeid, fh, .. } => {
@@ -694,12 +728,6 @@ impl<T: FuseTransporter> Vfs<T> {
         self.touch(nodeid);
         self.touch(parent_id);
         Ok(out)
-    }
-
-    fn invalidate_attr(&mut self, nodeid: u64) {
-        if let Some(inode) = self.inodes.get_mut(&nodeid) {
-            inode.attr_expiry = Instant::now();
-        }
     }
 }
 

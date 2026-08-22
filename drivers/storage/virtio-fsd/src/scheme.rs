@@ -131,7 +131,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             });
         }
 
-        let mut target_name_to_create = None;
+        let mut to_be_created = None;
 
         if !path.is_empty() && path != "/" {
             for (i, name) in path_parts.iter().copied().enumerate() {
@@ -158,7 +158,9 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                     Err(err) => {
                         if err.errno == ENOENT && is_last_element && (flags & syscall::O_CREAT != 0)
                         {
-                            target_name_to_create = Some(name);
+                            let dir = flags & syscall::O_DIRECTORY != 0;
+                            to_be_created = Some((name, dir));
+
                             break;
                         }
                         return Err(err);
@@ -181,54 +183,57 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
         }
 
-        if target_name_to_create.is_none()
-            && flags & syscall::O_CREAT != 0
-            && flags & syscall::O_EXCL != 0
+        if to_be_created.is_none() && flags & syscall::O_CREAT != 0 && flags & syscall::O_EXCL != 0
         {
             return Err(Error::new(EEXIST));
         }
 
-        if flags & syscall::O_STAT != 0 {
-            let fd = self.vfs.insert_stat_only(nodeid, rel_path)?;
-
-            return Ok(OpenResult::ThisScheme {
-                number: fd,
-                flags: NewFdFlags::POSITIONED,
-            });
-        }
-
-        if let Some(name) = target_name_to_create {
+        if let Some((name, is_dir)) = to_be_created {
             // We broke out of the loop early, so `nodeid` is currently
             // the parent directory where the new file should be created.
-
-            let is_dir = false;
-            let open_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
 
             //TODO: clean
             let redox_mode = (flags & 0xFFFF) as u32;
             const S_IFREG: u32 = 0o100000;
-            let final_mode = redox_mode | S_IFREG;
+            const S_IFDIR: u32 = 0o40000;
+            let mode = if is_dir {
+                redox_mode | S_IFDIR
+            } else {
+                redox_mode | S_IFREG
+            };
 
-            let fd = self
-                .vfs
-                .create(nodeid, name, open_flags, final_mode, rel_path)
-                .await?;
+            if is_dir {
+                translate_redox_flags_to_fuse(flags, is_dir)?;
+                (nodeid, node_mode) = self.vfs.mkdir(nodeid, name, mode).await?;
+            } else {
+                let fuse_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
+                let fd = self
+                    .vfs
+                    .create(nodeid, name, fuse_flags, mode, rel_path)
+                    .await?;
 
-            return Ok(OpenResult::ThisScheme {
-                number: fd,
-                flags: NewFdFlags::POSITIONED,
-            });
-        } else {
-            let is_dir = node_mode == MODE_DIR;
-            let open_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
+                return Ok(OpenResult::ThisScheme {
+                    number: fd,
+                    flags: NewFdFlags::POSITIONED,
+                });
+            }
+        }
 
-            let fd = self.vfs.open(nodeid, open_flags, is_dir, rel_path).await?;
-
+        if flags & syscall::O_STAT != 0 {
+            let fd = self.vfs.insert_stat_only(nodeid, rel_path)?;
             return Ok(OpenResult::ThisScheme {
                 number: fd,
                 flags: NewFdFlags::POSITIONED,
             });
         }
+
+        let is_dir = node_mode == MODE_DIR;
+        let fuse_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
+        let fd = self.vfs.open(nodeid, fuse_flags, is_dir, rel_path).await?;
+        return Ok(OpenResult::ThisScheme {
+            number: fd,
+            flags: NewFdFlags::POSITIONED,
+        });
     }
 
     async fn unlinkat(

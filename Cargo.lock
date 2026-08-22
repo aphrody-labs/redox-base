@@ -1585,7 +1585,7 @@ checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2875,9 +2875,9 @@ dependencies = [
  "pcid",
  "redox-scheme",
  "redox_event",
- "redox_syscall 0.9.0",
+ "redox_syscall 0.9.1",
  "scheme-utils",
- "thiserror 2.0.18",
+ "thiserror 2.0.19",
  "virtio-core",
  "zerocopy",
 ]
