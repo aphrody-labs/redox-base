@@ -139,18 +139,18 @@ impl DmaPool {
     }
 }
 
-pub struct VirtioFsSession<'a> {
+pub struct VirtioFsSession {
     tag: [u8; VIRTIO_FS_TAG_SIZE],
-    hiprio_queue: Arc<Queue<'a>>,
+    hiprio_queue: Arc<Queue>,
     /// Only exists if VIRTIO_FS_F_NOTIFICATION is set.
-    notif_queue: Option<Arc<Queue<'a>>>,
+    notif_queue: Option<Arc<Queue>>,
     /// Only exists if VIRTIO_FS_F_NOTIFICATION is set.
     notif_buf_size: Option<u32>,
-    request_queues: Vec<Arc<Queue<'a>>>,
+    request_queues: Vec<Arc<Queue>>,
     dma_pool: DmaPool,
 }
 
-impl<'a> VirtioFsSession<'a> {
+impl<'a> VirtioFsSession {
     /// Creates a new VirtioFsSession by initializing the given VirtIO device.
     ///
     /// # Panics
@@ -215,14 +215,12 @@ impl<'a> VirtioFsSession<'a> {
 
         // hiprio queue is only used for FUSE_INTERRUPT, FUSE_FORGET, and FUSE_BATCH_FORGET requests.
         let hiprio_queue = device
-            .transport
-            .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
+            .setup_queue()
             .expect("virtio-fsd: failed to setup hiprio queue.");
 
         let notif_queue = if notif_supported {
             let nq = device
-                .transport
-                .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
+                .setup_queue()
                 .expect("virtio-fsd: failed to setup notification queue.");
 
             Some(nq)
@@ -234,11 +232,10 @@ impl<'a> VirtioFsSession<'a> {
             nrq >= 1,
             "virtio-fsd: at least one request queue is needed."
         );
-        let request_queues = (0..nrq)
+        let request_queues: Vec<_> = (0..nrq)
             .map(|_| {
                 device
-                    .transport
-                    .setup_queue(virtio_core::MSIX_PRIMARY_VECTOR, &device.irq_handle)
+                    .setup_queue()
                     .expect("virtio-fsd: failed to setup request queue.")
             })
             .collect();
@@ -269,21 +266,19 @@ impl<'a> VirtioFsSession<'a> {
         core::str::from_utf8(&self.tag[..tag_len]).expect("virtio-fsd: tag is not valid UTF-8.")
     }
 
-    async fn send(&self, chain: Vec<Buffer>) -> u32 {
+    async fn send(&self, chain: Vec<Buffer>) -> Result<u32, TransportError> {
         //TODO: round-robin or per-cpu?
-        self.request_queues[0].send(chain).await
+        Ok(self.request_queues[0].send(chain).await)
     }
 
-    async fn send_hiprio(&self, chain: Vec<Buffer>) {
+    async fn send_hiprio(&self, chain: Vec<Buffer>) -> Result<(), TransportError> {
         self.hiprio_queue.send(chain).await;
+        Ok(())
     }
 }
 
-impl FuseTransporter for VirtioFsSession<'_> {
+impl FuseTransporter for VirtioFsSession {
     /// Sends a FUSE request that expects at least a response header into the default queue.
-    ///
-    /// # Panics
-    /// This function panics if the underlying send operation fails. This happens because `virtio-core`'s `send()` method uses `unwrap()`.
     async fn send<I, O>(
         &self,
         request: FuseRequest<I>,
@@ -370,7 +365,7 @@ impl FuseTransporter for VirtioFsSession<'_> {
         // send and wait
 
         let chain = builder.build();
-        let virtio_written = self.send(chain).await;
+        let virtio_written = self.send(chain).await?;
 
         // parse the header
 
@@ -421,9 +416,6 @@ impl FuseTransporter for VirtioFsSession<'_> {
     /// - `FUSE_FORGET`
     /// - `FUSE_BATCH_FORGET`
     /// - `FUSE_INTERRUPT`
-    ///
-    /// # Panics
-    /// This function panics if the underlying send operation fails. This happens because `virtio-core`'s `send()` method uses `unwrap()`.
     async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), TransportError>
     where
         I: IntoBytes + Immutable,
@@ -445,7 +437,7 @@ impl FuseTransporter for VirtioFsSession<'_> {
 
         let chain = builder.build();
 
-        self.send_hiprio(chain).await;
+        self.send_hiprio(chain).await?;
 
         Ok(())
     }

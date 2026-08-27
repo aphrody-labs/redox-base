@@ -4,8 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "lru-debug")]
-use log::info;
 use log::warn;
 use scheme_utils::HandleMap;
 use syscall::{
@@ -255,15 +253,6 @@ impl<T: FuseTransporter> Vfs<T> {
             #[cfg(feature = "lru-debug")]
             {
                 let name = self.dcache_name(id);
-                info!(
-                    "virtio-fsd: LRU evict nodeid={id} name={} nlookup={} used={} parent={} cache={}/{}",
-                    name.as_deref().unwrap_or("?"),
-                    inode.nlookup,
-                    inode.used,
-                    inode.parent,
-                    self.inodes.len(),
-                    INODES_MAX_LEN
-                );
                 if let Some(name) = name {
                     if self.evicted_names.len() >= EVICT_LOG_CAP {
                         self.evicted_names.remove(0);
@@ -288,14 +277,6 @@ impl<T: FuseTransporter> Vfs<T> {
             {
                 evicted += 1;
             }
-        }
-        #[cfg(feature = "lru-debug")]
-        if evicted > 0 {
-            info!(
-                "virtio-fsd: LRU reclaimed {evicted} inode(s), queued {} FORGET(s), cache={}",
-                self.forget_queue.len(),
-                self.inodes.len()
-            );
         }
     }
 
@@ -654,7 +635,10 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     #[cfg(feature = "lru-debug")]
-    pub fn open_lru_log(&mut self) -> usize {
+    pub fn open_lru_log(&mut self, clear: bool) -> usize {
+        if clear {
+            self.evicted_names.clear();
+        }
         self.handles.insert(Handle::LruLog)
     }
 

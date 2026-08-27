@@ -125,8 +125,11 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         let path_parts: Vec<&str> = path_components(path);
         #[cfg(feature = "lru-debug")]
         if path_parts.as_slice() == [crate::vfs::LRU_EVICTED_NAME] && nodeid == FUSE_ROOT_ID {
+            // O_TRUNC resets the in-memory eviction log so selftests can isolate runs
+            // without restarting the daemon.
+            let clear = flags & syscall::O_TRUNC != 0;
             return Ok(OpenResult::ThisScheme {
-                number: self.vfs.open_lru_log(),
+                number: self.vfs.open_lru_log(clear),
                 flags: NewFdFlags::POSITIONED,
             });
         }
