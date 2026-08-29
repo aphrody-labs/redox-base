@@ -17,7 +17,7 @@ use crate::fuse::{
     fuse_entry_out,
 };
 
-const INODES_MAX_LEN: usize = 4096;
+const INODES_MAX_LEN: usize = 64 * 1024;
 const FORGET_QUEUE_MIN_CAP: usize = 1024;
 
 #[cfg(feature = "lru-debug")]
@@ -26,6 +26,14 @@ const EVICT_LOG_CAP: usize = 8192;
 #[cfg(feature = "lru-debug")]
 /// Debug node at the scheme root: one evicted dcache name per line, LRU order.
 pub const LRU_EVICTED_NAME: &str = ".lru_evicted";
+
+pub struct WalkResult {
+    pub nodeid: u64,
+    pub node_mode: u16,
+    parent_nodeid: u64,
+    pub rel_path: Vec<String>,
+    pub last_to_be_created: bool,
+}
 
 struct Inode {
     nodeid: u64,
@@ -104,8 +112,8 @@ impl<T: FuseTransporter> Vfs<T> {
 
     fn merge_entry(&mut self, parent: u64, name: &str, entry: fuse_entry_out) -> Result<()> {
         let now = Instant::now();
-        let attr_expiry = now + Duration::new(entry.attr_valid, entry.attr_valid_nsec);
-        let entry_expiry = now + Duration::new(entry.entry_valid, entry.entry_valid_nsec);
+        let attr_expiry = fuse_expiry(now, entry.attr_valid, entry.attr_valid_nsec);
+        let entry_expiry = fuse_expiry(now, entry.entry_valid, entry.entry_valid_nsec);
 
         let old_parent = if let Some(inode) = self.inodes.get_mut(&entry.nodeid) {
             match inode.generation {
@@ -180,10 +188,19 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     fn decrement_fd_count(&mut self, nodeid: u64) {
-        match self.inodes.get_mut(&nodeid) {
-            Some(inode) if inode.open_fd_count > 0 => inode.open_fd_count -= 1,
-            Some(_) => warn!("virtio-fsd: open_fd_count underflow nodeid={nodeid}"),
-            None => warn!("virtio-fsd: decrement_fd_count: no inode for nodeid={nodeid}"),
+        if let Some(inode) = self.inodes.get_mut(&nodeid) {
+            if inode.open_fd_count > 0 {
+                inode.open_fd_count -= 1;
+            }
+
+            if inode.forget_pending && inode.open_fd_count == 0 {
+                if inode.nlookup > 0 {
+                    self.forget_queue.push_back((nodeid, inode.nlookup));
+                }
+                self.inodes.remove(&nodeid);
+            }
+        } else {
+            warn!("virtio-fsd: decrement_fd_count: no inode for nodeid={nodeid}");
         }
     }
 
@@ -222,7 +239,7 @@ impl<T: FuseTransporter> Vfs<T> {
         if let Some(inode) = self.inodes.get_mut(&nodeid) {
             inode.attr = payload.attr;
             inode.attr_expiry =
-                Instant::now() + Duration::new(payload.attr_valid, payload.attr_valid_nsec);
+                fuse_expiry(Instant::now(), payload.attr_valid, payload.attr_valid_nsec);
         }
         mode
     }
@@ -236,8 +253,6 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     fn populate_forgets(&mut self) {
-        #[cfg(feature = "lru-debug")]
-        let mut evicted = 0u32;
         while self.inodes.len() >= INODES_MAX_LEN {
             let Some(id) = self.pick_lru_victim() else {
                 warn!(
@@ -272,10 +287,6 @@ impl<T: FuseTransporter> Vfs<T> {
 
             if inode.nlookup > 0 {
                 self.forget_queue.push_back((id, inode.nlookup));
-            }
-            #[cfg(feature = "lru-debug")]
-            {
-                evicted += 1;
             }
         }
     }
@@ -340,6 +351,10 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub async fn lookup(&mut self, parent: u64, name: &str) -> Result<(u64, u16)> {
+        if name.is_empty() {
+            return Err(Error::new(ENOENT));
+        }
+
         if let Some(nodeid) = self.cached_child(parent, name) {
             if let Some(inode) = self.inodes.get(&nodeid)
                 && inode.attr_valid()
@@ -365,9 +380,14 @@ impl<T: FuseTransporter> Vfs<T> {
             return Ok((nodeid, mode));
         }
 
+        let name_cstring = CString::new(name).map_err(|_| {
+            warn!("virtio-fsd: lookup: dir name contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+
         let payload = self
             .fuse
-            .lookup(parent, name)
+            .lookup(parent, name_cstring)
             .await
             .map_err(|e| e.into_syscall("FUSE_LOOKUP"))?;
         let nodeid = payload.nodeid;
@@ -378,6 +398,10 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub async fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<(u64, u16)> {
+        if name.is_empty() {
+            return Err(Error::new(ENOENT));
+        }
+
         let name_cstring = CString::new(name).map_err(|_| {
             warn!("virtio-fsd: mkdir: dir name contained an internal 0 byte.");
             Error::new(EINVAL)
@@ -385,7 +409,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let payload = self
             .fuse
-            .mkdir(parent, name_cstring, mode)
+            .mkdir(parent, name_cstring.clone(), mode)
             .await
             .map_err(|e| e.into_syscall("FUSE_MKDIR"))?;
 
@@ -394,8 +418,12 @@ impl<T: FuseTransporter> Vfs<T> {
         let nodeid = payload.nodeid;
         let mode = payload.attr.mode as u16 & MODE_TYPE;
 
-        // TODO: FUSE_RMDIR on failure?
-        self.merge_entry(parent, name, payload)?;
+        if let Err(err) = self.merge_entry(parent, name, payload) {
+            if let Err(rm_err) = self.fuse.rm(parent, name_cstring, true).await {
+                warn!("virtio-fsd: FUSE_RMDIR after merge_entry fail: {rm_err}");
+            }
+            return Err(err);
+        }
 
         self.flush_forgets().await;
         Ok((nodeid, mode))
@@ -409,6 +437,10 @@ impl<T: FuseTransporter> Vfs<T> {
         mode: u32,
         path: Vec<String>,
     ) -> Result<usize> {
+        if name.is_empty() {
+            return Err(Error::new(ENOENT));
+        }
+
         let name_cstring = CString::new(name).map_err(|_| {
             warn!("virtio-fsd: create: file name contained an internal 0 byte.");
             Error::new(EINVAL)
@@ -628,6 +660,22 @@ impl<T: FuseTransporter> Vfs<T> {
                 warn!("virtio-fsd: close: fd '{fd}' was not found in handles");
             }
         };
+
+        self.flush_forgets().await;
+    }
+
+    pub async fn shutdown(&mut self) {
+        let ids: Vec<usize> = self.handles.keys().copied().collect();
+        for id in ids {
+            self.close(id).await;
+        }
+
+        for (nodeid, inode) in &self.inodes {
+            if *nodeid != FUSE_ROOT_ID && inode.nlookup > 0 {
+                self.forget_queue.push_back((*nodeid, inode.nlookup));
+            }
+        }
+        self.flush_forgets().await;
     }
 
     pub fn scheme_root(&mut self) -> usize {
@@ -642,24 +690,117 @@ impl<T: FuseTransporter> Vfs<T> {
         self.handles.insert(Handle::LruLog)
     }
 
-    pub fn walk_start(&self, fd: usize) -> Result<(u64, u16, Vec<String>)> {
-        match self.handles.get(fd)? {
-            Handle::File { .. } => Err(Error::new(ENOTDIR)),
-            #[cfg(feature = "lru-debug")]
-            Handle::LruLog => Err(Error::new(ENOTDIR)),
-            Handle::Directory { nodeid, path, .. } => {
-                let mode = self.inode_mode(*nodeid)?;
-                Ok((*nodeid, mode, path_components(path)))
-            }
-            Handle::StatOnly { nodeid, path } => {
-                let mode = self.inode_mode(*nodeid)?;
-                if mode != MODE_DIR {
-                    return Err(Error::new(ENOTDIR));
-                }
-                Ok((*nodeid, mode, path_components(path)))
-            }
-            Handle::SchemeRoot => Ok((FUSE_ROOT_ID, MODE_DIR, Vec::new())),
+    /// Open the synthetic `.lru_evicted` debug node, or leave the call to FUSE.
+    ///
+    /// That name is not a FUSE inode. It exists only at scheme root, so this
+    /// matches a single path component from an absolute path, a scheme-root
+    /// handle, or a directory whose nodeid is `FUSE_ROOT_ID`. Nested
+    /// `.lru_evicted` (and every other path) returns `Ok(None)` and is walked
+    /// normally. `O_TRUNC` clears the in-memory eviction log.
+    #[cfg(feature = "lru-debug")]
+    pub fn try_open_lru_log(
+        &mut self,
+        fd: usize,
+        path: &str,
+        flags: usize,
+    ) -> Result<Option<usize>> {
+        let parts: Vec<&str> = path_components(path);
+        if parts.as_slice() != [LRU_EVICTED_NAME] {
+            return Ok(None);
         }
+        let at_root = if path.starts_with('/') {
+            true
+        } else {
+            match self.handles.get(fd)? {
+                Handle::SchemeRoot => true,
+                Handle::Directory { nodeid, .. } | Handle::StatOnly { nodeid, .. } => {
+                    *nodeid == FUSE_ROOT_ID
+                }
+                Handle::File { .. } | Handle::LruLog => false,
+            }
+        };
+        if !at_root {
+            return Ok(None);
+        }
+        let clear = flags & syscall::O_TRUNC != 0;
+        Ok(Some(self.open_lru_log(clear)))
+    }
+
+    pub async fn walk_path(
+        &mut self,
+        fd: usize,
+        path: &str,
+        open_flags: usize,
+    ) -> Result<WalkResult> {
+        let mut walk = WalkResult {
+            nodeid: 0,
+            node_mode: 0,
+            parent_nodeid: 0,
+            rel_path: Vec::new(),
+            last_to_be_created: false,
+        };
+
+        // TODO: revalidate path evaluation
+        (walk.nodeid, walk.node_mode, walk.rel_path) = if path.starts_with('/') {
+            (FUSE_ROOT_ID, MODE_DIR, Vec::new())
+        } else {
+            match self.handles.get(fd)? {
+                Handle::File { .. } => Err(Error::new(ENOTDIR)),
+                #[cfg(feature = "lru-debug")]
+                Handle::LruLog => Err(Error::new(ENOTDIR)),
+                Handle::Directory { nodeid, path, .. } => {
+                    let mode = self.inode_mode(*nodeid)?;
+                    Ok((*nodeid, mode, path_components(path)))
+                }
+                Handle::StatOnly { nodeid, path } => {
+                    let mode = self.inode_mode(*nodeid)?;
+                    if mode != MODE_DIR {
+                        return Err(Error::new(ENOTDIR));
+                    }
+                    Ok((*nodeid, mode, path_components(path)))
+                }
+                Handle::SchemeRoot => Ok((FUSE_ROOT_ID, MODE_DIR, Vec::new())),
+            }?
+        };
+
+        let path_parts: Vec<&str> = path_components(path);
+
+        if !path.is_empty() && path != "/" {
+            for (i, name) in path_parts.iter().copied().enumerate() {
+                let is_last_element = i == path_parts.len() - 1;
+
+                if name.is_empty() || name == "." {
+                    continue;
+                }
+
+                if name == ".." {
+                    (walk.nodeid, walk.node_mode) = self.parent_of(walk.nodeid)?;
+                    walk.rel_path.pop();
+                    continue;
+                }
+
+                walk.rel_path.push(name.to_owned());
+
+                walk.parent_nodeid = walk.nodeid;
+                match self.lookup(walk.parent_nodeid, name).await {
+                    Ok((id, mode)) => {
+                        walk.nodeid = id;
+                        walk.node_mode = mode;
+                    }
+                    Err(err) => {
+                        if is_last_element
+                            && err.errno == ENOENT
+                            && (open_flags & syscall::O_CREAT != 0)
+                        {
+                            walk.last_to_be_created = true;
+                            break;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(walk)
     }
 
     pub async fn readdir(&mut self, fd: usize, offset: u64) -> Result<FuseReaddirOut> {
@@ -677,6 +818,50 @@ impl<T: FuseTransporter> Vfs<T> {
                 Err(Error::new(EBADF))
             }
         }
+    }
+
+    pub async fn rm(&mut self, mut walk: WalkResult, is_dir: bool) -> Result<()> {
+        let name = walk
+            .rel_path
+            .pop()
+            .expect("virtio-fsd: Vfs::rm: rel_path is empty.");
+
+        if name.is_empty() {
+            return Err(Error::new(EINVAL));
+        }
+
+        if let Some(inode) = self.inodes.get_mut(&walk.nodeid) {
+            let name_cstring = CString::new(name.clone()).map_err(|_| {
+                warn!("virtio-fsd: rm: file name contained an internal 0 byte.");
+                Error::new(EINVAL)
+            })?;
+
+            let opcode = if is_dir { "FUSE_RMDIR" } else { "FUSE_UNLINK" };
+
+            self.fuse
+                .rm(walk.parent_nodeid, name_cstring, is_dir)
+                .await
+                .map_err(|e| e.into_syscall(opcode))?;
+
+            if inode.open_fd_count == 0 {
+                if inode.nlookup > 0 {
+                    self.forget_queue.push_back((walk.nodeid, inode.nlookup));
+                }
+                self.inodes.remove(&walk.nodeid);
+            } else {
+                inode.forget_pending = true;
+            }
+        } else {
+            return Err(Error::new(ENOENT));
+        }
+
+        if let Some(parent) = self.inodes.get_mut(&walk.parent_nodeid) {
+            parent.child_count = parent.child_count.saturating_sub(1);
+        }
+        self.drop_dentry(walk.parent_nodeid, &name);
+        self.invalidate_attr(walk.parent_nodeid);
+        self.flush_forgets().await;
+        Ok(())
     }
 
     pub fn get_path(&self, fd: usize) -> Result<&str> {
@@ -715,9 +900,22 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 }
 
-pub(crate) fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
+fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
     path.split('/')
         .filter(|s| !s.is_empty())
         .map(T::from)
         .collect()
+}
+
+/// Cache expiry from a FUSE `*_valid`/`*_valid_nsec` pair. Clamps nsec to
+/// `0..=999_999_999` like the kernel does (no carry into seconds, so
+/// `Duration::new` can't panic). Saturates to a large TTL if `sec` is
+/// huge (e.g. `u64::MAX` for "forever"); if that still overflows, falls
+/// back to `now` (zero TTL, not infinite, not true saturation, but safe).
+fn fuse_expiry(now: Instant, sec: u64, nsec: u32) -> Instant {
+    const NS_PER_SEC: u32 = 1_000_000_000;
+    let ttl = Duration::new(sec, nsec.min(NS_PER_SEC - 1));
+    now.checked_add(ttl)
+        .or_else(|| now.checked_add(Duration::from_secs(u32::MAX as u64)))
+        .unwrap_or(now)
 }

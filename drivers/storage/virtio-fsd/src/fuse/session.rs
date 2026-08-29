@@ -365,26 +365,28 @@ where
         Ok(FuseReaddirOut::new(buf))
     }
 
-    pub async fn lookup(&self, root_nodeid: u64, name: &str) -> Result<fuse_entry_out, FuseError> {
+    pub async fn lookup(
+        &self,
+        parent_nodeid: u64,
+        name: CString,
+    ) -> Result<fuse_entry_out, FuseError> {
         let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
 
-        let mut name = name.as_bytes().to_vec();
+        let name = name.as_bytes_with_nul();
+        let name_len = name.len();
 
-        if name.len() > FUSE_LOOKUP_NAME_MAX {
+        if name_len > NAME_MAX {
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        name.push(0);
-
-        // TODO: This can be simplified, once send_request accepts a pre allocated dma buffer.
-        let mut name_buf = [0u8; FUSE_LOOKUP_NAME_MAX + 1];
+        let mut name_buf = [0u8; NAME_MAX];
         name_buf[..name.len()].copy_from_slice(&name);
 
         let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + name.len()) as u32,
+            len: (mem::size_of::<fuse_in_header>() + name_len) as u32,
             opcode: fuse_opcode::FUSE_LOOKUP.into(),
             unique,
-            nodeid: root_nodeid,
+            nodeid: parent_nodeid,
             uid: 0,
             gid: 0,
             pid: 0,
@@ -502,22 +504,26 @@ where
 
     pub async fn create(
         &self,
-        nodeid: u64,
-        file_name: CString,
+        parent_nodeid: u64,
+        name: CString,
         flags: u32,
         mode: u32,
     ) -> Result<FuseCreateOut, FuseError> {
         let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
 
-        let data = file_name.as_bytes_with_nul();
-        let size = data.len();
+        let name = name.as_bytes_with_nul();
+        let name_len = name.len();
+
+        if name_len > NAME_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
 
         let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_create_in>() + size)
+            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_create_in>() + name_len)
                 as u32,
             opcode: fuse_opcode::FUSE_CREATE.into(),
             unique,
-            nodeid,
+            nodeid: parent_nodeid,
             uid: 0,
             gid: 0,
             pid: 0,
@@ -538,7 +544,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::Send { data })
+            .send(request, AllocStrategy::Send { data: name })
             .await?
             .into_struct()
     }
@@ -643,20 +649,25 @@ where
 
     pub async fn mkdir(
         &self,
-        nodeid: u64,
+        parent_nodeid: u64,
         name: CString,
         mode: u32,
     ) -> Result<fuse_entry_out, FuseError> {
         let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
 
-        let data = name.as_bytes_with_nul();
-        let size = data.len();
+        let name = name.as_bytes_with_nul();
+        let name_len = name.len();
+
+        if name_len > NAME_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
 
         let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_mkdir_in>() + size) as u32,
+            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_mkdir_in>() + name_len)
+                as u32,
             opcode: fuse_opcode::FUSE_MKDIR.into(),
             unique,
-            nodeid,
+            nodeid: parent_nodeid,
             uid: 0,
             gid: 0,
             pid: 0,
@@ -672,8 +683,53 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::Send { data })
+            .send(request, AllocStrategy::Send { data: name })
             .await?
             .into_struct()
+    }
+
+    pub async fn rm(
+        &self,
+        parent_nodeid: u64,
+        name: CString,
+        is_dir: bool,
+    ) -> Result<(), FuseError> {
+        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
+
+        let name = name.as_bytes_with_nul();
+        let name_len = name.len();
+
+        if name_len > NAME_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
+
+        let mut name_buf = [0u8; NAME_MAX];
+        name_buf[..name.len()].copy_from_slice(&name);
+
+        let fuse_in_header = fuse_in_header {
+            len: (mem::size_of::<fuse_in_header>() + name_len) as u32,
+            opcode: if is_dir {
+                fuse_opcode::FUSE_RMDIR.into()
+            } else {
+                fuse_opcode::FUSE_UNLINK.into()
+            },
+            unique,
+            nodeid: parent_nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            total_extlen: 0,
+            padding: 0,
+        };
+
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(name_buf),
+        };
+
+        self.transporter
+            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .await?
+            .into_unit()
     }
 }

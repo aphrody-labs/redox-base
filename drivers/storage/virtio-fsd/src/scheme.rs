@@ -6,16 +6,17 @@ use redox_scheme::{
 use scheme_utils::FpathWriter;
 use std::io;
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
-use syscall::error::{EBADF, ENOENT, EOPNOTSUPP, ESPIPE, Error, Result};
+use syscall::error::{EBADF, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EEXIST, EINTR, EISDIR, ELOOP, ENOTDIR, EWOULDBLOCK, EventFlags, MODE_DIR,
-    MODE_SYMLINK, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
+    EAGAIN, EBADMSG, EEXIST, EINTR, EISDIR, ELOOP, ENOENT, ENOTDIR, EWOULDBLOCK, EventFlags,
+    MODE_DIR, MODE_SYMLINK, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta,
+    TimeSpec,
 };
 
-use crate::fuse::{FUSE_ROOT_ID, FuseTransporter};
+use crate::fuse::FuseTransporter;
 use crate::linux_abi;
-use crate::vfs::{Vfs, path_components};
+use crate::vfs::Vfs;
 
 pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
     socket: &'sock Socket,
@@ -46,13 +47,16 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
         self.inner.vfs.close(id).await
     }
 
+    pub async fn shutdown(&mut self) {
+        self.inner.vfs.shutdown().await
+    }
+
     pub async fn tick(&mut self) -> io::Result<()> {
         loop {
             let request = match self.inner.socket.next_request(SignalBehavior::Interrupt) {
                 Ok(Some(request)) => request,
                 Ok(None) => {
-                    // Scheme likely got unmounted
-                    // TODO: return this to caller instead
+                    self.inner.vfs.shutdown().await;
                     std::process::exit(0);
                 }
                 Err(error) if error.errno == EWOULDBLOCK || error.errno == EAGAIN => break,
@@ -115,64 +119,24 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     ) -> Result<OpenResult> {
         // TODO: check permissions
 
-        // TODO: revalidate path evaluation
-        let (mut nodeid, mut node_mode, mut rel_path) = if path.starts_with('/') {
-            (FUSE_ROOT_ID, MODE_DIR, Vec::new())
-        } else {
-            self.vfs.walk_start(fd)?
-        };
-
-        let path_parts: Vec<&str> = path_components(path);
         #[cfg(feature = "lru-debug")]
-        if path_parts.as_slice() == [crate::vfs::LRU_EVICTED_NAME] && nodeid == FUSE_ROOT_ID {
-            // O_TRUNC resets the in-memory eviction log so selftests can isolate runs
-            // without restarting the daemon.
-            let clear = flags & syscall::O_TRUNC != 0;
+        if let Some(number) = self.vfs.try_open_lru_log(fd, path, flags)? {
             return Ok(OpenResult::ThisScheme {
-                number: self.vfs.open_lru_log(clear),
+                number,
                 flags: NewFdFlags::POSITIONED,
             });
         }
 
-        let mut to_be_created = None;
+        let mut walk = self.vfs.walk_path(fd, path, flags).await?;
 
-        if !path.is_empty() && path != "/" {
-            for (i, name) in path_parts.iter().copied().enumerate() {
-                let is_last_element = i == path_parts.len() - 1;
+        let to_be_created = if walk.last_to_be_created {
+            let dir = flags & syscall::O_DIRECTORY != 0;
+            Some((walk.rel_path.last().unwrap().clone(), dir))
+        } else {
+            None
+        };
 
-                if name.is_empty() || name == "." {
-                    continue;
-                }
-
-                if name == ".." {
-                    (nodeid, node_mode) = self.vfs.parent_of(nodeid)?;
-                    rel_path.pop();
-                    continue;
-                }
-
-                rel_path.push(name.to_owned());
-
-                let parent = nodeid;
-                match self.vfs.lookup(parent, name).await {
-                    Ok((id, mode)) => {
-                        nodeid = id;
-                        node_mode = mode;
-                    }
-                    Err(err) => {
-                        if err.errno == ENOENT && is_last_element && (flags & syscall::O_CREAT != 0)
-                        {
-                            let dir = flags & syscall::O_DIRECTORY != 0;
-                            to_be_created = Some((name, dir));
-
-                            break;
-                        }
-                        return Err(err);
-                    }
-                }
-            }
-        }
-
-        if node_mode == MODE_SYMLINK {
+        if walk.node_mode == MODE_SYMLINK {
             // fall thorugh if stat only
             if flags & syscall::O_STAT == 0 {
                 if flags & syscall::O_NOFOLLOW != 0 {
@@ -206,13 +170,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             };
 
             if is_dir {
-                translate_redox_flags_to_fuse(flags, is_dir)?;
-                (nodeid, node_mode) = self.vfs.mkdir(nodeid, name, mode).await?;
+                translate_redox_flags_to_fuse(flags, is_dir, false)?;
+                (walk.nodeid, walk.node_mode) = self.vfs.mkdir(walk.nodeid, &name, mode).await?;
             } else {
-                let fuse_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
+                let fuse_flags = translate_redox_flags_to_fuse(flags, is_dir, true)?;
                 let fd = self
                     .vfs
-                    .create(nodeid, name, fuse_flags, mode, rel_path)
+                    .create(walk.nodeid, &name, fuse_flags, mode, walk.rel_path)
                     .await?;
 
                 return Ok(OpenResult::ThisScheme {
@@ -223,16 +187,22 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if flags & syscall::O_STAT != 0 {
-            let fd = self.vfs.insert_stat_only(nodeid, rel_path)?;
+            let fd = self.vfs.insert_stat_only(walk.nodeid, walk.rel_path)?;
             return Ok(OpenResult::ThisScheme {
                 number: fd,
                 flags: NewFdFlags::POSITIONED,
             });
         }
 
-        let is_dir = node_mode == MODE_DIR;
-        let fuse_flags = translate_redox_flags_to_fuse(flags, is_dir)?;
-        let fd = self.vfs.open(nodeid, fuse_flags, is_dir, rel_path).await?;
+        let is_dir = walk.node_mode == MODE_DIR;
+        if is_dir && flags & syscall::O_DIRECTORY == 0 {
+            return Err(Error::new(EISDIR));
+        }
+        let fuse_flags = translate_redox_flags_to_fuse(flags, is_dir, false)?;
+        let fd = self
+            .vfs
+            .open(walk.nodeid, fuse_flags, is_dir, walk.rel_path)
+            .await?;
         return Ok(OpenResult::ThisScheme {
             number: fd,
             flags: NewFdFlags::POSITIONED,
@@ -246,8 +216,15 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         flags: usize,
         ctx: &CallerCtx,
     ) -> Result<()> {
-        warn!("virtio-fsd: unlinkat is not supported on path {path}");
-        Err(Error::new(EOPNOTSUPP))
+        // relibc canonicalizes first, unlinkat never receives "." or ".."
+
+        let walk = self.vfs.walk_path(fd, path, 0).await?;
+        if walk.last_to_be_created {
+            return Err(Error::new(ENOENT));
+        }
+
+        let is_dir = flags & syscall::AT_REMOVEDIR == syscall::AT_REMOVEDIR;
+        Ok(self.vfs.rm(walk, is_dir).await?)
     }
 
     /* Resource operations */
@@ -473,7 +450,11 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
 // Helpers
 
-fn translate_redox_flags_to_fuse(redox_flags: usize, is_dir: bool) -> Result<u32> {
+fn translate_redox_flags_to_fuse(
+    redox_flags: usize,
+    is_dir: bool,
+    for_create: bool,
+) -> Result<u32> {
     let accmode = redox_flags & syscall::O_ACCMODE;
 
     if is_dir {
@@ -493,11 +474,11 @@ fn translate_redox_flags_to_fuse(redox_flags: usize, is_dir: bool) -> Result<u32
     };
 
     if !is_dir {
-        if redox_flags & syscall::O_CREAT != 0 {
+        if for_create && redox_flags & syscall::O_CREAT != 0 {
             linux_flags |= linux_abi::O_CREAT;
         }
 
-        if redox_flags & syscall::O_EXCL != 0 {
+        if for_create && redox_flags & syscall::O_EXCL != 0 {
             linux_flags |= linux_abi::O_EXCL;
         }
 
@@ -513,10 +494,8 @@ fn translate_redox_flags_to_fuse(redox_flags: usize, is_dir: bool) -> Result<u32
         if redox_flags & syscall::O_NONBLOCK != 0 {
             linux_flags |= linux_abi::O_NONBLOCK;
         }
-    } else {
-        if redox_flags & syscall::O_DIRECTORY != 0 {
-            linux_flags |= linux_abi::O_DIRECTORY;
-        }
+    } else if redox_flags & syscall::O_DIRECTORY != 0 {
+        linux_flags |= linux_abi::O_DIRECTORY;
     }
 
     Ok(linux_flags)

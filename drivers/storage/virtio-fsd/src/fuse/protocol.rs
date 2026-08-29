@@ -4,7 +4,8 @@ use zerocopy::{FromBytes, Immutable};
 
 pub const FUSE_READDIR_BUFFER_SIZE: u32 =
     (PAGE_SIZE - core::mem::size_of::<fuse_out_header>()) as u32;
-pub const FUSE_LOOKUP_NAME_MAX: usize = 255;
+
+pub const NAME_MAX: usize = 255 + 1;
 
 pub struct FuseDirent<'a> {
     pub ino: u64,

@@ -107,5 +107,6 @@ fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSe
         }
     }
 
+    futures::executor::block_on(scheme.shutdown());
     std::process::exit(0);
 }
