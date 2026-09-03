@@ -1,17 +1,14 @@
-use common::dma::Dma;
 use core::slice;
+use std::ops::{Deref, DerefMut};
+use std::ptr;
+use std::sync::Arc;
+
+use common::dma::Dma;
 use log::warn;
-use std::{
-    ops::{Deref, DerefMut},
-    ptr,
-    sync::Arc,
-};
 use syscall::PAGE_SIZE;
-use virtio_core::{
-    Device,
-    spec::{Buffer, ChainBuilder, DescriptorFlags},
-    transport::Queue,
-};
+use virtio_core::Device;
+use virtio_core::spec::{Buffer, ChainBuilder, DescriptorFlags};
+use virtio_core::transport::Queue;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fuse::{

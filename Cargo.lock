@@ -2875,9 +2875,9 @@ dependencies = [
  "pcid",
  "redox-scheme",
  "redox_event",
- "redox_syscall 0.9.1",
+ "redox_syscall 0.9.3",
  "scheme-utils",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "virtio-core",
  "zerocopy",
 ]

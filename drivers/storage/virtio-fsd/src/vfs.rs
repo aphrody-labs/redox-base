@@ -1,16 +1,11 @@
-use std::{
-    collections::{BTreeMap, VecDeque},
-    ffi::CString,
-    time::{Duration, Instant},
-};
+use std::collections::{BTreeMap, VecDeque};
+use std::ffi::CString;
+use std::time::{Duration, Instant};
 
 use log::warn;
 use scheme_utils::HandleMap;
-use syscall::{
-    EBADF, EINVAL, EISDIR, ENOENT, ENOTDIR,
-    error::{ESTALE, Error, Result},
-};
-use syscall::{MODE_DIR, MODE_TYPE};
+use syscall::error::{ESTALE, Error, Result};
+use syscall::{EBADF, EINVAL, EISDIR, ENOENT, ENOTDIR, MODE_DIR, MODE_TYPE};
 
 use crate::fuse::{
     FUSE_ROOT_ID, FuseReaddirOut, FuseSession, FuseTransporter, fuse_attr, fuse_attr_out,

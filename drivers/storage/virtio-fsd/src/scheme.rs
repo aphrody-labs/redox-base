@@ -1,10 +1,11 @@
+use std::io;
+
 use log::warn;
 use redox_scheme::scheme::{SchemeAsync, SchemeState};
 use redox_scheme::{
     CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
 };
 use scheme_utils::FpathWriter;
-use std::io;
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;

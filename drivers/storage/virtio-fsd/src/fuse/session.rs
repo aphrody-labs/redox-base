@@ -1,3 +1,7 @@
+use std::ffi::CString;
+use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use fuse_abi::linux::{
     FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
     FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out, fuse_create_in,
@@ -6,11 +10,6 @@ use fuse_abi::linux::{
     fuse_read_in, fuse_release_in, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
-use std::{
-    ffi::CString,
-    mem,
-    sync::atomic::{AtomicU64, Ordering},
-};
 use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
