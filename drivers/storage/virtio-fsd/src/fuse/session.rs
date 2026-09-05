@@ -731,4 +731,102 @@ where
             .await?
             .into_unit()
     }
+
+    pub async fn readlink(&self, nodeid: u64) -> Result<String, FuseError> {
+        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
+
+        let fuse_in_header = fuse_in_header {
+            len: mem::size_of::<fuse_in_header>() as u32,
+            opcode: fuse_opcode::FUSE_READLINK.into(),
+            unique,
+            nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            total_extlen: 0,
+            padding: 0,
+        };
+
+        let request: FuseRequest<()> = FuseRequest {
+            fuse_in_header,
+            fuse_in: None,
+        };
+
+        let mut buf = vec![0u8; FUSE_READLINK_MAX];
+
+        let n = self
+            .transporter
+            .send::<_, ()>(request, AllocStrategy::Recv { buf: &mut buf })
+            .await?
+            .into_size()?;
+
+        if n > FUSE_READLINK_MAX {
+            warn!("virtio-fsd: readlink: path length is larger than FUSE_READLINK_MAX");
+            return Err(FuseError::MalformedPayload);
+        }
+
+        buf.truncate(n);
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
+
+        String::from_utf8(buf).map_err(|e| {
+            warn!("virtio-fsd: readlink: path is not a valid utf8: {e:?}");
+            FuseError::MalformedPayload
+        })
+    }
+
+    pub async fn symlink(
+        &self,
+        parent_nodeid: u64,
+        name: &CString,
+        path: &CString,
+    ) -> Result<fuse_entry_out, FuseError> {
+        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
+
+        let name = name.as_bytes_with_nul();
+        let path = path.as_bytes_with_nul();
+
+        let name_len = name.len();
+        if name_len > NAME_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
+
+        let path_len = path.len();
+        if name_len + path_len > FUSE_SYMLINK_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
+
+        let fuse_in_header = fuse_in_header {
+            len: (mem::size_of::<fuse_in_header>() + name_len + path_len) as u32,
+            opcode: fuse_opcode::FUSE_SYMLINK.into(),
+            unique,
+            nodeid: parent_nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            total_extlen: 0,
+            padding: 0,
+        };
+
+        let mut data = [0u8; FUSE_SYMLINK_MAX];
+
+        data[..name_len].copy_from_slice(name);
+        data[name_len..name_len + path_len].copy_from_slice(path);
+
+        let request: FuseRequest<()> = FuseRequest {
+            fuse_in_header,
+            fuse_in: None,
+        };
+
+        self.transporter
+            .send(
+                request,
+                AllocStrategy::Send {
+                    data: &data[..name_len + path_len],
+                },
+            )
+            .await?
+            .into_struct()
+    }
 }

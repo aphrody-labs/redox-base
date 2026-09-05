@@ -10,9 +10,9 @@ use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EBADF, EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EEXIST, EINTR, EISDIR, ELOOP, ENOENT, ENOTDIR, EWOULDBLOCK, EventFlags,
-    MODE_DIR, MODE_SYMLINK, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta,
-    TimeSpec,
+    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, EWOULDBLOCK,
+    EventFlags, MODE_DIR, MODE_SYMLINK, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind,
+    StdFsCallMeta, TimeSpec,
 };
 
 use crate::fuse::FuseTransporter;
@@ -137,18 +137,31 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             None
         };
 
-        if walk.node_mode == MODE_SYMLINK {
-            // fall thorugh if stat only
-            if flags & syscall::O_STAT == 0 {
-                if flags & syscall::O_NOFOLLOW != 0 {
-                    warn!("virtio-fsd: O_NOFOLLOW enforced. Refusing to open symlink.");
-                    return Err(Error::new(ELOOP));
-                } else {
-                    // TODO: implement FUSE_READLINK
-                    warn!("virtio-fsd: symlink following not implemented yet.");
-                    return Err(Error::new(EOPNOTSUPP));
-                }
+        let o_stat = flags & syscall::O_STAT != 0;
+        let o_symlink = flags & syscall::O_SYMLINK != 0;
+        let o_nofollow = flags & syscall::O_NOFOLLOW != 0;
+
+        if o_symlink && flags & syscall::O_DIRECTORY != 0 {
+            return Err(Error::new(EINVAL));
+        }
+
+        // ln -s does not send O_EXCL. If the name already exists, fail here
+        // rather than opening the link and erroring on the later write.
+        if o_symlink && flags & syscall::O_CREAT != 0 && to_be_created.is_none() {
+            return Err(Error::new(EEXIST));
+        }
+
+        // O_SYMLINK opens the link itself (how Redox implements readlink).
+        // O_STAT is lstat: metadata of the link, do not follow. Otherwise follow.
+        if walk.node_mode == MODE_SYMLINK && !o_stat && !o_symlink {
+            if o_nofollow {
+                return Err(Error::new(ELOOP));
             }
+            walk = self.vfs.follow_chain(walk).await?;
+        }
+
+        if o_symlink && to_be_created.is_none() && walk.node_mode != MODE_SYMLINK {
+            return Err(Error::new(EINVAL));
         }
 
         if to_be_created.is_none() && flags & syscall::O_CREAT != 0 && flags & syscall::O_EXCL != 0
@@ -157,8 +170,18 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if let Some((name, is_dir)) = to_be_created {
-            // We broke out of the loop early, so `nodeid` is currently
+            // We broke out of the loop early, so `walk.nodeid` is currently
             // the parent directory where the new file should be created.
+
+            if o_symlink {
+                let fd = self
+                    .vfs
+                    .pre_create_symlink(walk.nodeid, name, walk.rel_path)?;
+                return Ok(OpenResult::ThisScheme {
+                    number: fd,
+                    flags: NewFdFlags::POSITIONED,
+                });
+            }
 
             //TODO: clean
             let redox_mode = (flags & 0xFFFF) as u32;
@@ -187,8 +210,19 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
             }
         }
 
-        if flags & syscall::O_STAT != 0 {
+        if o_stat {
             let fd = self.vfs.insert_stat_only(walk.nodeid, walk.rel_path)?;
+            return Ok(OpenResult::ThisScheme {
+                number: fd,
+                flags: NewFdFlags::POSITIONED,
+            });
+        }
+
+        if o_symlink {
+            let target = self.vfs.readlink(walk.nodeid).await?;
+            let fd = self
+                .vfs
+                .insert_symlink(walk.nodeid, walk.rel_path, target)?;
             return Ok(OpenResult::ThisScheme {
                 number: fd,
                 flags: NewFdFlags::POSITIONED,

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use log::warn;
 use scheme_utils::HandleMap;
 use syscall::error::{ESTALE, Error, Result};
-use syscall::{EBADF, EINVAL, EISDIR, ENOENT, ENOTDIR, MODE_DIR, MODE_TYPE};
+use syscall::{EBADF, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, MODE_DIR, MODE_SYMLINK, MODE_TYPE};
 
 use crate::fuse::{
     FUSE_ROOT_ID, FuseReaddirOut, FuseSession, FuseTransporter, fuse_attr, fuse_attr_out,
@@ -13,6 +13,7 @@ use crate::fuse::{
 };
 
 const INODES_MAX_LEN: usize = 64 * 1024;
+const SYMLOOP_MAX: u32 = 40;
 const FORGET_QUEUE_MIN_CAP: usize = 1024;
 
 #[cfg(feature = "lru-debug")]
@@ -77,6 +78,18 @@ enum Handle {
     },
     StatOnly {
         nodeid: u64,
+        path: String,
+    },
+    Symlink {
+        nodeid: u64,
+        path: String,
+        target: String,
+    },
+    /// Redox doesn't have a dedicated symlink creation scheme call,
+    /// relibc splits that into a create plus a write.
+    SymlinkPreCreate {
+        parent_nodeid: u64,
+        name: String,
         path: String,
     },
     SchemeRoot,
@@ -415,7 +428,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         if let Err(err) = self.merge_entry(parent, name, payload) {
             if let Err(rm_err) = self.fuse.rm(parent, name_cstring, true).await {
-                warn!("virtio-fsd: FUSE_RMDIR after merge_entry fail: {rm_err}");
+                warn!("virtio-fsd: FUSE_RMDIR failed after a merge_entry fail: {rm_err}");
             }
             return Err(err);
         }
@@ -520,8 +533,9 @@ impl<T: FuseTransporter> Vfs<T> {
             Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
                 (*nodeid, Some(*fh))
             }
-            Handle::StatOnly { nodeid, .. } => (*nodeid, None),
+            Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
             Handle::SchemeRoot => (FUSE_ROOT_ID, None),
+            Handle::SymlinkPreCreate { .. } => return Err(Error::new(EBADF)),
             #[cfg(feature = "lru-debug")]
             Handle::LruLog => {
                 return Ok(fuse_attr {
@@ -553,7 +567,7 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub async fn read(&mut self, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(0);
         }
 
@@ -563,6 +577,16 @@ impl<T: FuseTransporter> Vfs<T> {
                 .read(*nodeid, *fh, offset, buf, 0, 0)
                 .await
                 .map_err(|e| e.into_syscall("FUSE_READ")),
+            Handle::Symlink { target, .. } => {
+                let data = target.as_bytes();
+                let off = offset as usize;
+                if off >= data.len() {
+                    return Ok(0);
+                }
+                let n = (data.len() - off).min(buf.len());
+                buf[..n].copy_from_slice(&data[off..off + n]);
+                Ok(n)
+            }
             #[cfg(feature = "lru-debug")]
             Handle::LruLog => {
                 let data = self.evicted_names.join("\n");
@@ -583,12 +607,11 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub async fn write(&mut self, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
-        if buf.len() == 0 {
-            return Ok(0);
-        }
-
-        match self.handles.get(fd)? {
+        let (parent_nodeid, name, path) = match self.handles.get(fd)? {
             Handle::File { nodeid, fh, .. } => {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
                 let nodeid = *nodeid;
                 let fh = *fh;
                 let payload = self
@@ -597,14 +620,65 @@ impl<T: FuseTransporter> Vfs<T> {
                     .await
                     .map_err(|e| e.into_syscall("FUSE_WRITE"))?;
                 self.invalidate_attr(nodeid);
-                Ok(payload.size as usize)
+                return Ok(payload.size as usize);
             }
-            Handle::Directory { .. } => Err(Error::new(EISDIR)),
-            _ => {
-                warn!("virtio-fsd: write: fd '{fd}' is not associated with a valid file.");
-                Err(Error::new(EBADF))
+            Handle::SymlinkPreCreate {
+                parent_nodeid,
+                name,
+                path,
+            } => (*parent_nodeid, name.clone(), path.clone()),
+            Handle::Directory { .. } => return Err(Error::new(EISDIR)),
+            Handle::Symlink { .. } | Handle::StatOnly { .. } | Handle::SchemeRoot => {
+                return Err(Error::new(EBADF));
             }
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => return Err(Error::new(EBADF)),
+        };
+
+        if offset != 0 {
+            return Err(Error::new(EINVAL));
         }
+
+        let name_cstring = CString::new(name.as_str()).map_err(|_| {
+            warn!("virtio-fsd: write symlink: file name contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+
+        let target = std::str::from_utf8(buf)
+            .map_err(|e| {
+                warn!("virtio-fsd: write symlink: target is not valid utf8: {e:?}");
+                Error::new(EINVAL)
+            })?
+            .to_owned();
+        let target_cstring = CString::new(target.as_str()).map_err(|_| {
+            warn!("virtio-fsd: write symlink: target contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+
+        let payload = self
+            .fuse
+            .symlink(parent_nodeid, &name_cstring, &target_cstring)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_SYMLINK"))?;
+
+        let nodeid = payload.nodeid;
+        if let Err(err) = self.merge_entry(parent_nodeid, &name, payload) {
+            if let Err(rm_err) = self.fuse.rm(parent_nodeid, name_cstring, false).await {
+                warn!("virtio-fsd: FUSE_UNLINK failed after a merge_entry fail: {rm_err}");
+            }
+            return Err(err);
+        }
+        self.flush_forgets().await;
+
+        self.invalidate_attr(parent_nodeid);
+        self.increment_fd_count(nodeid)?;
+
+        *self.handles.get_mut(fd)? = Handle::Symlink {
+            nodeid,
+            path,
+            target,
+        };
+        Ok(buf.len())
     }
 
     pub async fn fsync(&self, fd: usize) -> Result<()> {
@@ -644,10 +718,11 @@ impl<T: FuseTransporter> Vfs<T> {
                     }
                     self.decrement_fd_count(nodeid);
                 }
-                Handle::StatOnly { nodeid, .. } => {
+                Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => {
                     self.decrement_fd_count(nodeid);
                 }
                 Handle::SchemeRoot => {}
+                Handle::SymlinkPreCreate { .. } => {}
                 #[cfg(feature = "lru-debug")]
                 Handle::LruLog => {}
             },
@@ -711,7 +786,10 @@ impl<T: FuseTransporter> Vfs<T> {
                 Handle::Directory { nodeid, .. } | Handle::StatOnly { nodeid, .. } => {
                     *nodeid == FUSE_ROOT_ID
                 }
-                Handle::File { .. } | Handle::LruLog => false,
+                Handle::File { .. }
+                | Handle::Symlink { .. }
+                | Handle::SymlinkPreCreate { .. }
+                | Handle::LruLog => false,
             }
         };
         if !at_root {
@@ -719,6 +797,19 @@ impl<T: FuseTransporter> Vfs<T> {
         }
         let clear = flags & syscall::O_TRUNC != 0;
         Ok(Some(self.open_lru_log(clear)))
+    }
+
+    pub(crate) async fn follow_chain(&mut self, mut walk: WalkResult) -> Result<WalkResult> {
+        let mut hops = 0u32;
+        while walk.node_mode == MODE_SYMLINK {
+            hops += 1;
+            if hops > SYMLOOP_MAX {
+                return Err(Error::new(ELOOP));
+            }
+            let link_path = self.readlink(walk.nodeid).await?;
+            walk = self.walk_link(walk, &link_path).await?;
+        }
+        Ok(walk)
     }
 
     pub async fn walk_path(
@@ -740,7 +831,9 @@ impl<T: FuseTransporter> Vfs<T> {
             (FUSE_ROOT_ID, MODE_DIR, Vec::new())
         } else {
             match self.handles.get(fd)? {
-                Handle::File { .. } => Err(Error::new(ENOTDIR)),
+                Handle::File { .. } | Handle::Symlink { .. } | Handle::SymlinkPreCreate { .. } => {
+                    Err(Error::new(ENOTDIR))
+                }
                 #[cfg(feature = "lru-debug")]
                 Handle::LruLog => Err(Error::new(ENOTDIR)),
                 Handle::Directory { nodeid, path, .. } => {
@@ -793,6 +886,59 @@ impl<T: FuseTransporter> Vfs<T> {
                         return Err(err);
                     }
                 }
+
+                if !is_last_element && walk.node_mode == MODE_SYMLINK {
+                    walk = self.follow_chain(walk).await?;
+                    if walk.node_mode != MODE_DIR {
+                        return Err(Error::new(ENOTDIR));
+                    }
+                }
+            }
+        }
+        Ok(walk)
+    }
+
+    pub async fn walk_link(&mut self, mut walk: WalkResult, path: &str) -> Result<WalkResult> {
+        if path.starts_with('/') {
+            walk.nodeid = FUSE_ROOT_ID;
+            walk.node_mode = MODE_DIR;
+            walk.parent_nodeid = FUSE_ROOT_ID;
+            walk.rel_path.clear();
+        } else {
+            // relative targets are relative to the directory that contains the link
+            walk.rel_path.pop();
+            if walk.parent_nodeid != 0 {
+                walk.nodeid = walk.parent_nodeid;
+                walk.node_mode = MODE_DIR;
+            } else {
+                (walk.nodeid, walk.node_mode) = self.parent_of(walk.nodeid)?;
+            }
+        }
+
+        let path_parts: Vec<&str> = path_components(path);
+
+        if !path.is_empty() && path != "/" {
+            for name in path_parts.iter().copied() {
+                if name.is_empty() || name == "." {
+                    continue;
+                }
+
+                if name == ".." {
+                    (walk.nodeid, walk.node_mode) = self.parent_of(walk.nodeid)?;
+                    walk.rel_path.pop();
+                    continue;
+                }
+
+                walk.rel_path.push(name.to_owned());
+
+                walk.parent_nodeid = walk.nodeid;
+                match self.lookup(walk.parent_nodeid, name).await {
+                    Ok((id, mode)) => {
+                        walk.nodeid = id;
+                        walk.node_mode = mode;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         Ok(walk)
@@ -816,10 +962,7 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub async fn rm(&mut self, mut walk: WalkResult, is_dir: bool) -> Result<()> {
-        let name = walk
-            .rel_path
-            .pop()
-            .expect("virtio-fsd: Vfs::rm: rel_path is empty.");
+        let name = walk.rel_path.pop().unwrap_or_default();
 
         if name.is_empty() {
             return Err(Error::new(EINVAL));
@@ -859,11 +1002,21 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(())
     }
 
+    pub async fn readlink(&self, nodeid: u64) -> Result<String> {
+        Ok(self
+            .fuse
+            .readlink(nodeid)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_READLINK"))?)
+    }
+
     pub fn get_path(&self, fd: usize) -> Result<&str> {
         match self.handles.get(fd)? {
             Handle::File { path, .. }
             | Handle::Directory { path, .. }
-            | Handle::StatOnly { path, .. } => Ok(path),
+            | Handle::StatOnly { path, .. }
+            | Handle::Symlink { path, .. }
+            | Handle::SymlinkPreCreate { path, .. } => Ok(path),
             Handle::SchemeRoot => Ok(""),
             #[cfg(feature = "lru-debug")]
             Handle::LruLog => Ok(LRU_EVICTED_NAME),
@@ -874,6 +1027,33 @@ impl<T: FuseTransporter> Vfs<T> {
         self.increment_fd_count(nodeid)?;
         Ok(self.handles.insert(Handle::StatOnly {
             nodeid,
+            path: path.join("/"),
+        }))
+    }
+
+    pub fn insert_symlink(
+        &mut self,
+        nodeid: u64,
+        path: Vec<String>,
+        target: String,
+    ) -> Result<usize> {
+        self.increment_fd_count(nodeid)?;
+        Ok(self.handles.insert(Handle::Symlink {
+            nodeid,
+            path: path.join("/"),
+            target,
+        }))
+    }
+
+    pub fn pre_create_symlink(
+        &mut self,
+        parent_nodeid: u64,
+        name: String,
+        path: Vec<String>,
+    ) -> Result<usize> {
+        Ok(self.handles.insert(Handle::SymlinkPreCreate {
+            parent_nodeid,
+            name,
             path: path.join("/"),
         }))
     }
