@@ -2,15 +2,32 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::time::{Duration, Instant};
 
+use fuse_abi::linux::{
+    FATTR_ATIME, FATTR_ATIME_NOW, FATTR_FH, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW,
+    FATTR_SIZE, FATTR_UID, FUSE_ATOMIC_O_TRUNC, fuse_setattr_in,
+};
 use log::warn;
 use scheme_utils::HandleMap;
 use syscall::error::{ESTALE, Error, Result};
-use syscall::{EBADF, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, MODE_DIR, MODE_SYMLINK, MODE_TYPE};
+use syscall::{
+    EBADF, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, MODE_DIR, MODE_SYMLINK, MODE_TYPE, O_ACCMODE,
+    O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDWR, O_TRUNC, O_WRONLY, TimeSpec,
+};
 
 use crate::fuse::{
-    FUSE_ROOT_ID, FuseReaddirOut, FuseSession, FuseTransporter, fuse_attr, fuse_attr_out,
+    Caller, FUSE_ROOT_ID, FuseReaddirOut, FuseSession, FuseTransporter, fuse_attr, fuse_attr_out,
     fuse_entry_out,
 };
+use crate::linux_abi;
+
+// futimens puts these in TimeSpec.tv_nsec:
+// - UTIME_NOW = "use the current time",
+// - UTIME_OMIT = "leave this stamp alone".
+// They are not nanoseconds (NOW is > 1e9), so they cannot go on the wire as atimensec/mtimensec.
+// FUSE uses FATTR_ATIME_NOW / FATTR_MTIME_NOW for NOW, and no bit at all for OMIT.
+// These are used by `Vfs::apply_timespec`.
+const UTIME_NOW: i32 = 0x3fffffff;
+const UTIME_OMIT: i32 = 0x3ffffffe;
 
 const INODES_MAX_LEN: usize = 64 * 1024;
 const SYMLOOP_MAX: u32 = 40;
@@ -312,9 +329,9 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    async fn flush_forgets(&mut self) {
+    async fn flush_forgets(&mut self, caller: Caller) {
         while let Some((nodeid, nlookup)) = self.forget_queue.pop_front() {
-            if let Err(err) = self.fuse.forget(nodeid, nlookup).await {
+            if let Err(err) = self.fuse.forget(nodeid, nlookup, caller).await {
                 warn!("virtio-fsd: FUSE_FORGET: {err}");
                 self.forget_queue.push_front((nodeid, nlookup));
                 break;
@@ -358,7 +375,7 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    pub async fn lookup(&mut self, parent: u64, name: &str) -> Result<(u64, u16)> {
+    pub async fn lookup(&mut self, parent: u64, name: &str, caller: Caller) -> Result<(u64, u16)> {
         if name.is_empty() {
             return Err(Error::new(ENOENT));
         }
@@ -372,7 +389,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 return Ok((nodeid, mode));
             }
 
-            let payload = match self.fuse.getattr(nodeid, None).await {
+            let payload = match self.fuse.getattr(nodeid, None, caller).await {
                 Ok(payload) => payload,
                 Err(e) => {
                     let err = e.into_syscall("FUSE_GETATTR");
@@ -395,17 +412,23 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let payload = self
             .fuse
-            .lookup(parent, name_cstring)
+            .lookup(parent, name_cstring, caller)
             .await
             .map_err(|e| e.into_syscall("FUSE_LOOKUP"))?;
         let nodeid = payload.nodeid;
         let mode = payload.attr.mode as u16 & MODE_TYPE;
         self.merge_entry(parent, name, payload)?;
-        self.flush_forgets().await;
+        self.flush_forgets(caller).await;
         Ok((nodeid, mode))
     }
 
-    pub async fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<(u64, u16)> {
+    pub async fn mkdir(
+        &mut self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        caller: Caller,
+    ) -> Result<(u64, u16)> {
         if name.is_empty() {
             return Err(Error::new(ENOENT));
         }
@@ -417,7 +440,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let payload = self
             .fuse
-            .mkdir(parent, name_cstring.clone(), mode)
+            .mkdir(parent, name_cstring.clone(), mode, caller)
             .await
             .map_err(|e| e.into_syscall("FUSE_MKDIR"))?;
 
@@ -427,13 +450,13 @@ impl<T: FuseTransporter> Vfs<T> {
         let mode = payload.attr.mode as u16 & MODE_TYPE;
 
         if let Err(err) = self.merge_entry(parent, name, payload) {
-            if let Err(rm_err) = self.fuse.rm(parent, name_cstring, true).await {
+            if let Err(rm_err) = self.fuse.rm(parent, name_cstring, true, caller).await {
                 warn!("virtio-fsd: FUSE_RMDIR failed after a merge_entry fail: {rm_err}");
             }
             return Err(err);
         }
 
-        self.flush_forgets().await;
+        self.flush_forgets(caller).await;
         Ok((nodeid, mode))
     }
 
@@ -441,13 +464,16 @@ impl<T: FuseTransporter> Vfs<T> {
         &mut self,
         parent_nodeid: u64,
         name: &str,
-        flags: u32,
+        flags: usize,
         mode: u32,
         path: Vec<String>,
+        caller: Caller,
     ) -> Result<usize> {
         if name.is_empty() {
             return Err(Error::new(ENOENT));
         }
+
+        let fuse_flags = fuse_open_flags(flags, false, true)?;
 
         let name_cstring = CString::new(name).map_err(|_| {
             warn!("virtio-fsd: create: file name contained an internal 0 byte.");
@@ -456,7 +482,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let payload = self
             .fuse
-            .create(parent_nodeid, name_cstring, flags, mode)
+            .create(parent_nodeid, name_cstring, fuse_flags, mode, caller)
             .await
             .map_err(|e| e.into_syscall("FUSE_CREATE"))?;
 
@@ -465,20 +491,28 @@ impl<T: FuseTransporter> Vfs<T> {
         let nodeid = payload.entry.nodeid;
 
         if let Err(err) = self.merge_entry(parent_nodeid, name, payload.entry) {
-            if let Err(rel_err) = self.fuse.release(nodeid, payload.open.fh, false).await {
+            if let Err(rel_err) = self
+                .fuse
+                .release(nodeid, payload.open.fh, false, caller)
+                .await
+            {
                 warn!("virtio-fsd: FUSE_RELEASE: {rel_err}");
             }
             return Err(err);
         }
 
         if let Err(err) = self.increment_fd_count(nodeid) {
-            if let Err(rel_err) = self.fuse.release(nodeid, payload.open.fh, false).await {
+            if let Err(rel_err) = self
+                .fuse
+                .release(nodeid, payload.open.fh, false, caller)
+                .await
+            {
                 warn!("virtio-fsd: FUSE_RELEASE: {rel_err}");
             }
             return Err(err);
         }
 
-        self.flush_forgets().await;
+        self.flush_forgets(caller).await;
 
         Ok(self.handles.insert(Handle::File {
             nodeid,
@@ -490,22 +524,29 @@ impl<T: FuseTransporter> Vfs<T> {
     pub async fn open(
         &mut self,
         nodeid: u64,
-        flags: u32,
+        flags: usize,
         is_dir: bool,
         path: Vec<String>,
+        caller: Caller,
     ) -> Result<usize> {
         let opcode = if is_dir { "FUSE_OPENDIR" } else { "FUSE_OPEN" };
+        let mut open_flags = fuse_open_flags(flags, is_dir, false)?;
+        let trunc = !is_dir && open_flags & linux_abi::O_TRUNC != 0;
+        let atomic_trunc = self.fuse.capable(FUSE_ATOMIC_O_TRUNC);
+        if trunc && !atomic_trunc {
+            open_flags &= !linux_abi::O_TRUNC;
+        }
 
         let payload = self
             .fuse
-            .open(nodeid, flags, is_dir)
+            .open(nodeid, open_flags, is_dir, caller)
             .await
             .map_err(|e| e.into_syscall(opcode))?;
 
         let fh = payload.fh;
 
         if let Err(err) = self.increment_fd_count(nodeid) {
-            if let Err(rel_err) = self.fuse.release(nodeid, fh, is_dir).await {
+            if let Err(rel_err) = self.fuse.release(nodeid, fh, is_dir, caller).await {
                 warn!("virtio-fsd: FUSE_RELEASE: {rel_err}");
             }
             return Err(err);
@@ -524,11 +565,21 @@ impl<T: FuseTransporter> Vfs<T> {
                 path: path.join("/"),
             }
         };
+        let fd = self.handles.insert(handle);
 
-        Ok(self.handles.insert(handle))
+        if trunc && !atomic_trunc {
+            if let Err(err) = self.ftruncate(fd, 0, caller).await {
+                self.close(fd, caller).await;
+                return Err(err);
+            }
+        } else if trunc {
+            self.invalidate_attr(nodeid);
+        }
+
+        Ok(fd)
     }
 
-    pub async fn getattr(&mut self, fd: usize) -> Result<fuse_attr> {
+    pub async fn getattr(&mut self, fd: usize, caller: Caller) -> Result<fuse_attr> {
         let (nodeid, fh) = match self.handles.get(fd)? {
             Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
                 (*nodeid, Some(*fh))
@@ -557,7 +608,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let payload = self
             .fuse
-            .getattr(nodeid, fh)
+            .getattr(nodeid, fh, caller)
             .await
             .map_err(|e| e.into_syscall("FUSE_GETATTR"))?;
 
@@ -566,7 +617,13 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(payload.attr)
     }
 
-    pub async fn read(&mut self, fd: usize, buf: &mut [u8], offset: u64) -> Result<usize> {
+    pub async fn read(
+        &mut self,
+        fd: usize,
+        buf: &mut [u8],
+        offset: u64,
+        caller: Caller,
+    ) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -574,7 +631,7 @@ impl<T: FuseTransporter> Vfs<T> {
         match self.handles.get(fd)? {
             Handle::File { nodeid, fh, .. } => self
                 .fuse
-                .read(*nodeid, *fh, offset, buf, 0, 0)
+                .read(*nodeid, *fh, offset, buf, 0, 0, caller)
                 .await
                 .map_err(|e| e.into_syscall("FUSE_READ")),
             Handle::Symlink { target, .. } => {
@@ -606,7 +663,13 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    pub async fn write(&mut self, fd: usize, buf: &[u8], offset: u64) -> Result<usize> {
+    pub async fn write(
+        &mut self,
+        fd: usize,
+        buf: &[u8],
+        offset: u64,
+        caller: Caller,
+    ) -> Result<usize> {
         let (parent_nodeid, name, path) = match self.handles.get(fd)? {
             Handle::File { nodeid, fh, .. } => {
                 if buf.is_empty() {
@@ -616,7 +679,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 let fh = *fh;
                 let payload = self
                     .fuse
-                    .write(nodeid, fh, offset, buf, 0, 0)
+                    .write(nodeid, fh, offset, buf, 0, 0, caller)
                     .await
                     .map_err(|e| e.into_syscall("FUSE_WRITE"))?;
                 self.invalidate_attr(nodeid);
@@ -657,18 +720,22 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let payload = self
             .fuse
-            .symlink(parent_nodeid, &name_cstring, &target_cstring)
+            .symlink(parent_nodeid, &name_cstring, &target_cstring, caller)
             .await
             .map_err(|e| e.into_syscall("FUSE_SYMLINK"))?;
 
         let nodeid = payload.nodeid;
         if let Err(err) = self.merge_entry(parent_nodeid, &name, payload) {
-            if let Err(rm_err) = self.fuse.rm(parent_nodeid, name_cstring, false).await {
+            if let Err(rm_err) = self
+                .fuse
+                .rm(parent_nodeid, name_cstring, false, caller)
+                .await
+            {
                 warn!("virtio-fsd: FUSE_UNLINK failed after a merge_entry fail: {rm_err}");
             }
             return Err(err);
         }
-        self.flush_forgets().await;
+        self.flush_forgets(caller).await;
 
         self.invalidate_attr(parent_nodeid);
         self.increment_fd_count(nodeid)?;
@@ -681,7 +748,7 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(buf.len())
     }
 
-    pub async fn fsync(&self, fd: usize) -> Result<()> {
+    pub async fn fsync(&self, fd: usize, caller: Caller) -> Result<()> {
         let (nodeid, fh, is_dir) = match self.handles.get(fd)? {
             Handle::File { nodeid, fh, .. } => (*nodeid, *fh, false),
             Handle::Directory { nodeid, fh, .. } => (*nodeid, *fh, true),
@@ -698,22 +765,142 @@ impl<T: FuseTransporter> Vfs<T> {
         };
 
         self.fuse
-            .fsync(nodeid, fh, is_dir)
+            .fsync(nodeid, fh, is_dir, caller)
             .await
             .map_err(|e| e.into_syscall(opcode))
     }
 
-    pub async fn close(&mut self, fd: usize) {
+    async fn setattr(
+        &mut self,
+        nodeid: u64,
+        fuse_in: fuse_setattr_in,
+        caller: Caller,
+    ) -> Result<()> {
+        let payload = self
+            .fuse
+            .setattr(nodeid, fuse_in, caller)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_SETATTR"))?;
+        self.refresh_attr(nodeid, payload);
+        self.touch(nodeid);
+        Ok(())
+    }
+
+    pub async fn ftruncate(&mut self, fd: usize, len: u64, caller: Caller) -> Result<()> {
+        let (nodeid, fh) = match self.handles.get(fd)? {
+            Handle::File { nodeid, fh, .. } => (*nodeid, Some(*fh)),
+            Handle::Directory { .. } => return Err(Error::new(EISDIR)),
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        let mut fuse_in = fuse_setattr_in {
+            size: len,
+            ..Default::default()
+        };
+        fuse_in.valid = FATTR_SIZE;
+        if let Some(fh) = fh {
+            fuse_in.valid |= FATTR_FH;
+            fuse_in.fh = fh;
+        }
+
+        self.setattr(nodeid, fuse_in, caller).await
+    }
+
+    pub async fn futimens(&mut self, fd: usize, times: &[TimeSpec], caller: Caller) -> Result<()> {
+        let atime = times.first().ok_or(Error::new(EINVAL))?;
+        let mtime = times.get(1).ok_or(Error::new(EINVAL))?;
+
+        let (nodeid, fh) = match self.handles.get(fd)? {
+            Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
+                (*nodeid, Some(*fh))
+            }
+            Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        let mut fuse_in = fuse_setattr_in::default();
+        apply_timespec(&mut fuse_in, atime, true)?;
+        apply_timespec(&mut fuse_in, mtime, false)?;
+        if fuse_in.valid == 0 {
+            return Ok(());
+        }
+        if let Some(fh) = fh {
+            fuse_in.valid |= FATTR_FH;
+            fuse_in.fh = fh;
+        }
+
+        self.setattr(nodeid, fuse_in, caller).await
+    }
+
+    pub async fn fchmod(&mut self, fd: usize, new_mode: u16, caller: Caller) -> Result<()> {
+        let (nodeid, fh) = match self.handles.get(fd)? {
+            Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
+                (*nodeid, Some(*fh))
+            }
+            Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        let type_bits = self
+            .inodes
+            .get(&nodeid)
+            .map(|i| i.attr.mode & MODE_TYPE as u32)
+            .unwrap_or(0);
+
+        let mut fuse_in = fuse_setattr_in {
+            mode: (new_mode as u32 & 0o7777) | type_bits,
+            ..Default::default()
+        };
+        fuse_in.valid = FATTR_MODE;
+        if let Some(fh) = fh {
+            fuse_in.valid |= FATTR_FH;
+            fuse_in.fh = fh;
+        }
+
+        self.setattr(nodeid, fuse_in, caller).await
+    }
+
+    pub async fn fchown(&mut self, fd: usize, uid: u32, gid: u32, caller: Caller) -> Result<()> {
+        let (nodeid, fh) = match self.handles.get(fd)? {
+            Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
+                (*nodeid, Some(*fh))
+            }
+            Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        let mut fuse_in = fuse_setattr_in::default();
+        // POSIX: uid/gid -1 (here u32::MAX) means "leave this id alone".
+        if uid != u32::MAX {
+            fuse_in.valid |= FATTR_UID;
+            fuse_in.uid = uid;
+        }
+        if gid != u32::MAX {
+            fuse_in.valid |= FATTR_GID;
+            fuse_in.gid = gid;
+        }
+        if fuse_in.valid == 0 {
+            return Ok(());
+        }
+        if let Some(fh) = fh {
+            fuse_in.valid |= FATTR_FH;
+            fuse_in.fh = fh;
+        }
+
+        self.setattr(nodeid, fuse_in, caller).await
+    }
+
+    pub async fn close(&mut self, fd: usize, caller: Caller) {
         match self.handles.remove(fd) {
             Some(handle) => match handle {
                 Handle::File { nodeid, fh, .. } => {
-                    if let Err(err) = self.fuse.release(nodeid, fh, false).await {
+                    if let Err(err) = self.fuse.release(nodeid, fh, false, caller).await {
                         warn!("virtio-fsd: FUSE_RELEASE: {err}");
                     }
                     self.decrement_fd_count(nodeid);
                 }
                 Handle::Directory { nodeid, fh, .. } => {
-                    if let Err(err) = self.fuse.release(nodeid, fh, true).await {
+                    if let Err(err) = self.fuse.release(nodeid, fh, true, caller).await {
                         warn!("virtio-fsd: FUSE_RELEASE: {err}");
                     }
                     self.decrement_fd_count(nodeid);
@@ -731,13 +918,13 @@ impl<T: FuseTransporter> Vfs<T> {
             }
         };
 
-        self.flush_forgets().await;
+        self.flush_forgets(caller).await;
     }
 
     pub async fn shutdown(&mut self) {
         let ids: Vec<usize> = self.handles.keys().copied().collect();
         for id in ids {
-            self.close(id).await;
+            self.close(id, Caller::NONE).await;
         }
 
         for (nodeid, inode) in &self.inodes {
@@ -745,7 +932,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 self.forget_queue.push_back((*nodeid, inode.nlookup));
             }
         }
-        self.flush_forgets().await;
+        self.flush_forgets(Caller::NONE).await;
     }
 
     pub fn scheme_root(&mut self) -> usize {
@@ -799,15 +986,19 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(Some(self.open_lru_log(clear)))
     }
 
-    pub(crate) async fn follow_chain(&mut self, mut walk: WalkResult) -> Result<WalkResult> {
+    pub(crate) async fn follow_chain(
+        &mut self,
+        mut walk: WalkResult,
+        caller: Caller,
+    ) -> Result<WalkResult> {
         let mut hops = 0u32;
         while walk.node_mode == MODE_SYMLINK {
             hops += 1;
             if hops > SYMLOOP_MAX {
                 return Err(Error::new(ELOOP));
             }
-            let link_path = self.readlink(walk.nodeid).await?;
-            walk = self.walk_link(walk, &link_path).await?;
+            let link_path = self.readlink(walk.nodeid, caller).await?;
+            walk = self.walk_link(walk, &link_path, caller).await?;
         }
         Ok(walk)
     }
@@ -817,6 +1008,7 @@ impl<T: FuseTransporter> Vfs<T> {
         fd: usize,
         path: &str,
         open_flags: usize,
+        caller: Caller,
     ) -> Result<WalkResult> {
         let mut walk = WalkResult {
             nodeid: 0,
@@ -870,7 +1062,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 walk.rel_path.push(name.to_owned());
 
                 walk.parent_nodeid = walk.nodeid;
-                match self.lookup(walk.parent_nodeid, name).await {
+                match self.lookup(walk.parent_nodeid, name, caller).await {
                     Ok((id, mode)) => {
                         walk.nodeid = id;
                         walk.node_mode = mode;
@@ -888,7 +1080,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 }
 
                 if !is_last_element && walk.node_mode == MODE_SYMLINK {
-                    walk = self.follow_chain(walk).await?;
+                    walk = self.follow_chain(walk, caller).await?;
                     if walk.node_mode != MODE_DIR {
                         return Err(Error::new(ENOTDIR));
                     }
@@ -898,7 +1090,12 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(walk)
     }
 
-    pub async fn walk_link(&mut self, mut walk: WalkResult, path: &str) -> Result<WalkResult> {
+    pub async fn walk_link(
+        &mut self,
+        mut walk: WalkResult,
+        path: &str,
+        caller: Caller,
+    ) -> Result<WalkResult> {
         if path.starts_with('/') {
             walk.nodeid = FUSE_ROOT_ID;
             walk.node_mode = MODE_DIR;
@@ -932,7 +1129,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 walk.rel_path.push(name.to_owned());
 
                 walk.parent_nodeid = walk.nodeid;
-                match self.lookup(walk.parent_nodeid, name).await {
+                match self.lookup(walk.parent_nodeid, name, caller).await {
                     Ok((id, mode)) => {
                         walk.nodeid = id;
                         walk.node_mode = mode;
@@ -944,12 +1141,17 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(walk)
     }
 
-    pub async fn readdir(&mut self, fd: usize, offset: u64) -> Result<FuseReaddirOut> {
+    pub async fn readdir(
+        &mut self,
+        fd: usize,
+        offset: u64,
+        caller: Caller,
+    ) -> Result<FuseReaddirOut> {
         match self.handles.get(fd)? {
             Handle::Directory { nodeid, fh, .. } => {
                 let (nodeid, fh) = (*nodeid, *fh);
                 self.fuse
-                    .readdir(nodeid, fh, offset)
+                    .readdir(nodeid, fh, offset, caller)
                     .await
                     .map_err(|e| e.into_syscall("FUSE_READDIR"))
             }
@@ -961,7 +1163,7 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    pub async fn rm(&mut self, mut walk: WalkResult, is_dir: bool) -> Result<()> {
+    pub async fn rm(&mut self, mut walk: WalkResult, is_dir: bool, caller: Caller) -> Result<()> {
         let name = walk.rel_path.pop().unwrap_or_default();
 
         if name.is_empty() {
@@ -977,7 +1179,7 @@ impl<T: FuseTransporter> Vfs<T> {
             let opcode = if is_dir { "FUSE_RMDIR" } else { "FUSE_UNLINK" };
 
             self.fuse
-                .rm(walk.parent_nodeid, name_cstring, is_dir)
+                .rm(walk.parent_nodeid, name_cstring, is_dir, caller)
                 .await
                 .map_err(|e| e.into_syscall(opcode))?;
 
@@ -998,14 +1200,14 @@ impl<T: FuseTransporter> Vfs<T> {
         }
         self.drop_dentry(walk.parent_nodeid, &name);
         self.invalidate_attr(walk.parent_nodeid);
-        self.flush_forgets().await;
+        self.flush_forgets(caller).await;
         Ok(())
     }
 
-    pub async fn readlink(&self, nodeid: u64) -> Result<String> {
+    pub async fn readlink(&self, nodeid: u64, caller: Caller) -> Result<String> {
         Ok(self
             .fuse
-            .readlink(nodeid)
+            .readlink(nodeid, caller)
             .await
             .map_err(|e| e.into_syscall("FUSE_READLINK"))?)
     }
@@ -1080,6 +1282,72 @@ fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
         .filter(|s| !s.is_empty())
         .map(T::from)
         .collect()
+}
+
+fn fuse_open_flags(redox_flags: usize, is_dir: bool, for_create: bool) -> Result<u32> {
+    let accmode = redox_flags & O_ACCMODE;
+
+    if is_dir && (accmode == O_WRONLY || accmode == O_RDWR) {
+        return Err(Error::new(EISDIR));
+    }
+    if redox_flags & O_DIRECTORY != 0 && !is_dir {
+        return Err(Error::new(ENOTDIR));
+    }
+
+    let mut linux_flags: u32 = match accmode {
+        O_RDWR => linux_abi::O_RDWR,
+        O_WRONLY => linux_abi::O_WRONLY,
+        _ => linux_abi::O_RDONLY,
+    };
+
+    if !is_dir {
+        if for_create && redox_flags & O_CREAT != 0 {
+            linux_flags |= linux_abi::O_CREAT;
+        }
+        if for_create && redox_flags & O_EXCL != 0 {
+            linux_flags |= linux_abi::O_EXCL;
+        }
+        if redox_flags & O_APPEND != 0 {
+            linux_flags |= linux_abi::O_APPEND;
+        }
+        if redox_flags & O_TRUNC != 0 {
+            linux_flags |= linux_abi::O_TRUNC;
+        }
+        if redox_flags & O_NONBLOCK != 0 {
+            linux_flags |= linux_abi::O_NONBLOCK;
+        }
+    } else if redox_flags & O_DIRECTORY != 0 {
+        linux_flags |= linux_abi::O_DIRECTORY;
+    }
+
+    Ok(linux_flags)
+}
+
+fn apply_timespec(fuse_in: &mut fuse_setattr_in, ts: &TimeSpec, atime: bool) -> Result<()> {
+    match ts.tv_nsec {
+        UTIME_OMIT => Ok(()),
+        UTIME_NOW => {
+            fuse_in.valid |= if atime {
+                FATTR_ATIME | FATTR_ATIME_NOW
+            } else {
+                FATTR_MTIME | FATTR_MTIME_NOW
+            };
+            Ok(())
+        }
+        nsec if nsec >= 0 && nsec < 1_000_000_000 && ts.tv_sec >= 0 => {
+            if atime {
+                fuse_in.valid |= FATTR_ATIME;
+                fuse_in.atime = ts.tv_sec as u64;
+                fuse_in.atimensec = nsec as u32;
+            } else {
+                fuse_in.valid |= FATTR_MTIME;
+                fuse_in.mtime = ts.tv_sec as u64;
+                fuse_in.mtimensec = nsec as u32;
+            }
+            Ok(())
+        }
+        _ => Err(Error::new(EINVAL)),
+    }
 }
 
 /// Cache expiry from a FUSE `*_valid`/`*_valid_nsec` pair. Clamps nsec to

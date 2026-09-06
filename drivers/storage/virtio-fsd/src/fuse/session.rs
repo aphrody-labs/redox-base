@@ -3,11 +3,11 @@ use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fuse_abi::linux::{
-    FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
-    FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out, fuse_create_in,
-    fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_init_in,
-    fuse_init_out, fuse_mkdir_in, fuse_opcode, fuse_open_in, fuse_open_out, fuse_out_header,
-    fuse_read_in, fuse_release_in, fuse_write_in, fuse_write_out,
+    FUSE_ATOMIC_O_TRUNC, FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION,
+    FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out,
+    fuse_create_in, fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header,
+    fuse_init_in, fuse_init_out, fuse_mkdir_in, fuse_opcode, fuse_open_in, fuse_open_out,
+    fuse_out_header, fuse_read_in, fuse_release_in, fuse_setattr_in, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
 use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
@@ -132,6 +132,23 @@ pub trait FuseTransporter {
         I: IntoBytes + Immutable;
 }
 
+/// Identity for `fuse_in_header`.
+/// `NONE` (zeros) when the scheme call has no `CallerCtx` (INIT, OnClose, getdents, unmount).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Caller {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+}
+
+impl Caller {
+    pub const NONE: Self = Self {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+}
+
 pub struct FuseSession<T: FuseTransporter> {
     next_unique: AtomicU64,
     init: fuse_init_out,
@@ -142,6 +159,9 @@ impl<T> FuseSession<T>
 where
     T: FuseTransporter,
 {
+    /// Flags we put on FUSE_INIT. The host replies with the intersection.
+    const CLIENT_INIT_FLAGS: u64 = FUSE_MAX_PAGES as u64 | FUSE_ATOMIC_O_TRUNC as u64;
+
     /// Initializes the FUSE session by sending a FUSE_INIT request to the device.
     #[must_use = "The function returns a future that must be awaited to ensure the sent request is completed."]
     pub async fn new(transporter: T) -> Result<Self, FuseError> {
@@ -151,27 +171,21 @@ where
             next_unique: AtomicU64::new(1),
         };
 
-        let unique = session.next_unique.fetch_add(1, Ordering::SeqCst);
+        let fuse_in_header = session.in_header(
+            fuse_opcode::FUSE_INIT.into(),
+            FUSE_ROOT_ID,
+            mem::size_of::<fuse_init_in>(),
+            None,
+            Caller::NONE,
+        );
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_init_in>()) as u32,
-            opcode: fuse_opcode::FUSE_INIT.into(),
-            unique,
-            nodeid: FUSE_ROOT_ID,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
-
-        let flags: u64 = FUSE_MAX_PAGES as u64;
+        let flags = Self::CLIENT_INIT_FLAGS;
         let init_in = fuse_init_in {
             major: FUSE_KERNEL_VERSION,
             minor: FUSE_KERNEL_MINOR_VERSION,
             max_readahead: 1 << 20, // 1 MiB
             flags: flags as u32,
-            flags2: (flags >> 32) as u32, // shift down the flags above bit 31 into flags2
+            flags2: (flags >> 32) as u32,
             unused: [0; 11],
         };
 
@@ -222,12 +236,8 @@ where
             session.init.max_stack_depth,
         );
 
-        // TODO: check response flags and change behaviour accordingly
-
-        let init_flags = session.init.flags as u64 | (session.init.flags2 as u64) << 32;
-
-        let use_local_parent_resolution = (init_flags & FUSE_NO_EXPORT_SUPPORT) != 0
-            || (init_flags & FUSE_EXPORT_SUPPORT as u64) == 0;
+        let use_local_parent_resolution =
+            session.capable(FUSE_NO_EXPORT_SUPPORT) || !session.capable(FUSE_EXPORT_SUPPORT);
 
         // currently we use parent_map for both scenarios, as
         // virtiofsd does not support `FUSE_NO_EXPORT_SUPPORT` flag
@@ -242,32 +252,49 @@ where
         Ok(session)
     }
 
+    /// Whether this `FUSE_INIT` flag was negotiated (`flags` / `flags2`).
+    pub fn capable(&self, cap: impl Into<u64>) -> bool {
+        (self.init.flags as u64 | (self.init.flags2 as u64) << 32) & cap.into() != 0
+    }
+
+    /// `extra_len` is the size of the in-payload after this header (`len` = header + extra_len).
+    /// `unique` is allocated from `next_unique` when `None`. FUSE_FORGET must send `Some(0)`.
+    fn in_header(
+        &self,
+        opcode: u32,
+        nodeid: u64,
+        extra_len: usize,
+        unique: Option<u64>,
+        caller: Caller,
+    ) -> fuse_in_header {
+        fuse_in_header {
+            len: (mem::size_of::<fuse_in_header>() + extra_len) as u32,
+            opcode,
+            unique: unique.unwrap_or_else(|| self.next_unique.fetch_add(1, Ordering::SeqCst)),
+            nodeid,
+            uid: caller.uid,
+            gid: caller.gid,
+            pid: caller.pid,
+            total_extlen: 0,
+            padding: 0,
+        }
+    }
+
     /// Handles both `open` and `opendir` opcodes based on `is_dir`.
     pub async fn open(
         &self,
         nodeid: u64,
         flags: u32,
         is_dir: bool,
+        caller: Caller,
     ) -> Result<fuse_open_out, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let opcode = if is_dir {
             fuse_opcode::FUSE_OPENDIR.into()
         } else {
             fuse_opcode::FUSE_OPEN.into()
         };
-
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_open_in>()) as u32,
-            opcode,
-            unique,
-            nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+        let fuse_in_header =
+            self.in_header(opcode, nodeid, mem::size_of::<fuse_open_in>(), None, caller);
 
         let fuse_in = fuse_open_in {
             flags,
@@ -285,20 +312,19 @@ where
             .into_struct()
     }
 
-    pub async fn getattr(&self, nodeid: u64, fh: Option<u64>) -> Result<fuse_attr_out, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_getattr_in>()) as u32,
-            opcode: fuse_opcode::FUSE_GETATTR.into(),
-            unique,
+    pub async fn getattr(
+        &self,
+        nodeid: u64,
+        fh: Option<u64>,
+        caller: Caller,
+    ) -> Result<fuse_attr_out, FuseError> {
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_GETATTR.into(),
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+            mem::size_of::<fuse_getattr_in>(),
+            None,
+            caller,
+        );
 
         let fuse_in = fuse_getattr_in {
             getattr_flags: if fh.is_some() { FUSE_GETATTR_FH } else { 0 },
@@ -317,25 +343,45 @@ where
             .into_struct()
     }
 
+    pub async fn setattr(
+        &self,
+        nodeid: u64,
+        fuse_in: fuse_setattr_in,
+        caller: Caller,
+    ) -> Result<fuse_attr_out, FuseError> {
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_SETATTR.into(),
+            nodeid,
+            mem::size_of::<fuse_setattr_in>(),
+            None,
+            caller,
+        );
+
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(fuse_in),
+        };
+
+        self.transporter
+            .send(request, AllocStrategy::DmaPool)
+            .await?
+            .into_struct()
+    }
+
     pub async fn readdir(
         &self,
         nodeid: u64,
         fh: u64,
         offset: u64,
+        caller: Caller,
     ) -> Result<FuseReaddirOut, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_read_in>()) as u32,
-            opcode: fuse_opcode::FUSE_READDIR.into(),
-            unique,
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_READDIR.into(),
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+            mem::size_of::<fuse_read_in>(),
+            None,
+            caller,
+        );
 
         let fuse_in = fuse_read_in {
             fh,
@@ -368,9 +414,8 @@ where
         &self,
         parent_nodeid: u64,
         name: CString,
+        caller: Caller,
     ) -> Result<fuse_entry_out, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
 
@@ -381,17 +426,13 @@ where
         let mut name_buf = [0u8; NAME_MAX];
         name_buf[..name.len()].copy_from_slice(&name);
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + name_len) as u32,
-            opcode: fuse_opcode::FUSE_LOOKUP.into(),
-            unique,
-            nodeid: parent_nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_LOOKUP.into(),
+            parent_nodeid,
+            name_len,
+            None,
+            caller,
+        );
 
         let request = FuseRequest {
             fuse_in_header,
@@ -412,20 +453,15 @@ where
         buf: &mut [u8],
         read_flags: u32,
         flags: u32,
+        caller: Caller,
     ) -> Result<usize, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_read_in>()) as u32,
-            opcode: fuse_opcode::FUSE_READ.into(),
-            unique,
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_READ.into(),
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+            mem::size_of::<fuse_read_in>(),
+            None,
+            caller,
+        );
 
         // TODO: make sure size is <= max_writeself.init.max_pages as u32 * linux_abi::PAGE_SIZE - otherwise, chunk the data
         // let max_size = core::cmp::min(buf.len(), u32::MAX as usize) as u32;
@@ -460,22 +496,17 @@ where
         data: &[u8],
         write_flags: u32,
         flags: u32,
+        caller: Caller,
     ) -> Result<fuse_write_out, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let size = data.len();
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_write_in>() + size) as u32,
-            opcode: fuse_opcode::FUSE_WRITE.into(),
-            unique,
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_WRITE.into(),
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+            mem::size_of::<fuse_write_in>() + size,
+            None,
+            caller,
+        );
 
         // TODO: make sure size is <= max_write - otherwise, chunk the data
         // let request_size = core::cmp::min(size, self.init.max_write as usize);
@@ -507,9 +538,8 @@ where
         name: CString,
         flags: u32,
         mode: u32,
+        caller: Caller,
     ) -> Result<FuseCreateOut, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
 
@@ -517,18 +547,13 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_create_in>() + name_len)
-                as u32,
-            opcode: fuse_opcode::FUSE_CREATE.into(),
-            unique,
-            nodeid: parent_nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_CREATE.into(),
+            parent_nodeid,
+            mem::size_of::<fuse_create_in>() + name_len,
+            None,
+            caller,
+        );
 
         let fuse_in = fuse_create_in {
             flags,
@@ -548,24 +573,25 @@ where
             .into_struct()
     }
 
-    pub async fn fsync(&self, nodeid: u64, fh: u64, is_dir: bool) -> Result<(), FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_fsync_in>()) as u32,
-            opcode: if is_dir {
-                fuse_opcode::FUSE_FSYNCDIR.into()
-            } else {
-                fuse_opcode::FUSE_FSYNC.into()
-            },
-            unique,
-            nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
+    pub async fn fsync(
+        &self,
+        nodeid: u64,
+        fh: u64,
+        is_dir: bool,
+        caller: Caller,
+    ) -> Result<(), FuseError> {
+        let opcode = if is_dir {
+            fuse_opcode::FUSE_FSYNCDIR.into()
+        } else {
+            fuse_opcode::FUSE_FSYNC.into()
         };
+        let fuse_in_header = self.in_header(
+            opcode,
+            nodeid,
+            mem::size_of::<fuse_fsync_in>(),
+            None,
+            caller,
+        );
 
         let fuse_in = fuse_fsync_in {
             fh,
@@ -584,24 +610,25 @@ where
             .into_unit()
     }
 
-    pub async fn release(&self, nodeid: u64, fh: u64, is_dir: bool) -> Result<(), FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_release_in>()) as u32,
-            opcode: if is_dir {
-                fuse_opcode::FUSE_RELEASEDIR.into()
-            } else {
-                fuse_opcode::FUSE_RELEASE.into()
-            },
-            unique,
-            nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
+    pub async fn release(
+        &self,
+        nodeid: u64,
+        fh: u64,
+        is_dir: bool,
+        caller: Caller,
+    ) -> Result<(), FuseError> {
+        let opcode = if is_dir {
+            fuse_opcode::FUSE_RELEASEDIR.into()
+        } else {
+            fuse_opcode::FUSE_RELEASE.into()
         };
+        let fuse_in_header = self.in_header(
+            opcode,
+            nodeid,
+            mem::size_of::<fuse_release_in>(),
+            None,
+            caller,
+        );
 
         let fuse_in = fuse_release_in {
             fh,
@@ -621,18 +648,14 @@ where
             .into_unit()
     }
 
-    pub async fn forget(&self, nodeid: u64, nlookup: u64) -> Result<(), FuseError> {
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_forget_in>()) as u32,
-            opcode: fuse_opcode::FUSE_FORGET.into(),
-            unique: 0,
+    pub async fn forget(&self, nodeid: u64, nlookup: u64, caller: Caller) -> Result<(), FuseError> {
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_FORGET.into(),
             nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+            mem::size_of::<fuse_forget_in>(),
+            Some(0),
+            caller,
+        );
 
         let fuse_in = fuse_forget_in { nlookup };
 
@@ -651,9 +674,8 @@ where
         parent_nodeid: u64,
         name: CString,
         mode: u32,
+        caller: Caller,
     ) -> Result<fuse_entry_out, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
 
@@ -661,18 +683,13 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<fuse_mkdir_in>() + name_len)
-                as u32,
-            opcode: fuse_opcode::FUSE_MKDIR.into(),
-            unique,
-            nodeid: parent_nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_MKDIR.into(),
+            parent_nodeid,
+            mem::size_of::<fuse_mkdir_in>() + name_len,
+            None,
+            caller,
+        );
 
         let fuse_in = fuse_mkdir_in { mode, umask: 0 };
 
@@ -692,9 +709,8 @@ where
         parent_nodeid: u64,
         name: CString,
         is_dir: bool,
+        caller: Caller,
     ) -> Result<(), FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
 
@@ -705,21 +721,12 @@ where
         let mut name_buf = [0u8; NAME_MAX];
         name_buf[..name.len()].copy_from_slice(&name);
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + name_len) as u32,
-            opcode: if is_dir {
-                fuse_opcode::FUSE_RMDIR.into()
-            } else {
-                fuse_opcode::FUSE_UNLINK.into()
-            },
-            unique,
-            nodeid: parent_nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
+        let opcode = if is_dir {
+            fuse_opcode::FUSE_RMDIR.into()
+        } else {
+            fuse_opcode::FUSE_UNLINK.into()
         };
+        let fuse_in_header = self.in_header(opcode, parent_nodeid, name_len, None, caller);
 
         let request = FuseRequest {
             fuse_in_header,
@@ -732,20 +739,9 @@ where
             .into_unit()
     }
 
-    pub async fn readlink(&self, nodeid: u64) -> Result<String, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
-        let fuse_in_header = fuse_in_header {
-            len: mem::size_of::<fuse_in_header>() as u32,
-            opcode: fuse_opcode::FUSE_READLINK.into(),
-            unique,
-            nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+    pub async fn readlink(&self, nodeid: u64, caller: Caller) -> Result<String, FuseError> {
+        let fuse_in_header =
+            self.in_header(fuse_opcode::FUSE_READLINK.into(), nodeid, 0, None, caller);
 
         let request: FuseRequest<()> = FuseRequest {
             fuse_in_header,
@@ -781,9 +777,8 @@ where
         parent_nodeid: u64,
         name: &CString,
         path: &CString,
+        caller: Caller,
     ) -> Result<fuse_entry_out, FuseError> {
-        let unique = self.next_unique.fetch_add(1, Ordering::SeqCst);
-
         let name = name.as_bytes_with_nul();
         let path = path.as_bytes_with_nul();
 
@@ -797,17 +792,13 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + name_len + path_len) as u32,
-            opcode: fuse_opcode::FUSE_SYMLINK.into(),
-            unique,
-            nodeid: parent_nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            total_extlen: 0,
-            padding: 0,
-        };
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_SYMLINK.into(),
+            parent_nodeid,
+            name_len + path_len,
+            None,
+            caller,
+        );
 
         let mut data = [0u8; FUSE_SYMLINK_MAX];
 
