@@ -10,8 +10,9 @@ use log::warn;
 use scheme_utils::HandleMap;
 use syscall::error::{ESTALE, Error, Result};
 use syscall::{
-    EBADF, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, MODE_DIR, MODE_SYMLINK, MODE_TYPE, O_ACCMODE,
-    O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDWR, O_TRUNC, O_WRONLY, TimeSpec,
+    EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, EPERM, MODE_DIR, MODE_SYMLINK,
+    MODE_TYPE, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDWR, O_TRUNC,
+    O_WRONLY, TimeSpec,
 };
 
 use crate::fuse::{
@@ -129,7 +130,7 @@ impl<T: FuseTransporter> Vfs<T> {
     // Private API
 
     fn touch(&mut self, nodeid: u64) {
-        self.next_used += 1;
+        self.next_used = self.next_used.saturating_add(1);
         if let Some(inode) = self.inodes.get_mut(&nodeid) {
             inode.used = self.next_used;
         }
@@ -152,7 +153,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 }
                 Some(_) => {}
             }
-            inode.nlookup += 1;
+            inode.nlookup = inode.nlookup.saturating_add(1);
             inode.attr = entry.attr;
             inode.attr_expiry = attr_expiry;
             let old_parent = inode.parent;
@@ -176,7 +177,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 },
             );
             if let Some(p) = self.inodes.get_mut(&parent) {
-                p.child_count += 1;
+                p.child_count = p.child_count.saturating_add(1);
             }
             None
         };
@@ -188,7 +189,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 p.child_count = p.child_count.saturating_sub(1);
             }
             if let Some(p) = self.inodes.get_mut(&parent) {
-                p.child_count += 1;
+                p.child_count = p.child_count.saturating_add(1);
             }
         }
 
@@ -203,19 +204,72 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(())
     }
 
+    fn merge_link(&mut self, parent: u64, name: &str, entry: fuse_entry_out) -> Result<()> {
+        let now = Instant::now();
+        let attr_expiry = fuse_expiry(now, entry.attr_valid, entry.attr_valid_nsec);
+        let entry_expiry = fuse_expiry(now, entry.entry_valid, entry.entry_valid_nsec);
+
+        if let Some(inode) = self.inodes.get_mut(&entry.nodeid) {
+            match inode.generation {
+                None => inode.generation = Some(entry.generation),
+                Some(g) if g != entry.generation => {
+                    warn!(
+                        "virtio-fsd: generation mismatch nodeid={} have={g} got={}",
+                        entry.nodeid, entry.generation
+                    );
+                    return Err(Error::new(ESTALE));
+                }
+                Some(_) => {}
+            }
+            inode.nlookup = inode.nlookup.saturating_add(1);
+            inode.attr = entry.attr;
+            inode.attr_expiry = attr_expiry;
+        } else {
+            self.populate_forgets();
+            self.inodes.insert(
+                entry.nodeid,
+                Inode {
+                    nodeid: entry.nodeid,
+                    generation: Some(entry.generation),
+                    parent,
+                    attr: entry.attr,
+                    attr_expiry,
+                    nlookup: 1,
+                    forget_pending: false,
+                    open_fd_count: 0,
+                    child_count: 0,
+                    used: 0,
+                },
+            );
+        }
+
+        self.dcache.entry(parent).or_default().insert(
+            name.to_owned(),
+            Dentry {
+                nodeid: entry.nodeid,
+                entry_expiry,
+            },
+        );
+        if let Some(p) = self.inodes.get_mut(&parent) {
+            p.child_count = p.child_count.saturating_add(1);
+        }
+        self.touch(entry.nodeid);
+        Ok(())
+    }
+
     fn increment_fd_count(&mut self, nodeid: u64) -> Result<()> {
         let inode = self.inodes.get_mut(&nodeid).ok_or_else(|| {
             warn!("virtio-fsd: increment_fd_count: no inode for nodeid={nodeid}");
             Error::new(EBADF)
         })?;
-        inode.open_fd_count += 1;
+        inode.open_fd_count = inode.open_fd_count.saturating_add(1);
         Ok(())
     }
 
     fn decrement_fd_count(&mut self, nodeid: u64) {
         if let Some(inode) = self.inodes.get_mut(&nodeid) {
             if inode.open_fd_count > 0 {
-                inode.open_fd_count -= 1;
+                inode.open_fd_count = inode.open_fd_count.saturating_sub(1);
             }
 
             if inode.forget_pending && inode.open_fd_count == 0 {
@@ -993,7 +1047,7 @@ impl<T: FuseTransporter> Vfs<T> {
     ) -> Result<WalkResult> {
         let mut hops = 0u32;
         while walk.node_mode == MODE_SYMLINK {
-            hops += 1;
+            hops = hops.saturating_add(1);
             if hops > SYMLOOP_MAX {
                 return Err(Error::new(ELOOP));
             }
@@ -1310,6 +1364,50 @@ impl<T: FuseTransporter> Vfs<T> {
             }
         }
 
+        self.flush_forgets(caller).await;
+        Ok(())
+    }
+
+    pub async fn link(&mut self, fd: usize, dest: &str, caller: Caller) -> Result<()> {
+        let src_nodeid = match self.handles.get(fd)? {
+            Handle::Directory { .. } => return Err(Error::new(EPERM)),
+            Handle::File { nodeid, .. } | Handle::Symlink { nodeid, .. } => *nodeid,
+            Handle::StatOnly { nodeid, .. } => {
+                if self.inode_mode(*nodeid)? == MODE_DIR {
+                    return Err(Error::new(EPERM));
+                }
+                *nodeid
+            }
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        let dest_walk = self.walk_path(fd, dest, O_CREAT, caller).await?;
+        let new_name = dest_walk
+            .rel_path
+            .last()
+            .cloned()
+            .ok_or(Error::new(EINVAL))?;
+        let new_parent = dest_walk.parent_nodeid;
+        if new_parent == 0 {
+            return Err(Error::new(EINVAL));
+        }
+        if !dest_walk.last_to_be_created {
+            return Err(Error::new(EEXIST));
+        }
+
+        let name_cstring = CString::new(new_name.as_str()).map_err(|_| {
+            warn!("virtio-fsd: link: new name contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+
+        let entry = self
+            .fuse
+            .link(new_parent, src_nodeid, name_cstring, caller)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_LINK"))?;
+
+        self.merge_link(new_parent, &new_name, entry)?;
+        self.invalidate_attr(new_parent);
         self.flush_forgets(caller).await;
         Ok(())
     }

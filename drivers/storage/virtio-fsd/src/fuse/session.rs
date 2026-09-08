@@ -6,9 +6,9 @@ use fuse_abi::linux::{
     FUSE_ATOMIC_O_TRUNC, FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION,
     FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out,
     fuse_create_in, fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header,
-    fuse_init_in, fuse_init_out, fuse_mkdir_in, fuse_opcode, fuse_open_in, fuse_open_out,
-    fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in, fuse_setattr_in, fuse_write_in,
-    fuse_write_out,
+    fuse_init_in, fuse_init_out, fuse_link_in, fuse_mkdir_in, fuse_opcode, fuse_open_in,
+    fuse_open_out, fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in, fuse_setattr_in,
+    fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
 use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
@@ -865,5 +865,41 @@ where
             .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
             .await?
             .into_unit()
+    }
+
+    pub async fn link(
+        &self,
+        new_parent: u64,
+        old_nodeid: u64,
+        name: CString,
+        caller: Caller,
+    ) -> Result<fuse_entry_out, FuseError> {
+        let name = name.as_bytes_with_nul();
+        let name_len = name.len();
+        if name_len > NAME_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
+
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_LINK.into(),
+            new_parent,
+            mem::size_of::<fuse_link_in>() + name_len,
+            None,
+            caller,
+        );
+
+        let fuse_in = fuse_link_in {
+            oldnodeid: old_nodeid,
+        };
+
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(fuse_in),
+        };
+
+        self.transporter
+            .send(request, AllocStrategy::Send { data: name })
+            .await?
+            .into_struct()
     }
 }

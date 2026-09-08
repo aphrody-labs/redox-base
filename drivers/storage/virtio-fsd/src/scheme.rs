@@ -327,8 +327,9 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn flink(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        warn!("virtio-fsd: flink is not supported on id {id} and path {path}");
-        Err(Error::new(EOPNOTSUPP))
+        let dest = get_dest(&self.scheme_name, path)?;
+        self.vfs.link(id, &dest, caller(ctx)).await?;
+        Ok(0)
     }
 
     async fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
@@ -341,27 +342,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        let dest = {
-            // relibc sends `path` as a canonical `/scheme/<scheme_name>/…` path
-            if let Some(after) = path.strip_prefix("/scheme/") {
-                let (name, rest) = after.split_once('/').unwrap_or((after, ""));
-                if name != &self.scheme_name {
-                    return Err(Error::new(EXDEV));
-                }
-                if rest.is_empty() {
-                    "/".to_owned()
-                } else {
-                    format!("/{rest}")
-                }
-            } else {
-                if path.starts_with('/') {
-                    path.to_owned()
-                } else {
-                    format!("/{path}")
-                }
-            }
-        };
-
+        let dest = get_dest(&self.scheme_name, path)?;
         self.vfs.rename(id, &dest, caller(ctx)).await?;
         Ok(0)
     }
@@ -505,5 +486,24 @@ fn caller(ctx: &CallerCtx) -> Caller {
         uid: ctx.uid,
         gid: ctx.gid,
         pid: ctx.pid as u32,
+    }
+}
+
+// Relibc `flink` and `frename` send path as `/scheme/<scheme_name>/…`
+fn get_dest(scheme: &str, path: &str) -> Result<String> {
+    if let Some(after) = path.strip_prefix("/scheme/") {
+        let (name, rest) = after.split_once('/').unwrap_or((after, ""));
+        if name != scheme {
+            return Err(Error::new(EXDEV));
+        }
+        if rest.is_empty() {
+            return Ok("/".to_owned());
+        }
+        return Ok(format!("/{rest}"));
+    }
+    if path.starts_with('/') {
+        Ok(path.to_owned())
+    } else {
+        Ok(format!("/{path}"))
     }
 }
