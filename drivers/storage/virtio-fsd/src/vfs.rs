@@ -1204,6 +1204,116 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(())
     }
 
+    pub async fn rename(&mut self, fd: usize, dest: &str, caller: Caller) -> Result<()> {
+        let (src_nodeid, src_path) = match self.handles.get(fd)? {
+            Handle::File { nodeid, path, .. }
+            | Handle::Directory { nodeid, path, .. }
+            | Handle::StatOnly { nodeid, path }
+            | Handle::Symlink { nodeid, path, .. } => (*nodeid, path.clone()),
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        let mut src_parts: Vec<String> = path_components(&src_path);
+        let old_name = src_parts.pop().ok_or(Error::new(EINVAL))?;
+        let old_parent = if src_parts.is_empty() {
+            FUSE_ROOT_ID
+        } else {
+            let parent_path = format!("/{}", src_parts.join("/"));
+            let walk = self.walk_path(fd, &parent_path, 0, caller).await?;
+            if walk.last_to_be_created {
+                return Err(Error::new(ENOENT));
+            }
+            walk.nodeid
+        };
+
+        let dest_walk = self.walk_path(fd, dest, O_CREAT, caller).await?;
+        let new_name = dest_walk
+            .rel_path
+            .last()
+            .cloned()
+            .ok_or(Error::new(EINVAL))?;
+        let new_parent = dest_walk.parent_nodeid;
+        if new_parent == 0 {
+            return Err(Error::new(EINVAL));
+        }
+        let dest_exists = !dest_walk.last_to_be_created;
+        let dest_nodeid = dest_walk.nodeid;
+
+        let old_cstring = CString::new(old_name.as_str()).map_err(|_| {
+            warn!("virtio-fsd: rename: old name contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+        let new_cstring = CString::new(new_name.as_str()).map_err(|_| {
+            warn!("virtio-fsd: rename: new name contained an internal 0 byte.");
+            Error::new(EINVAL)
+        })?;
+
+        self.fuse
+            .rename(old_parent, old_cstring, new_parent, new_cstring, caller)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_RENAME"))?;
+
+        // forgetting dest inode if it was replaced
+        if dest_exists && dest_nodeid != src_nodeid {
+            if let Some(inode) = self.inodes.get_mut(&dest_nodeid) {
+                if inode.open_fd_count == 0 {
+                    if inode.nlookup > 0 {
+                        self.forget_queue.push_back((dest_nodeid, inode.nlookup));
+                    }
+                    self.inodes.remove(&dest_nodeid);
+                } else {
+                    inode.forget_pending = true;
+                }
+            }
+            if let Some(parent) = self.inodes.get_mut(&new_parent) {
+                parent.child_count = parent.child_count.saturating_sub(1);
+            }
+        }
+
+        if old_parent != new_parent {
+            if let Some(parent) = self.inodes.get_mut(&old_parent) {
+                parent.child_count = parent.child_count.saturating_sub(1);
+            }
+            if let Some(parent) = self.inodes.get_mut(&new_parent) {
+                parent.child_count = parent.child_count.saturating_add(1);
+            }
+            if let Some(inode) = self.inodes.get_mut(&src_nodeid) {
+                inode.parent = new_parent;
+            }
+        }
+
+        self.drop_dentry(old_parent, &old_name);
+        self.drop_dentry(new_parent, &new_name);
+        self.invalidate_attr(old_parent);
+        self.invalidate_attr(new_parent);
+        self.invalidate_attr(src_nodeid);
+
+        // rewrite handle paths
+        let new_path = dest_walk.rel_path.join("/");
+        for handle in self.handles.values_mut() {
+            let path = match handle {
+                Handle::File { path, .. }
+                | Handle::Directory { path, .. }
+                | Handle::StatOnly { path, .. }
+                | Handle::Symlink { path, .. }
+                | Handle::SymlinkPreCreate { path, .. } => path,
+                Handle::SchemeRoot => continue,
+                #[cfg(feature = "lru-debug")]
+                Handle::LruLog => continue,
+            };
+            if path == &src_path {
+                *path = new_path.clone();
+            } else if let Some(rest) = path.strip_prefix(&src_path)
+                && rest.starts_with('/')
+            {
+                *path = format!("{new_path}{rest}");
+            }
+        }
+
+        self.flush_forgets(caller).await;
+        Ok(())
+    }
+
     pub async fn readlink(&self, nodeid: u64, caller: Caller) -> Result<String> {
         Ok(self
             .fuse

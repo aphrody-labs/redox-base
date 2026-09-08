@@ -7,7 +7,8 @@ use fuse_abi::linux::{
     FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out,
     fuse_create_in, fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header,
     fuse_init_in, fuse_init_out, fuse_mkdir_in, fuse_opcode, fuse_open_in, fuse_open_out,
-    fuse_out_header, fuse_read_in, fuse_release_in, fuse_setattr_in, fuse_write_in, fuse_write_out,
+    fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in, fuse_setattr_in, fuse_write_in,
+    fuse_write_out,
 };
 use log::{info, warn};
 use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
@@ -819,5 +820,50 @@ where
             )
             .await?
             .into_struct()
+    }
+
+    pub async fn rename(
+        &self,
+        old_parent: u64,
+        old_name: CString,
+        new_parent: u64,
+        new_name: CString,
+        caller: Caller,
+    ) -> Result<(), FuseError> {
+        const RENAME_IN_LEN: usize = mem::size_of::<fuse_rename_in>();
+
+        let old = old_name.as_bytes_with_nul();
+        let new = new_name.as_bytes_with_nul();
+        if old.len() > NAME_MAX || new.len() > NAME_MAX {
+            return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
+        }
+
+        let extra = RENAME_IN_LEN + old.len() + new.len();
+        let fuse_in_header = self.in_header(
+            // switch to FUSE_RENAME2 if scheme starts accepting flags
+            fuse_opcode::FUSE_RENAME.into(),
+            old_parent,
+            extra,
+            None,
+            caller,
+        );
+
+        let rename_in = fuse_rename_in { newdir: new_parent };
+
+        let mut data = [0u8; RENAME_IN_LEN + NAME_MAX * 2];
+
+        data[..RENAME_IN_LEN].copy_from_slice(rename_in.as_bytes());
+        data[RENAME_IN_LEN..RENAME_IN_LEN + old.len()].copy_from_slice(old);
+        data[RENAME_IN_LEN + old.len()..RENAME_IN_LEN + old.len() + new.len()].copy_from_slice(new);
+
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(data),
+        };
+
+        self.transporter
+            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .await?
+            .into_unit()
     }
 }

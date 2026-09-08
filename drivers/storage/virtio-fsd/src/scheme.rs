@@ -10,7 +10,7 @@ use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EOPNOTSUPP, ESPIPE, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, ENOENT, EWOULDBLOCK, EventFlags,
+    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, ENOENT, EWOULDBLOCK, EXDEV, EventFlags,
     MODE_DIR, MODE_SYMLINK, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta,
     TimeSpec,
 };
@@ -341,8 +341,29 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        warn!("virtio-fsd: frename is not supported on id {id} and path {path}");
-        Err(Error::new(EOPNOTSUPP))
+        let dest = {
+            // relibc sends `path` as a canonical `/scheme/<scheme_name>/…` path
+            if let Some(after) = path.strip_prefix("/scheme/") {
+                let (name, rest) = after.split_once('/').unwrap_or((after, ""));
+                if name != &self.scheme_name {
+                    return Err(Error::new(EXDEV));
+                }
+                if rest.is_empty() {
+                    "/".to_owned()
+                } else {
+                    format!("/{rest}")
+                }
+            } else {
+                if path.starts_with('/') {
+                    path.to_owned()
+                } else {
+                    format!("/{path}")
+                }
+            }
+        };
+
+        self.vfs.rename(id, &dest, caller(ctx)).await?;
+        Ok(0)
     }
 
     async fn fstat(&mut self, id: usize, stat: &mut Stat, ctx: &CallerCtx) -> Result<()> {
