@@ -11,8 +11,8 @@ use scheme_utils::HandleMap;
 use syscall::error::{ESTALE, Error, Result};
 use syscall::{
     EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, EPERM, MODE_DIR, MODE_SYMLINK,
-    MODE_TYPE, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDWR, O_TRUNC,
-    O_WRONLY, TimeSpec,
+    MODE_TYPE, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
+    O_TRUNC, O_WRONLY, TimeSpec,
 };
 
 use crate::fuse::{
@@ -676,19 +676,36 @@ impl<T: FuseTransporter> Vfs<T> {
         fd: usize,
         buf: &mut [u8],
         offset: u64,
+        fcntl_flags: u32,
         caller: Caller,
     ) -> Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+        let can_read = matches!(fcntl_flags as usize & O_ACCMODE, O_RDONLY | O_RDWR);
 
         match self.handles.get(fd)? {
-            Handle::File { nodeid, fh, .. } => self
-                .fuse
-                .read(*nodeid, *fh, offset, buf, 0, 0, caller)
-                .await
-                .map_err(|e| e.into_syscall("FUSE_READ")),
+            Handle::File { nodeid, fh, .. } => {
+                if !can_read {
+                    return Err(Error::new(EBADF));
+                }
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                self.fuse
+                    .read(
+                        *nodeid,
+                        *fh,
+                        offset,
+                        buf,
+                        0,
+                        fuse_io_flags(fcntl_flags),
+                        caller,
+                    )
+                    .await
+                    .map_err(|e| e.into_syscall("FUSE_READ"))
+            }
             Handle::Symlink { target, .. } => {
+                if !can_read {
+                    return Err(Error::new(EBADF));
+                }
                 let data = target.as_bytes();
                 let off = offset as usize;
                 if off >= data.len() {
@@ -700,6 +717,9 @@ impl<T: FuseTransporter> Vfs<T> {
             }
             #[cfg(feature = "lru-debug")]
             Handle::LruLog => {
+                if !can_read {
+                    return Err(Error::new(EBADF));
+                }
                 let data = self.evicted_names.join("\n");
                 let off = offset as usize;
                 if off >= data.len() {
@@ -710,8 +730,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 Ok(n)
             }
             Handle::Directory { .. } => Err(Error::new(EISDIR)),
-            _ => {
-                warn!("virtio-fsd: read: fd '{fd}' is not associated with a valid file.");
+            Handle::StatOnly { .. } | Handle::SchemeRoot | Handle::SymlinkPreCreate { .. } => {
                 Err(Error::new(EBADF))
             }
         }
@@ -722,23 +741,47 @@ impl<T: FuseTransporter> Vfs<T> {
         fd: usize,
         buf: &[u8],
         offset: u64,
+        fcntl_flags: u32,
         caller: Caller,
     ) -> Result<usize> {
-        let (parent_nodeid, name, path) = match self.handles.get(fd)? {
-            Handle::File { nodeid, fh, .. } => {
-                if buf.is_empty() {
-                    return Ok(0);
-                }
-                let nodeid = *nodeid;
-                let fh = *fh;
-                let payload = self
-                    .fuse
-                    .write(nodeid, fh, offset, buf, 0, 0, caller)
-                    .await
-                    .map_err(|e| e.into_syscall("FUSE_WRITE"))?;
-                self.invalidate_attr(nodeid);
-                return Ok(payload.size as usize);
+        let can_write = matches!(fcntl_flags as usize & O_ACCMODE, O_WRONLY | O_RDWR);
+
+        let file_ids = match self.handles.get(fd)? {
+            Handle::File { nodeid, fh, .. } => Some((*nodeid, *fh)),
+            _ => None,
+        };
+        if let Some((nodeid, fh)) = file_ids {
+            if !can_write {
+                return Err(Error::new(EBADF));
             }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+
+            let offset = if fcntl_flags as usize & O_APPEND != 0 {
+                self.getattr(fd, caller).await?.size
+            } else {
+                offset
+            };
+            let payload = self
+                .fuse
+                .write(
+                    nodeid,
+                    fh,
+                    offset,
+                    buf,
+                    0,
+                    fuse_io_flags(fcntl_flags),
+                    caller,
+                )
+                .await
+                .map_err(|e| e.into_syscall("FUSE_WRITE"))?;
+            self.invalidate_attr(nodeid);
+            return Ok(payload.size as usize);
+        }
+
+        let (parent_nodeid, name, path) = match self.handles.get(fd)? {
+            Handle::File { .. } => unreachable!("handled above"),
             Handle::SymlinkPreCreate {
                 parent_nodeid,
                 name,
@@ -752,6 +795,9 @@ impl<T: FuseTransporter> Vfs<T> {
             Handle::LruLog => return Err(Error::new(EBADF)),
         };
 
+        if !can_write {
+            return Err(Error::new(EBADF));
+        }
         if offset != 0 {
             return Err(Error::new(EINVAL));
         }
@@ -1420,6 +1466,10 @@ impl<T: FuseTransporter> Vfs<T> {
             .map_err(|e| e.into_syscall("FUSE_READLINK"))?)
     }
 
+    pub fn has_fd(&self, fd: usize) -> Result<()> {
+        self.handles.get(fd).map(|_| ())
+    }
+
     pub fn get_path(&self, fd: usize) -> Result<&str> {
         match self.handles.get(fd)? {
             Handle::File { path, .. }
@@ -1485,6 +1535,8 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 }
 
+// Helpers
+
 fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
     path.split('/')
         .filter(|s| !s.is_empty())
@@ -1515,20 +1567,30 @@ fn fuse_open_flags(redox_flags: usize, is_dir: bool, for_create: bool) -> Result
         if for_create && redox_flags & O_EXCL != 0 {
             linux_flags |= linux_abi::O_EXCL;
         }
-        if redox_flags & O_APPEND != 0 {
-            linux_flags |= linux_abi::O_APPEND;
-        }
         if redox_flags & O_TRUNC != 0 {
             linux_flags |= linux_abi::O_TRUNC;
-        }
-        if redox_flags & O_NONBLOCK != 0 {
-            linux_flags |= linux_abi::O_NONBLOCK;
         }
     } else if redox_flags & O_DIRECTORY != 0 {
         linux_flags |= linux_abi::O_DIRECTORY;
     }
 
     Ok(linux_flags)
+}
+
+fn fuse_io_flags(fcntl_flags: u32) -> u32 {
+    let flags = fcntl_flags as usize;
+    let mut linux = match flags & O_ACCMODE {
+        O_RDWR => linux_abi::O_RDWR,
+        O_WRONLY => linux_abi::O_WRONLY,
+        _ => linux_abi::O_RDONLY,
+    };
+    if flags & O_NONBLOCK != 0 {
+        linux |= linux_abi::O_NONBLOCK;
+    }
+    if flags & O_APPEND != 0 {
+        linux |= linux_abi::O_APPEND;
+    }
+    linux
 }
 
 fn apply_timespec(fuse_in: &mut fuse_setattr_in, ts: &TimeSpec, atime: bool) -> Result<()> {

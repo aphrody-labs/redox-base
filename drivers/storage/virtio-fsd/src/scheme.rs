@@ -7,12 +7,12 @@ use redox_scheme::{
 };
 use scheme_utils::FpathWriter;
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
-use syscall::error::{EOPNOTSUPP, ESPIPE, Error, Result};
+use syscall::error::{EOPNOTSUPP, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, ENOENT, EWOULDBLOCK, EXDEV, EventFlags,
-    MODE_DIR, MODE_SYMLINK, MapFlags, MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta,
-    TimeSpec,
+    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, ENOENT, EPERM, EWOULDBLOCK, EXDEV,
+    EventFlags, F_GETFL, F_SETFL, MODE_DIR, MODE_FILE, MODE_PERM, MODE_SYMLINK, MapFlags,
+    MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
 };
 
 use crate::fuse::{Caller, FuseTransporter};
@@ -70,30 +70,17 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
                         .handle_async(&mut self.inner, &mut self.state)
                         .await
                 }
-                RequestKind::SendFd(request) => {
-                    warn!("virtio-fsd: RequestKind::SendFd not supported");
-                    Response::err(EOPNOTSUPP, request)
-                }
-                RequestKind::RecvFd(request) => {
-                    warn!("virtio-fsd: RequestKind::RecvFd not supported");
-                    Response::err(EOPNOTSUPP, request)
-                }
-                RequestKind::Cancellation(_cancellation_request) => {
-                    warn!("virtio-fsd: RequestKind::Cancellation not supported");
-                    continue;
-                }
+                RequestKind::SendFd(request) => Response::err(EOPNOTSUPP, request),
+                RequestKind::RecvFd(request) => Response::err(EOPNOTSUPP, request),
                 RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {
-                    warn!("virtio-fsd: RequestKind::MsyncMsg | MunmapMsg | MmapMsg not supported");
                     continue;
                 }
                 RequestKind::OnClose { id } => {
                     self.on_close(id).await;
                     continue;
                 }
-                RequestKind::OnDetach { .. } => {
-                    warn!("virtio-fsd: RequestKind::OnDetach not supported");
-                    continue;
-                }
+                RequestKind::Cancellation(_cancellation_request) => continue,
+                RequestKind::OnDetach { .. } => continue,
             };
             self.inner
                 .socket
@@ -117,6 +104,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         fcntl_flags: u32,
         ctx: &CallerCtx,
     ) -> Result<OpenResult> {
+        let flags = flags | fcntl_flags as usize;
         let caller = caller(ctx);
 
         #[cfg(feature = "lru-debug")]
@@ -169,9 +157,6 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         }
 
         if let Some((name, is_dir)) = to_be_created {
-            // We broke out of the loop early, so `walk.nodeid` is currently
-            // the parent directory where the new file should be created.
-
             if o_symlink {
                 let fd = self
                     .vfs
@@ -182,29 +167,28 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
                 });
             }
 
-            //TODO: clean
-            let redox_mode = (flags & 0xFFFF) as u32;
-            const S_IFREG: u32 = 0o100000;
-            const S_IFDIR: u32 = 0o40000;
-            let mode = if is_dir {
-                redox_mode | S_IFDIR
-            } else {
-                redox_mode | S_IFREG
-            };
-
+            let perm = flags as u32 & u32::from(MODE_PERM);
             if is_dir {
                 let accmode = flags & syscall::O_ACCMODE;
                 if accmode == syscall::O_WRONLY || accmode == syscall::O_RDWR {
                     return Err(Error::new(EISDIR));
                 }
-                (walk.nodeid, walk.node_mode) =
-                    self.vfs.mkdir(walk.nodeid, &name, mode, caller).await?;
+                (walk.nodeid, walk.node_mode) = self
+                    .vfs
+                    .mkdir(walk.nodeid, &name, perm | u32::from(MODE_DIR), caller)
+                    .await?;
             } else {
                 let fd = self
                     .vfs
-                    .create(walk.nodeid, &name, flags, mode, walk.rel_path, caller)
+                    .create(
+                        walk.nodeid,
+                        &name,
+                        flags,
+                        perm | u32::from(MODE_FILE),
+                        walk.rel_path,
+                        caller,
+                    )
                     .await?;
-
                 return Ok(OpenResult::ThisScheme {
                     number: fd,
                     flags: NewFdFlags::POSITIONED,
@@ -264,9 +248,10 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         Ok(self.vfs.rm(walk, is_dir, caller).await?)
     }
 
-    /* Resource operations */
-    async fn dup(&mut self, old_id: usize, buf: &[u8], ctx: &CallerCtx) -> Result<OpenResult> {
-        warn!("virtio-fsd: dup is not supported on id {old_id}");
+    // Ordinary dup/dup2 is done in the kernel and we never see it. This is only
+    // for schemes that treat dup(fd, "some-name") as a special open, which we
+    // don't. redoxfs skips it too.
+    async fn dup(&mut self, _old_id: usize, _buf: &[u8], _ctx: &CallerCtx) -> Result<OpenResult> {
         Err(Error::new(EOPNOTSUPP))
     }
 
@@ -278,7 +263,9 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         fcntl_flags: u32,
         ctx: &CallerCtx,
     ) -> Result<usize> {
-        self.vfs.read(id, buf, offset, caller(ctx)).await
+        self.vfs
+            .read(id, buf, offset, fcntl_flags, caller(ctx))
+            .await
     }
 
     async fn write(
@@ -289,12 +276,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         fcntl_flags: u32,
         ctx: &CallerCtx,
     ) -> Result<usize> {
-        self.vfs.write(id, buf, offset, caller(ctx)).await
+        self.vfs
+            .write(id, buf, offset, fcntl_flags, caller(ctx))
+            .await
     }
 
     async fn fsize(&mut self, id: usize, ctx: &CallerCtx) -> Result<u64> {
-        warn!("virtio-fsd: fsize is not supported on id {id}");
-        Err(Error::new(ESPIPE))
+        Ok(self.vfs.getattr(id, caller(ctx)).await?.size)
     }
 
     async fn fchmod(&mut self, id: usize, new_mode: u16, ctx: &CallerCtx) -> Result<()> {
@@ -311,19 +299,32 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         self.vfs.fchown(id, new_uid, new_gid, caller(ctx)).await
     }
 
-    async fn fcntl(&mut self, id: usize, cmd: usize, arg: usize, ctx: &CallerCtx) -> Result<usize> {
-        warn!("virtio-fsd: fcntl is not supported on id {id}");
-        Err(Error::new(EOPNOTSUPP))
+    async fn fcntl(
+        &mut self,
+        id: usize,
+        cmd: usize,
+        _arg: usize,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        // F_GETFL/F_SETFL: kernel keeps the bits and passes them back as
+        // fcntl_flags on read/write. We only have to agree. F_GETFD/F_SETFD
+        // and F_DUPFD never reach the scheme.
+        self.vfs.has_fd(id)?;
+        match cmd {
+            F_GETFL | F_SETFL => Ok(0),
+            _ => Err(Error::new(EINVAL)),
+        }
     }
 
     async fn fevent(
         &mut self,
         id: usize,
-        flags: EventFlags,
-        ctx: &CallerCtx,
+        _flags: EventFlags,
+        _ctx: &CallerCtx,
     ) -> Result<EventFlags> {
-        warn!("virtio-fsd: fevent is not supported on id {id}");
-        Ok(EventFlags::empty())
+        // files here are always ready, same as redoxfs.
+        self.vfs.has_fd(id)?;
+        Err(Error::new(EPERM))
     }
 
     async fn flink(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
@@ -394,24 +395,22 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
 
     async fn call(
         &mut self,
-        id: usize,
-        payload: &mut [u8],
-        metadata: &[u64],
-        ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
+        _id: usize,
+        _payload: &mut [u8],
+        _metadata: &[u64],
+        _ctx: &CallerCtx,
     ) -> Result<usize> {
-        warn!("virtio-fsd: call is not supported on id {id}");
         Err(Error::new(EOPNOTSUPP))
     }
 
     async fn std_fs_call(
         &mut self,
-        id: usize,
-        kind: StdFsCallKind,
-        payload: &mut [u8],
-        metadata: StdFsCallMeta,
-        ctx: &CallerCtx, // Only pid and id are correct here, uid/gid are not used
+        _id: usize,
+        _kind: StdFsCallKind,
+        _payload: &mut [u8],
+        _metadata: StdFsCallMeta,
+        _ctx: &CallerCtx,
     ) -> Result<usize> {
-        warn!("virtio-fsd: std_fs_call is not supported on id {id}");
         Err(Error::new(EOPNOTSUPP))
     }
 
@@ -446,35 +445,31 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         Ok(buf)
     }
 
+    // Mapping file contents needs DAX, which we aren't doing yet.
     async fn mmap_prep(
         &mut self,
-        id: usize,
-        offset: u64,
-        size: usize,
-        flags: MapFlags,
-        ctx: &CallerCtx,
+        _id: usize,
+        _offset: u64,
+        _size: usize,
+        _flags: MapFlags,
+        _ctx: &CallerCtx,
     ) -> Result<usize> {
-        warn!("virtio-fsd: mmap_prep is not supported on id {id}");
         Err(Error::new(EOPNOTSUPP))
     }
 
+    // Only needed once mmap_prep actually maps something.
     async fn munmap(
         &mut self,
-        id: usize,
-        offset: u64,
-        size: usize,
-        flags: MunmapFlags,
-        ctx: &CallerCtx,
+        _id: usize,
+        _offset: u64,
+        _size: usize,
+        _flags: MunmapFlags,
+        _ctx: &CallerCtx,
     ) -> Result<()> {
-        warn!("virtio-fsd: munmap is not supported on id {id}");
         Err(Error::new(EOPNOTSUPP))
     }
 
-    async fn on_recvfd(&mut self, recvfd_request: &RecvFdRequest) -> Result<OpenResult> {
-        warn!(
-            "virtio-fsd: recvfd is not supported on id {}",
-            recvfd_request.id()
-        );
+    async fn on_recvfd(&mut self, _recvfd_request: &RecvFdRequest) -> Result<OpenResult> {
         Err(Error::new(EOPNOTSUPP))
     }
 }
