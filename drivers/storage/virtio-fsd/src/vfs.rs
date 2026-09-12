@@ -17,7 +17,7 @@ use syscall::{
 
 use crate::fuse::{
     Caller, FUSE_ROOT_ID, FuseReaddirOut, FuseSession, FuseTransporter, fuse_attr, fuse_attr_out,
-    fuse_entry_out,
+    fuse_entry_out, fuse_kstatfs,
 };
 use crate::linux_abi;
 
@@ -669,6 +669,26 @@ impl<T: FuseTransporter> Vfs<T> {
         self.refresh_attr(nodeid, payload);
         self.touch(nodeid);
         Ok(payload.attr)
+    }
+
+    pub async fn statfs(&self, fd: usize, caller: Caller) -> Result<fuse_kstatfs> {
+        let nodeid = match self.handles.get(fd)? {
+            Handle::File { nodeid, .. }
+            | Handle::Directory { nodeid, .. }
+            | Handle::StatOnly { nodeid, .. }
+            | Handle::Symlink { nodeid, .. } => *nodeid,
+            Handle::SchemeRoot => FUSE_ROOT_ID,
+            Handle::SymlinkPreCreate { .. } => return Err(Error::new(EBADF)),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => FUSE_ROOT_ID,
+        };
+
+        Ok(self
+            .fuse
+            .statfs(nodeid, caller)
+            .await
+            .map_err(|e| e.into_syscall("FUSE_STATFS"))?
+            .st)
     }
 
     pub async fn read(

@@ -8,7 +8,7 @@ use fuse_abi::linux::{
     fuse_create_in, fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header,
     fuse_init_in, fuse_init_out, fuse_link_in, fuse_mkdir_in, fuse_opcode, fuse_open_in,
     fuse_open_out, fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in, fuse_setattr_in,
-    fuse_write_in, fuse_write_out,
+    fuse_statfs_out, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
 use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
@@ -336,6 +336,21 @@ where
         let request = FuseRequest {
             fuse_in_header,
             fuse_in: Some(fuse_in),
+        };
+
+        self.transporter
+            .send(request, AllocStrategy::DmaPool)
+            .await?
+            .into_struct()
+    }
+
+    pub async fn statfs(&self, nodeid: u64, caller: Caller) -> Result<fuse_statfs_out, FuseError> {
+        let fuse_in_header =
+            self.in_header(fuse_opcode::FUSE_STATFS.into(), nodeid, 0, None, caller);
+
+        let request: FuseRequest<()> = FuseRequest {
+            fuse_in_header,
+            fuse_in: None,
         };
 
         self.transporter

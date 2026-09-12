@@ -377,8 +377,17 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn fstatvfs(&mut self, id: usize, stat: &mut StatVfs, ctx: &CallerCtx) -> Result<()> {
-        warn!("virtio-fsd: fstatvfs is not supported on id {id}");
-        Err(Error::new(EOPNOTSUPP))
+        let k = self.vfs.statfs(id, caller(ctx)).await?;
+        let bsize = if k.bsize != 0 { k.bsize } else { k.frsize };
+
+        *stat = StatVfs {
+            f_bsize: bsize,
+            f_blocks: k.blocks,
+            f_bfree: k.bfree,
+            f_bavail: k.bavail,
+        };
+
+        Ok(())
     }
 
     async fn fsync(&mut self, id: usize, ctx: &CallerCtx) -> Result<()> {
