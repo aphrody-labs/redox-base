@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use event::EventQueue;
 use log::warn;
 use pcid_interface::PciFunctionHandle;
@@ -61,8 +63,14 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
     scheme_start(daemon, fuse_session);
 }
 
-fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSession<T>) -> ! {
-    let scheme_file = Socket::create().expect("virtio-fsd: failed to create the scheme socket.");
+fn scheme_start<T: FuseTransporter + 'static>(
+    daemon: daemon::Daemon,
+    fuse_session: FuseSession<T>,
+) -> ! {
+    // Socket must be non-blocking since `scheme.tick()` drains
+    // until EAGAIN, then it runs the batch.
+    let scheme_file =
+        Arc::new(Socket::nonblock().expect("virtio-fsd: failed to create the scheme socket."));
 
     let event_queue = EventQueue::new().expect("virtio-fsd: failed to create the event queue.");
 
@@ -79,9 +87,9 @@ fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSe
         .expect("virtio-fsd: failed to subscribe to the event queue.");
 
     let vfs = Vfs::new(fuse_session);
-    let mut scheme = VirtioFsScheme::new(&scheme_file, vfs);
+    let mut scheme = VirtioFsScheme::new(Arc::clone(&scheme_file), vfs);
 
-    register_async_scheme(&scheme_file, "virtio-fsd", &mut scheme.inner)
+    register_async_scheme(scheme_file.as_ref(), "virtio-fsd", &mut scheme)
         .expect("virtio-fsd: can't register virtio-fsd scheme");
 
     daemon.ready();
@@ -94,13 +102,7 @@ fn scheme_start<T: FuseTransporter>(daemon: daemon::Daemon, fuse_session: FuseSe
             .user_data
         {
             Source::Scheme => {
-                // TODO: Spawn a separate task for each scheme call. This would however require the
-                // use of a smarter buffer pool (or direct IO, or a buffer per fd) in order to do
-                // parallel IO. It might also require async-aware locks so that a close() is
-                // correctly ordered wrt IO on the same fd.
-                // When it comes to event parsing, current implementation is sequential because we
-                // block on each event.
-                if let Err(err) = futures::executor::block_on(scheme.tick()) {
+                if let Err(err) = scheme.tick() {
                     warn!("virtio-fsd: error processing scheme requests: {err}");
                 }
             }

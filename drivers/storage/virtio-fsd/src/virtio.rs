@@ -2,6 +2,7 @@ use core::slice;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::dma::Dma;
 use log::warn;
@@ -144,6 +145,7 @@ pub struct VirtioFsSession {
     /// Only exists if VIRTIO_FS_F_NOTIFICATION is set.
     notif_buf_size: Option<u32>,
     request_queues: Vec<Arc<Queue>>,
+    next_queue: AtomicUsize,
     dma_pool: DmaPool,
 }
 
@@ -245,6 +247,7 @@ impl<'a> VirtioFsSession {
             hiprio_queue,
             notif_queue,
             request_queues,
+            next_queue: AtomicUsize::new(0),
             dma_pool: DmaPool::new(),
         }
     }
@@ -264,8 +267,9 @@ impl<'a> VirtioFsSession {
     }
 
     async fn send(&self, chain: Vec<Buffer>) -> Result<u32, TransportError> {
-        //TODO: round-robin or per-cpu?
-        Ok(self.request_queues[0].send(chain).await)
+        let n = self.request_queues.len();
+        let i = self.next_queue.fetch_add(1, Ordering::Relaxed) % n;
+        Ok(self.request_queues[i].send(chain).await)
     }
 
     async fn send_hiprio(&self, chain: Vec<Buffer>) -> Result<(), TransportError> {

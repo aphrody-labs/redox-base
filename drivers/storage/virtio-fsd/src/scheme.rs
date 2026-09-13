@@ -1,5 +1,8 @@
 use std::io;
+use std::sync::Arc;
 
+use futures::executor::LocalPool;
+use futures::task::LocalSpawnExt;
 use log::warn;
 use redox_scheme::scheme::{SchemeAsync, SchemeState};
 use redox_scheme::{
@@ -18,45 +21,48 @@ use syscall::{
 use crate::fuse::{Caller, FuseTransporter};
 use crate::vfs::Vfs;
 
-pub struct VirtioFsSchemeInner<'sock, T: FuseTransporter> {
-    socket: &'sock Socket,
-    vfs: Vfs<T>,
-    scheme_name: String,
+pub struct VirtioFsScheme<T: FuseTransporter> {
+    socket: Arc<Socket>,
+    vfs: Arc<Vfs<T>>,
+    scheme_name: Arc<str>,
 }
 
-pub struct VirtioFsScheme<'sock, T: FuseTransporter> {
-    pub inner: VirtioFsSchemeInner<'sock, T>,
-    state: SchemeState,
-}
-
-impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
-    pub fn new(socket: &'sock Socket, vfs: Vfs<T>) -> Self {
-        let inner = VirtioFsSchemeInner {
-            vfs,
-            socket,
-            scheme_name: "virtio-fsd".to_owned(),
-        };
-
+impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
+    fn clone(&self) -> Self {
         Self {
-            inner,
-            state: SchemeState::new(),
+            socket: Arc::clone(&self.socket),
+            vfs: Arc::clone(&self.vfs),
+            scheme_name: Arc::clone(&self.scheme_name),
+        }
+    }
+}
+
+impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
+    pub fn new(socket: Arc<Socket>, vfs: Vfs<T>) -> Self {
+        Self {
+            vfs: Arc::new(vfs),
+            socket,
+            scheme_name: Arc::from("virtio-fsd"),
         }
     }
 
-    pub async fn on_close(&mut self, id: usize) {
-        self.inner.vfs.close(id, Caller::NONE).await
-    }
-
     pub async fn shutdown(&mut self) {
-        self.inner.vfs.shutdown().await
+        self.vfs.shutdown().await
     }
 
-    pub async fn tick(&mut self) -> io::Result<()> {
+    pub fn tick(&mut self) -> io::Result<()> {
+        // We interleave requests on the same thread, then `pool.run()`
+        // once EAGAIN is encountered.
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let mut closes = Vec::new();
+
         loop {
-            let request = match self.inner.socket.next_request(SignalBehavior::Interrupt) {
+            let request = match self.socket.next_request(SignalBehavior::Interrupt) {
                 Ok(Some(request)) => request,
                 Ok(None) => {
-                    self.inner.vfs.shutdown().await;
+                    pool.run();
+                    futures::executor::block_on(self.vfs.shutdown());
                     std::process::exit(0);
                 }
                 Err(error) if error.errno == EWOULDBLOCK || error.errno == EAGAIN => break,
@@ -64,34 +70,50 @@ impl<'sock, T: FuseTransporter> VirtioFsScheme<'sock, T> {
                 Err(err) => return Err(err.into()),
             };
 
-            let response = match request.kind() {
+            match request.kind() {
                 RequestKind::Call(call_request) => {
-                    call_request
-                        .handle_async(&mut self.inner, &mut self.state)
-                        .await
+                    let mut scheme = self.clone();
+                    spawner
+                        .spawn_local(async move {
+                            let mut state = SchemeState::new();
+                            let response = call_request.handle_async(&mut scheme, &mut state).await;
+                            if let Err(err) = scheme
+                                .socket
+                                .write_response(response, SignalBehavior::Restart)
+                            {
+                                warn!("virtio-fsd: write_response: {err}");
+                            }
+                        })
+                        .expect("virtio-fsd: failed to spawn scheme call");
                 }
-                RequestKind::SendFd(request) => Response::err(EOPNOTSUPP, request),
-                RequestKind::RecvFd(request) => Response::err(EOPNOTSUPP, request),
-                RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {
-                    continue;
+                RequestKind::SendFd(request) => {
+                    let _ = self.socket.write_response(
+                        Response::err(EOPNOTSUPP, request),
+                        SignalBehavior::Restart,
+                    );
                 }
-                RequestKind::OnClose { id } => {
-                    self.on_close(id).await;
-                    continue;
+                RequestKind::RecvFd(request) => {
+                    let _ = self.socket.write_response(
+                        Response::err(EOPNOTSUPP, request),
+                        SignalBehavior::Restart,
+                    );
                 }
-                RequestKind::Cancellation(_cancellation_request) => continue,
-                RequestKind::OnDetach { .. } => continue,
-            };
-            self.inner
-                .socket
-                .write_response(response, SignalBehavior::Restart)?;
+                RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {}
+                RequestKind::OnClose { id } => closes.push(id),
+                RequestKind::Cancellation(_cancellation_request) => {}
+                RequestKind::OnDetach { .. } => {}
+            }
         }
 
+        pool.run();
+        for id in closes {
+            futures::executor::block_on(self.vfs.close(id, Caller::NONE));
+        }
         Ok(())
     }
 }
 
-impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
+impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
     fn scheme_root(&mut self) -> Result<usize> {
         Ok(self.vfs.scheme_root())
     }
@@ -328,7 +350,7 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
     }
 
     async fn flink(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        let dest = get_dest(&self.scheme_name, path)?;
+        let dest = get_dest(self.scheme_name.as_ref(), path)?;
         self.vfs.link(id, &dest, caller(ctx)).await?;
         Ok(0)
     }
@@ -337,13 +359,13 @@ impl<'sock, T: FuseTransporter> SchemeAsync for VirtioFsSchemeInner<'sock, T> {
         let path = self.vfs.get_path(id)?;
 
         FpathWriter::with(buf, self.scheme_name.as_ref(), |w| {
-            w.push_str(path);
+            w.push_str(&path);
             Ok(())
         })
     }
 
     async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        let dest = get_dest(&self.scheme_name, path)?;
+        let dest = get_dest(self.scheme_name.as_ref(), path)?;
         self.vfs.rename(id, &dest, caller(ctx)).await?;
         Ok(0)
     }
