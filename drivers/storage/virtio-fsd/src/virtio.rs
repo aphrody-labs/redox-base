@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::dma::Dma;
-use log::warn;
+use log::{info, warn};
 use syscall::PAGE_SIZE;
 use virtio_core::Device;
 use virtio_core::spec::{Buffer, ChainBuilder, DescriptorFlags};
@@ -160,12 +160,12 @@ impl<'a> VirtioFsSession {
             .check_device_feature(VIRTIO_FS_F_NOTIFICATION);
 
         if notif_supported {
-            warn!("virtio-fsd: device supports notifications.");
+            info!("virtio-fsd: device supports notifications.");
             device
                 .transport
                 .ack_driver_feature(VIRTIO_FS_F_NOTIFICATION);
         } else {
-            warn!("virtio-fsd: device does not support notifications.");
+            info!("virtio-fsd: device does not support notifications.");
         }
 
         device.transport.finalize_features();
@@ -252,19 +252,20 @@ impl<'a> VirtioFsSession {
         }
     }
 
+    // TODO: use tag as the scheme name such that multiple shares can be
+    // represented by Redox if QEMU makes them available.
     /// Returns the VirtIO FS tag associated with this session.
     ///
     /// # Panics
     /// This function panics if the tag is not valid UTF-8.
-    pub fn tag(&self) -> &str {
-        let tag_len = self
-            .tag
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(self.tag.len());
-
-        core::str::from_utf8(&self.tag[..tag_len]).expect("virtio-fsd: tag is not valid UTF-8.")
-    }
+    // pub fn tag(&self) -> &str {
+    //     let tag_len = self
+    //         .tag
+    //         .iter()
+    //         .position(|&c| c == 0)
+    //         .unwrap_or(self.tag.len());
+    //     core::str::from_utf8(&self.tag[..tag_len]).expect("virtio-fsd: tag is not valid UTF-8.")
+    // }
 
     async fn send(&self, chain: Vec<Buffer>) -> Result<u32, TransportError> {
         let n = self.request_queues.len();

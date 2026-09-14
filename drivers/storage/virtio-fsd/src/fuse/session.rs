@@ -11,6 +11,7 @@ use fuse_abi::linux::{
     fuse_statfs_out, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
+use syscall::PAGE_SIZE;
 use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -210,33 +211,6 @@ where
 
         session.init = init_out;
 
-        warn!(
-            "virtio-fsd: FUSE INIT succeeded:
-            - protocol {}.{}
-            - max_write={}
-            - max_readahead={}
-            - max_background={}
-            - time_gran={}
-            - flags={:#x}
-            - congestion_threshold={}
-            - max_pages={}
-            - map_alignment={}
-            - flags2={:#x}
-            - max_stack_depth={}",
-            session.init.major,
-            session.init.minor,
-            session.init.max_write,
-            session.init.max_readahead,
-            session.init.max_background,
-            session.init.time_gran,
-            session.init.flags,
-            session.init.congestion_threshold,
-            session.init.max_pages,
-            session.init.map_alignment,
-            session.init.flags2,
-            session.init.max_stack_depth,
-        );
-
         let use_local_parent_resolution =
             session.capable(FUSE_NO_EXPORT_SUPPORT) || !session.capable(FUSE_EXPORT_SUPPORT);
 
@@ -244,18 +218,39 @@ where
         // virtiofsd does not support `FUSE_NO_EXPORT_SUPPORT` flag
         if use_local_parent_resolution {
             info!(
-                "Host disabled export support (or is old). lookup('..') must be resolved locally."
+                "virtio-fsd: Host disabled export support (or is old). lookup('..') will be resolved locally."
             );
         } else {
-            info!("Host enabled full export support. lookup('..') can be forwarded to host.");
+            info!(
+                "virtio-fsd: Host enabled full export support. lookup('..') can be forwarded to host."
+            );
         }
 
+        info!("virtio-fsd: Share is available at '/scheme/virtio-fsd'.");
         Ok(session)
     }
 
     /// Whether this `FUSE_INIT` flag was negotiated (`flags` / `flags2`).
     pub fn capable(&self, cap: impl Into<u64>) -> bool {
         (self.init.flags as u64 | (self.init.flags2 as u64) << 32) & cap.into() != 0
+    }
+
+    /// Max payload of one `FUSE_WRITE` (`fuse_init_out.max_write`).
+    fn max_write_len(&self) -> usize {
+        match self.init.max_write as usize {
+            0 => PAGE_SIZE,
+            n => n,
+        }
+    }
+
+    /// Max payload of one `FUSE_READ` (`max_pages * PAGE_SIZE`).
+    /// Linux uses 32 pages when the host leaves `max_pages` at 0.
+    fn max_read_len(&self) -> usize {
+        let pages = match self.init.max_pages as usize {
+            0 => 32,
+            n => n,
+        };
+        pages.saturating_mul(PAGE_SIZE).max(PAGE_SIZE)
     }
 
     /// `extra_len` is the size of the in-payload after this header (`len` = header + extra_len).
@@ -471,6 +466,39 @@ where
         flags: u32,
         caller: Caller,
     ) -> Result<usize, FuseError> {
+        let max = self.max_read_len();
+        let mut done = 0;
+        while done < buf.len() {
+            let n = (buf.len() - done).min(max);
+            let got = self
+                .read_one(
+                    nodeid,
+                    fh,
+                    offset + done as u64,
+                    &mut buf[done..done + n],
+                    read_flags,
+                    flags,
+                    caller,
+                )
+                .await?;
+            done += got;
+            if got < n {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
+    async fn read_one(
+        &self,
+        nodeid: u64,
+        fh: u64,
+        offset: u64,
+        buf: &mut [u8],
+        read_flags: u32,
+        flags: u32,
+        caller: Caller,
+    ) -> Result<usize, FuseError> {
         let fuse_in_header = self.in_header(
             fuse_opcode::FUSE_READ.into(),
             nodeid,
@@ -478,10 +506,6 @@ where
             None,
             caller,
         );
-
-        // TODO: make sure size is <= max_writeself.init.max_pages as u32 * linux_abi::PAGE_SIZE - otherwise, chunk the data
-        // let max_size = core::cmp::min(buf.len(), u32::MAX as usize) as u32;
-        // let size = core::cmp::min(max_size, self.init.max_pages as u32 * linux_abi::PAGE_SIZE);
 
         let fuse_in = fuse_read_in {
             fh,
@@ -514,8 +538,47 @@ where
         flags: u32,
         caller: Caller,
     ) -> Result<fuse_write_out, FuseError> {
-        let size = data.len();
+        let max = self.max_write_len();
+        let mut done = 0u32;
+        while (done as usize) < data.len() {
+            let rest = &data[done as usize..];
+            let n = rest.len().min(max);
+            let out = self
+                .write_one(
+                    nodeid,
+                    fh,
+                    offset + u64::from(done),
+                    &rest[..n],
+                    write_flags,
+                    flags,
+                    caller,
+                )
+                .await?;
+            if out.size == 0 {
+                break;
+            }
+            done = done.saturating_add(out.size);
+            if (out.size as usize) < n {
+                break;
+            }
+        }
+        Ok(fuse_write_out {
+            size: done,
+            padding: 0,
+        })
+    }
 
+    async fn write_one(
+        &self,
+        nodeid: u64,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        write_flags: u32,
+        flags: u32,
+        caller: Caller,
+    ) -> Result<fuse_write_out, FuseError> {
+        let size = data.len();
         let fuse_in_header = self.in_header(
             fuse_opcode::FUSE_WRITE.into(),
             nodeid,
@@ -524,13 +587,10 @@ where
             caller,
         );
 
-        // TODO: make sure size is <= max_write - otherwise, chunk the data
-        // let request_size = core::cmp::min(size, self.init.max_write as usize);
-
         let fuse_in = fuse_write_in {
             fh,
             offset,
-            size: core::cmp::min(size, u32::MAX as usize) as u32,
+            size: size as u32,
             write_flags,
             lock_owner: 0,
             flags,
