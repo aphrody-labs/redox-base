@@ -1,10 +1,12 @@
+use std::cell::RefCell;
 use std::io;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt;
 use log::warn;
-use redox_scheme::scheme::{SchemeAsync, SchemeState};
+use redox_scheme::scheme::{Op, SchemeAsync, SchemeState};
 use redox_scheme::{
     CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
 };
@@ -21,18 +23,22 @@ use syscall::{
 use crate::fuse::{Caller, FuseTransporter};
 use crate::vfs::Vfs;
 
+// TODO: host-level locks via FUSE.
+// Path resolution and I/O go to FUSE while fcntl locks stay in `lock_state` (local to redox).
 pub struct VirtioFsScheme<T: FuseTransporter> {
     socket: Arc<Socket>,
-    vfs: Arc<Vfs<T>>,
-    scheme_name: Arc<str>,
+    vfs: Rc<Vfs<T>>,
+    scheme_name: Rc<str>,
+    lock_state: Rc<RefCell<SchemeState>>,
 }
 
 impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
     fn clone(&self) -> Self {
         Self {
             socket: Arc::clone(&self.socket),
-            vfs: Arc::clone(&self.vfs),
-            scheme_name: Arc::clone(&self.scheme_name),
+            vfs: Rc::clone(&self.vfs),
+            scheme_name: Rc::clone(&self.scheme_name),
+            lock_state: Rc::clone(&self.lock_state),
         }
     }
 }
@@ -40,14 +46,24 @@ impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
 impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
     pub fn new(socket: Arc<Socket>, vfs: Vfs<T>) -> Self {
         Self {
-            vfs: Arc::new(vfs),
+            vfs: Rc::new(vfs),
             socket,
-            scheme_name: Arc::from("virtio-fsd"),
+            scheme_name: Rc::from("virtio-fsd"),
+            lock_state: Rc::new(RefCell::new(SchemeState::new())),
         }
     }
 
     pub async fn shutdown(&mut self) {
         self.vfs.shutdown().await
+    }
+
+    fn drop_file_locks(&self, id: usize, pid: usize) {
+        let Ok(inode) = self.vfs.get_inode(id) else {
+            return;
+        };
+        self.lock_state
+            .borrow_mut()
+            .on_detach(id, inode as usize, pid);
     }
 
     pub fn tick(&mut self) -> io::Result<()> {
@@ -72,19 +88,72 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
 
             match request.kind() {
                 RequestKind::Call(call_request) => {
-                    let mut scheme = self.clone();
-                    spawner
-                        .spawn_local(async move {
-                            let mut state = SchemeState::new();
-                            let response = call_request.handle_async(&mut scheme, &mut state).await;
+                    let caller = call_request.caller();
+                    match call_request.op() {
+                        Ok(op) if is_lock_op(&op) => {
+                            let mut scheme = self.clone();
+
+                            let lock_state = Rc::clone(&self.lock_state);
+                            let mut state = lock_state.borrow_mut();
+
+                            // Lock ops happen sequentially.
+                            let response = futures::executor::block_on(op.handle_async(
+                                caller,
+                                &mut scheme,
+                                &mut state,
+                            ));
+
+                            drop(state);
+
                             if let Err(err) = scheme
                                 .socket
                                 .write_response(response, SignalBehavior::Restart)
                             {
                                 warn!("virtio-fsd: write_response: {err}");
                             }
-                        })
-                        .expect("virtio-fsd: failed to spawn scheme call");
+                        }
+                        Ok(op) => {
+                            let mut scheme = self.clone();
+                            spawner
+                                .spawn_local(async move {
+                                    let mut dummy_state = SchemeState::new();
+                                    let response = op
+                                        .handle_async(caller, &mut scheme, &mut dummy_state)
+                                        .await;
+
+                                    if let Err(err) = scheme
+                                        .socket
+                                        .write_response(response, SignalBehavior::Restart)
+                                    {
+                                        warn!("virtio-fsd: write_response: {err}");
+                                    }
+                                })
+                                .expect("virtio-fsd: failed to spawn scheme call");
+                        }
+                        Err(req) => {
+                            let mut scheme = self.clone();
+                            spawner
+                                .spawn_local(async move {
+                                    let mut dummy_state = SchemeState::new();
+                                    let response =
+                                        req.handle_async(&mut scheme, &mut dummy_state).await;
+                                    if let Err(err) = scheme
+                                        .socket
+                                        .write_response(response, SignalBehavior::Restart)
+                                    {
+                                        warn!("virtio-fsd: write_response: {err}");
+                                    }
+                                })
+                                .expect("virtio-fsd: failed to spawn scheme call");
+                        }
+                    }
+                }
+                RequestKind::OnClose { id } => {
+                    self.drop_file_locks(id, 0);
+                    closes.push(id);
+                }
+                RequestKind::OnDetach { id, pid } => {
+                    self.drop_file_locks(id, pid);
                 }
                 RequestKind::SendFd(request) => {
                     let _ = self.socket.write_response(
@@ -99,9 +168,7 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
                     );
                 }
                 RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {}
-                RequestKind::OnClose { id } => closes.push(id),
                 RequestKind::Cancellation(_cancellation_request) => {}
-                RequestKind::OnDetach { .. } => {}
             }
         }
 
@@ -116,6 +183,10 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
 impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
     fn scheme_root(&mut self) -> Result<usize> {
         Ok(self.vfs.scheme_root())
+    }
+
+    async fn inode(&self, id: usize) -> Result<usize> {
+        self.vfs.get_inode(id).map(|ino| ino as usize)
     }
 
     async fn openat(
@@ -506,6 +577,17 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
 }
 
 // Helpers
+
+fn is_lock_op(op: &Op) -> bool {
+    let Op::StdFsCall(req) = op else {
+        return false;
+    };
+
+    matches!(
+        StdFsCallKind::try_from_raw(req.metadata()[0] as u8),
+        Some(StdFsCallKind::Lock | StdFsCallKind::Unlock | StdFsCallKind::GetLock)
+    )
+}
 
 fn caller(ctx: &CallerCtx) -> Caller {
     Caller {

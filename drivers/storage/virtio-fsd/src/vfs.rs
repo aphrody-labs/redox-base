@@ -731,19 +731,7 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub async fn statfs(&self, fd: usize, caller: Caller) -> Result<fuse_kstatfs> {
-        let nodeid = {
-            let g = self.state.borrow();
-            match g.handles.get(fd)? {
-                Handle::File { nodeid, .. }
-                | Handle::Directory { nodeid, .. }
-                | Handle::StatOnly { nodeid, .. }
-                | Handle::Symlink { nodeid, .. } => *nodeid,
-                Handle::SchemeRoot => FUSE_ROOT_ID,
-                Handle::SymlinkPreCreate { .. } => return Err(Error::new(EBADF)),
-                #[cfg(feature = "lru-debug")]
-                Handle::LruLog => FUSE_ROOT_ID,
-            }
-        };
+        let nodeid = self.get_inode(fd)?;
 
         Ok(self
             .fuse
@@ -1596,6 +1584,21 @@ impl<T: FuseTransporter> Vfs<T> {
 
     pub fn has_fd(&self, fd: usize) -> Result<()> {
         self.state.borrow().handles.get(fd).map(|_| ())
+    }
+
+    pub fn get_inode(&self, fd: usize) -> Result<u64> {
+        let g = self.state.borrow();
+        let nodeid = match g.handles.get(fd)? {
+            Handle::File { nodeid, .. }
+            | Handle::Directory { nodeid, .. }
+            | Handle::StatOnly { nodeid, .. }
+            | Handle::Symlink { nodeid, .. } => *nodeid,
+            Handle::SchemeRoot => FUSE_ROOT_ID,
+            Handle::SymlinkPreCreate { .. } => return Err(Error::new(EBADF)),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => return Err(Error::new(EBADF)),
+        };
+        Ok(nodeid)
     }
 
     pub fn get_path(&self, fd: usize) -> Result<String> {
