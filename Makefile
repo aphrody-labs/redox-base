@@ -12,6 +12,7 @@ SYSROOT ?= $(shell pwd)/target/$(TARGET)/sysroot
 TARGET_DIR = $(BUILD_DIR)/$(TARGET)/$(BUILD_TYPE)
 BUILD_FLAGS +=  --target-dir $(BUILD_DIR)
 FEATURES ?=
+export FEATURES
 FEATURE_FLAGS = $(if $(FEATURES),--features $(FEATURES),)
 
 INITFS_BINS = ipcd init logd ramfs randd udsd zerod \
@@ -21,6 +22,8 @@ INITFS_DRIVERS_BINS = nvmed virtio-blkd virtio-gpud
 BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
 DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8139d rtl8168d \
 	usbctl usbhidd usbhubd usbscsid virtio-netd xhcid virtio-fsd
+SELFTEST_DIRS := $(patsubst selftests/%/Cargo.toml,%,$(wildcard selftests/*/Cargo.toml))
+TEST_BINS := $(addsuffix -selftest,$(SELFTEST_DIRS))
 
 ifneq (,$(filter i586-unknown-redox i686-unknown-redox x86_64-unknown-redox,$(TARGET)))
     INITFS_BINS += ps2d
@@ -39,8 +42,9 @@ INITFS_CARGO_ARGS = $(foreach bin,$(INITFS_BINS),-p $(bin))
 INITFS_DRIVERS_CARGO_ARGS = $(foreach bin,$(INITFS_DRIVERS_BINS),-p $(bin))
 BASE_CARGO_ARGS = $(foreach bin,$(BASE_BINS),-p $(bin))
 DRIVERS_CARGO_ARGS = $(foreach bin,$(DRIVERS_BINS),-p $(bin))
+TEST_CARGO_ARGS = $(foreach bin,$(TEST_BINS),-p $(bin))
 
-.PHONY: all base install install-base test test-gui test-ipcd
+.PHONY: all base install install-base test test-gui test-ipcd test-selftests test-virtio-fs
 
 all: base
 install: install-base
@@ -52,6 +56,27 @@ clean:
 test: all
 	$(MAKE) install
 	REDOXER_SYSROOT=$(DESTDIR) redoxer exec true
+
+test-selftests: FEATURES += lru-debug
+test-selftests: all
+	$(MAKE) install
+	@for bin in $(TEST_BINS); do \
+		cp -v "$(TARGET_DIR)/$$bin" "$(DESTDIR)/usr/bin"; \
+	done
+	@for d in $(SELFTEST_DIRS); do \
+		run="$(SRC_DIR)/selftests/$$d/scripts/redoxer-run.sh"; \
+		if [ -x "$$run" ]; then \
+			REDOXER_SYSROOT=$(DESTDIR) "$$run"; \
+		else \
+			env -u REDOXER_SYSROOT redoxer exec --folder "$(DESTDIR)/:/" $$d-selftest; \
+		fi; \
+	done
+
+test-virtio-fs: FEATURES += lru-debug
+test-virtio-fs: all
+	$(MAKE) install
+	cp -v "$(TARGET_DIR)/virtio-fsd-selftest" "$(DESTDIR)/usr/bin"
+	REDOXER_SYSROOT=$(DESTDIR) $(SRC_DIR)/selftests/virtio-fsd/scripts/redoxer-run.sh
 
 # test with interactive gui
 test-gui: all
@@ -81,7 +106,7 @@ base:
 	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
 		$(CARGO) build $(BUILD_FLAGS) $(FEATURE_FLAGS) \
 		--manifest-path "$(SRC_DIR)/Cargo.toml" \
-		$(BASE_CARGO_ARGS) $(DRIVERS_CARGO_ARGS)
+		$(BASE_CARGO_ARGS) $(DRIVERS_CARGO_ARGS) $(TEST_CARGO_ARGS)
 # Build initfs daemons and drivers
 # FIXME fix whatever issue (feature unification?) causes most logs to be omitted
 # if this is merged with the above build command.

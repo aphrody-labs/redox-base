@@ -71,6 +71,8 @@ members = [
     "drivers/usb/xhcid",
     "drivers/usb/usbctl",
     "drivers/usb/usbhubd",
+
+    "selftests/virtio-fsd",
 ]
 
 # Bootstrap needs it's own profile configuration

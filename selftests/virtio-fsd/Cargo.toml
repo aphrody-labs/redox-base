@@ -1,0 +1,18 @@
+[package]
+name = "virtio-fsd-selftest"
+version = "0.1.0"
+edition = "2024"
+authors = ["MJ Pooladkhay <mj@pooladkhay.com>"]
+
+# Pinned instead of `workspace = true` to allow Cookbook to copy this 
+# crate out and build it on its own, where there is no workspace root.
+[dependencies]
+libredox = { version = "0.1.21", features = ["call", "std"] }
+libc = "0.2.181"
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = []
+# Runs edge_forget_lru_pressure. Pair with virtio-fsd's lru-debug so
+# /scheme/virtio-fsd/.lru_evicted exists and eviction order is checked.
+lru-debug = []

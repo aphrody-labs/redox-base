@@ -17,6 +17,7 @@ You can see what each component does in the following list:
 - ramfs : RAM filesystem
 - randd : Daemon used for random number generation
 - zerod : Daemon used to discard all writes and fill read buffers with zero
+- selftests : Driver selftests
 
 ## How To Contribute
 
@@ -35,9 +36,12 @@ To learn how to do development with these system components inside the Redox bui
 It is recommended to build this system component via the Redox build system, you can learn how to do it on the [Building Redox](https://doc.redox-os.org/book/podman-build.html) page.
 
 To build and test outside the build system, [install redoxer](https://doc.redox-os.org/book/ci.html) then use `check.sh` script to build or test:
+
 - `./check.sh` - Check build for x86_64
 - `./check.sh --arch=ARCH` - Check build for specific ARCH (`aarch64`, `i586`, `riscv64gc`)
 - `./check.sh --all` - Check build for all ARCH
 - `./check.sh --test` - Check the base system boots up on x86_64
+- `make test-selftests` - Run all driver selftests under `selftests/`
+- `make test-virtio-fs` - Run the virtio-fsd selftest
 
 You can also use `make install` to inspect the content on `./sysroot`, or `make test-gui` to test booting with orbital interactively.
