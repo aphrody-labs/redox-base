@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fuse_abi::linux::{
     FUSE_ATOMIC_O_TRUNC, FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION,
     FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out,
-    fuse_create_in, fuse_entry_out, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header,
-    fuse_init_in, fuse_init_out, fuse_link_in, fuse_mkdir_in, fuse_opcode, fuse_open_in,
-    fuse_open_out, fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in, fuse_setattr_in,
-    fuse_statfs_out, fuse_write_in, fuse_write_out,
+    fuse_create_in, fuse_entry_out, fuse_flush_in, fuse_forget_in, fuse_fsync_in, fuse_getattr_in,
+    fuse_in_header, fuse_init_in, fuse_init_out, fuse_link_in, fuse_mkdir_in, fuse_opcode,
+    fuse_open_in, fuse_open_out, fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in,
+    fuse_setattr_in, fuse_statfs_out, fuse_write_in, fuse_write_out,
 };
 use log::{info, warn};
 use syscall::PAGE_SIZE;
@@ -135,7 +135,7 @@ pub trait FuseTransporter {
 }
 
 /// Identity for `fuse_in_header`.
-/// `NONE` (zeros) when the scheme call has no `CallerCtx` (INIT, OnClose, getdents, unmount).
+/// `NONE` (zeros) when the scheme call has no `CallerCtx` (INIT, OnClose, unmount).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Caller {
     pub uid: u32,
@@ -214,15 +214,15 @@ where
         let use_local_parent_resolution =
             session.capable(FUSE_NO_EXPORT_SUPPORT) || !session.capable(FUSE_EXPORT_SUPPORT);
 
-        // currently we use parent_map for both scenarios, as
-        // virtiofsd does not support `FUSE_NO_EXPORT_SUPPORT` flag
+        // `walk_path` always resolves `..` locally via `parent_of`, regardless
+        // of export support. The host flag is logged for diagnosis only.
         if use_local_parent_resolution {
             info!(
-                "virtio-fsd: Host disabled export support (or is old). lookup('..') will be resolved locally."
+                "virtio-fsd: Host disabled export support (or is old). lookup('..') is resolved locally."
             );
         } else {
             info!(
-                "virtio-fsd: Host enabled full export support. lookup('..') can be forwarded to host."
+                "virtio-fsd: Host enabled full export support; lookup('..') is still resolved locally."
             );
         }
 
@@ -456,6 +456,9 @@ where
             .into_struct()
     }
 
+    /// Chunked at `max_read`. `Vfs` holds a shared per-inode lock for the whole
+    /// call, so these chunks stay ordered for this read. Other reads of the
+    /// same inode may interleave but a write cannot.
     pub async fn read(
         &self,
         nodeid: u64,
@@ -528,6 +531,8 @@ where
             .into_size()
     }
 
+    /// Chunked at `max_write`. `Vfs` holds an exclusive per-inode lock for the
+    /// whole call, so these chunks cannot interleave with other I/O on this inode.
     pub async fn write(
         &self,
         nodeid: u64,
@@ -673,6 +678,33 @@ where
             fh,
             fsync_flags: 0,
             padding: 0,
+        };
+
+        let request = FuseRequest {
+            fuse_in_header,
+            fuse_in: Some(fuse_in),
+        };
+
+        self.transporter
+            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .await?
+            .into_unit()
+    }
+
+    pub async fn flush(&self, nodeid: u64, fh: u64, caller: Caller) -> Result<(), FuseError> {
+        let fuse_in_header = self.in_header(
+            fuse_opcode::FUSE_FLUSH.into(),
+            nodeid,
+            mem::size_of::<fuse_flush_in>(),
+            None,
+            caller,
+        );
+
+        let fuse_in = fuse_flush_in {
+            fh,
+            unused: 0,
+            padding: 0,
+            lock_owner: 0,
         };
 
         let request = FuseRequest {
@@ -976,5 +1008,21 @@ where
             .send(request, AllocStrategy::Send { data: name })
             .await?
             .into_struct()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(transporter: T) -> Self {
+        Self {
+            transporter,
+            init: fuse_init_out {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                flags: FUSE_ATOMIC_O_TRUNC,
+                max_write: PAGE_SIZE as u32,
+                max_pages: 1,
+                ..fuse_init_out::default()
+            },
+            next_unique: AtomicU64::new(1),
+        }
     }
 }

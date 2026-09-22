@@ -44,7 +44,7 @@ BASE_CARGO_ARGS = $(foreach bin,$(BASE_BINS),-p $(bin))
 DRIVERS_CARGO_ARGS = $(foreach bin,$(DRIVERS_BINS),-p $(bin))
 TEST_CARGO_ARGS = $(foreach bin,$(TEST_BINS),-p $(bin))
 
-.PHONY: all base install install-base test test-gui test-ipcd test-selftests test-virtio-fs
+.PHONY: all base install install-base test test-gui test-ipcd selftests test-selftests test-virtio-fs
 
 all: base
 install: install-base
@@ -60,6 +60,7 @@ test: all
 test-selftests: FEATURES += lru-debug
 test-selftests: all
 	$(MAKE) install
+	$(MAKE) selftests
 	@for bin in $(TEST_BINS); do \
 		cp -v "$(TARGET_DIR)/$$bin" "$(DESTDIR)/usr/bin"; \
 	done
@@ -75,6 +76,7 @@ test-selftests: all
 test-virtio-fs: FEATURES += lru-debug
 test-virtio-fs: all
 	$(MAKE) install
+	$(MAKE) selftests
 	cp -v "$(TARGET_DIR)/virtio-fsd-selftest" "$(DESTDIR)/usr/bin"
 	REDOXER_SYSROOT=$(DESTDIR) $(SRC_DIR)/selftests/virtio-fsd/scripts/redoxer-run.sh
 
@@ -106,7 +108,7 @@ base:
 	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
 		$(CARGO) build $(BUILD_FLAGS) $(FEATURE_FLAGS) \
 		--manifest-path "$(SRC_DIR)/Cargo.toml" \
-		$(BASE_CARGO_ARGS) $(DRIVERS_CARGO_ARGS) $(TEST_CARGO_ARGS)
+		$(BASE_CARGO_ARGS) $(DRIVERS_CARGO_ARGS)
 # Build initfs daemons and drivers
 # FIXME fix whatever issue (feature unification?) causes most logs to be omitted
 # if this is merged with the above build command.
@@ -117,6 +119,15 @@ base:
 # Build bootstrap
 	cd "$(SRC_DIR)/bootstrap" && RUSTFLAGS= $(CARGO) rustc $(BUILD_FLAGS) \
 		-- -Ctarget-feature=+crt-static -Clinker="$(LINKER)"
+
+# Not part of the image. CI runs these under redoxer. the virtio-fsd-selftest
+# package is the opt-in build for a live system.
+selftests:
+	@mkdir -pv "$(BUILD_DIR)"
+	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
+		$(CARGO) build $(BUILD_FLAGS) $(FEATURE_FLAGS) \
+		--manifest-path "$(SRC_DIR)/Cargo.toml" \
+		$(TEST_CARGO_ARGS)
 
 install-base: base $(SYSROOT)/bin/redoxfs
 	@mkdir -pv "$(DESTDIR)/usr/bin" "$(DESTDIR)/usr/lib/drivers"

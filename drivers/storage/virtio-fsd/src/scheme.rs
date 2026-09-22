@@ -522,7 +522,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         mut buf: DirentBuf<&'buf mut [u8]>,
         opaque_offset: u64,
     ) -> Result<DirentBuf<&'buf mut [u8]>> {
-        let payload = self.vfs.readdir(id, opaque_offset, Caller::NONE).await?;
+        let payload = self.vfs.readdir(id, opaque_offset).await?;
 
         for dir in payload.iter() {
             let name = match str::from_utf8(dir.name) {
