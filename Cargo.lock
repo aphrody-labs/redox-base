@@ -2917,7 +2917,6 @@ dependencies = [
  "async-lock",
  "bitflags 2.13.1",
  "common",
- "crossbeam-queue",
  "daemon",
  "fuse-abi",
  "futures",

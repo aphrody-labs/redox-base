@@ -8,7 +8,6 @@ authors = ["MJ Pooladkhay <mj@pooladkhay.com>"]
 async-lock = "3.4"
 bitflags = "2.11"
 thiserror = "2.0"
-crossbeam-queue = "0.3"
 zerocopy = { version = "0.8", features = ["derive"] }
 futures = { version = "0.3.28", features = ["executor"] }
 fuse-abi = { version = "0.2.0", features = ["linux", "zerocopy", "num_enum"] }

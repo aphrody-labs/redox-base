@@ -1,15 +1,12 @@
-use core::slice;
-use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::dma::Dma;
 use log::{info, warn};
-use syscall::PAGE_SIZE;
-use virtio_core::Device;
 use virtio_core::spec::{Buffer, ChainBuilder, DescriptorFlags};
 use virtio_core::transport::Queue;
+use virtio_core::{Device, DmaPool};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fuse::{
@@ -22,119 +19,11 @@ pub const VIRTIO_FS_F_NOTIFICATION: u32 = 0;
 
 const DMA_POOL_CAP: usize = 128;
 
-#[repr(C, packed)]
+#[repr(C)]
 struct VirtioFsDeviceConfig {
     tag: [u8; VIRTIO_FS_TAG_SIZE],
     num_request_queues: u32,
     notify_buf_size: u32,
-}
-
-struct DmaPool {
-    pool: Dma<[u8]>,
-    free_indexes: crossbeam_queue::ArrayQueue<usize>,
-}
-
-struct DmaGuardMut<'dma> {
-    index: usize,
-    phys: usize,
-    virt: &'dma mut [u8],
-    dma_pool: &'dma DmaPool,
-}
-impl<'dma> DmaGuardMut<'dma> {
-    /// Copies a struct into the DMA memory, advances the offset, and returns a Virtio Buffer.
-    pub fn append_tx<T: IntoBytes + Immutable>(&mut self, offset: &mut usize, data: &T) -> Buffer {
-        let bytes = data.as_bytes();
-        let len = bytes.len();
-        self.virt[*offset..(*offset + len)].copy_from_slice(bytes);
-
-        // SAFETY
-        // - `self.phys` was handed to us by `Dma::zeroed_slice`.
-        let buf = unsafe { Buffer::from_raw_parts(self.phys + *offset, len) };
-
-        *offset += len;
-
-        buf
-    }
-
-    /// Reserves space for the device to write into, advances the offset, and returns a Write-Only Buffer.
-    pub fn reserve_rx<T: Sized>(&mut self, offset: &mut usize) -> Buffer {
-        let len = core::mem::size_of::<T>();
-
-        // SAFETY
-        // - `self.phys` was handed to us by `Dma::zeroed_slice`.
-        let buf = unsafe { Buffer::from_raw_parts(self.phys + *offset, len) }
-            .flags(DescriptorFlags::WRITE_ONLY);
-
-        *offset += len;
-
-        buf
-    }
-}
-impl<'dma> Deref for DmaGuardMut<'dma> {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.virt
-    }
-}
-impl<'dma> DerefMut for DmaGuardMut<'dma> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.virt
-    }
-}
-impl<'dma> Drop for DmaGuardMut<'dma> {
-    fn drop(&mut self) {
-        self.dma_pool.put_memory(self.index);
-    }
-}
-
-impl DmaPool {
-    fn new() -> Self {
-        let dma = Dma::zeroed_slice(DMA_POOL_CAP * PAGE_SIZE)
-            .expect("virtio-fsd: DMA allocation failed.");
-
-        // SAFETY:
-        // - Any value can be considered a valid u8.
-        let pool = unsafe { dma.assume_init() };
-
-        let free_indexes = crossbeam_queue::ArrayQueue::new(DMA_POOL_CAP);
-
-        for i in 0..DMA_POOL_CAP {
-            free_indexes
-                .push(i)
-                .expect("virtio-fsd: free_indexes is full.");
-        }
-
-        Self { pool, free_indexes }
-    }
-    fn get_memory_mut<'dma>(&'dma self) -> Option<DmaGuardMut<'dma>> {
-        let i = self.free_indexes.pop()?;
-        let offset = i * PAGE_SIZE;
-
-        let virt = {
-            let base_ptr = self.pool.as_ptr() as *mut u8;
-            // SAFETY
-            // - It is guaranteed that the offset is always within the bounds of the original allocation,
-            //   because we control pushes and pops from the queue.
-            // - `free_indexes` is a MPMC queue, hence when given an index, we are the only owner of it.
-            // - (As a result) the given memory range will only have one owner.
-            unsafe {
-                let slot_ptr = base_ptr.add(offset);
-                slice::from_raw_parts_mut(slot_ptr, PAGE_SIZE)
-            }
-        };
-        Some(DmaGuardMut {
-            index: i,
-            phys: self.pool.physical() + offset,
-            virt,
-            dma_pool: self,
-        })
-    }
-    fn put_memory(&self, index: usize) {
-        self.free_indexes
-            .push(index)
-            .expect("virtio-fsd: free_indexes queue was full which is not expected.")
-    }
 }
 
 pub struct VirtioFsSession {
@@ -146,7 +35,7 @@ pub struct VirtioFsSession {
     notif_buf_size: Option<u32>,
     request_queues: Vec<Arc<Queue>>,
     next_queue: AtomicUsize,
-    dma_pool: DmaPool,
+    dma_pool: Arc<DmaPool>,
 }
 
 impl<'a> VirtioFsSession {
@@ -171,41 +60,24 @@ impl<'a> VirtioFsSession {
         device.transport.finalize_features();
 
         let config = device.device_space as *const VirtioFsDeviceConfig;
-
-        // SAFETY:
-        // - We use addr_of! to avoid creating a reference to a packed field.
-        // - Tag has alignment of 1, so it's always safe to read it as a byte array.
-        let tag_raw = unsafe { ptr::read_volatile(ptr::addr_of!((*config).tag)) };
-
-        // SAFETY:
-        // - We use addr_of! to avoid creating a reference to a packed field, that can potentially be unaligned.
-        let nrq_ptr = unsafe { ptr::addr_of!((*config).num_request_queues) };
-        assert_eq!(
-            nrq_ptr as usize % core::mem::align_of::<u32>(),
-            0,
-            "virtio-fsd: num_request_queues is not properly aligned."
+        assert!(
+            config.is_aligned(),
+            "virtio-fsd: device configuration is not properly aligned."
         );
 
         // SAFETY:
-        // - nrq_ptr has alignment of 4, so it's safe to read it.
-        let nrq = u32::from_le(unsafe { ptr::read_volatile(nrq_ptr) });
-
-        let nbs = if notif_supported {
-            // SAFETY:
-            // - We use addr_of! to avoid creating a reference to a packed field, that can potentially be unaligned.
-            let nbs_ptr = unsafe { ptr::addr_of!((*config).notify_buf_size) };
-            assert_eq!(
-                nbs_ptr as usize % core::mem::align_of::<u32>(),
-                0,
-                "virtio-fsd: notify_buf_size is not properly aligned."
-            );
-
-            // SAFETY:
-            // - nbs_ptr has alignment of 4, so it's safe to read it.
-            Some(u32::from_le(unsafe { ptr::read_volatile(nbs_ptr) }))
-        } else {
-            None
-        };
+        // - `config` is aligned for `VirtioFsDeviceConfig`, so each field is aligned.
+        // - `&raw const` does not create a reference to device memory.
+        // - The device configuration is valid to read for the duration of these loads.
+        // - The tag is read one byte at a time, as the specification requires 8-bit wide
+        //   accesses for 8-bit wide fields.
+        let tag_ptr = unsafe { &raw const (*config).tag }.cast::<u8>();
+        let tag_raw = core::array::from_fn(|i| unsafe { ptr::read_volatile(tag_ptr.add(i)) });
+        let nrq =
+            u32::from_le(unsafe { ptr::read_volatile(&raw const (*config).num_request_queues) });
+        let nbs = notif_supported.then(|| {
+            u32::from_le(unsafe { ptr::read_volatile(&raw const (*config).notify_buf_size) })
+        });
 
         // Virtqueues - https://docs.oasis-open.org/virtio/virtio/v1.2/csd01/virtio-v1.2-csd01.html#x1-4600002
         // 0 - hiprio
@@ -231,6 +103,15 @@ impl<'a> VirtioFsSession {
             nrq >= 1,
             "virtio-fsd: at least one request queue is needed."
         );
+
+        // hiprio queue, the notification queue if any, and the request queues.
+        let queues_needed = 1 + u64::from(notif_supported) + u64::from(nrq);
+        assert!(
+            queues_needed <= u64::from(device.transport.num_queues()),
+            "virtio-fsd: device reports {nrq} request queues but only supports {} queues.",
+            device.transport.num_queues()
+        );
+
         let request_queues: Vec<_> = (0..nrq)
             .map(|_| {
                 device
@@ -238,6 +119,9 @@ impl<'a> VirtioFsSession {
                     .expect("virtio-fsd: failed to setup request queue.")
             })
             .collect();
+
+        // running this before `run_device`, so an allocation failure happens before the device goes live.
+        let dma_pool = DmaPool::new(DMA_POOL_CAP).expect("virtio-fsd: DMA allocation failed.");
 
         device.transport.run_device();
 
@@ -248,7 +132,7 @@ impl<'a> VirtioFsSession {
             notif_queue,
             request_queues,
             next_queue: AtomicUsize::new(0),
-            dma_pool: DmaPool::new(),
+            dma_pool,
         }
     }
 
@@ -294,31 +178,24 @@ impl FuseTransporter for VirtioFsSession {
 
         // write fuse_in_header and fuse_*_in into a DMA memory
 
-        let mut tx_guard = self
-            .dma_pool
-            .get_memory_mut()
-            .ok_or(TransportError::OutOfMemory)?;
+        let mut tx_guard = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
         let mut tx_offset = 0;
 
-        builder = builder.chain(tx_guard.append_tx(&mut tx_offset, &request.fuse_in_header));
+        builder = builder.chain(tx_guard.append(&mut tx_offset, request.fuse_in_header.as_bytes()));
         if let Some(ref fuse_in) = request.fuse_in {
-            builder = builder.chain(tx_guard.append_tx(&mut tx_offset, fuse_in));
+            builder = builder.chain(tx_guard.append(&mut tx_offset, fuse_in.as_bytes()));
         }
 
         // write fuse_out_header into a DMA memory
 
-        let mut rx_guard = self
-            .dma_pool
-            .get_memory_mut()
-            .ok_or(TransportError::OutOfMemory)?;
+        let mut rx_guard = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
         let mut rx_offset = 0;
 
-        builder = builder.chain(rx_guard.reserve_rx::<fuse_out_header>(&mut rx_offset));
+        builder = builder.chain(rx_guard.reserve(&mut rx_offset, size_of::<fuse_out_header>()));
 
         // decide how to send the data based on AllocStrategy
 
-        // keep the DMA memory alive until virtio finishes
-        let mut _tx_bounce = None;
+        // read back once virtio finishes
         let mut rx_bounce = None;
 
         let mut out_payload_offset = 0;
@@ -326,7 +203,7 @@ impl FuseTransporter for VirtioFsSession {
         match strategy {
             AllocStrategy::DmaPool => {
                 out_payload_offset = rx_offset;
-                builder = builder.chain(rx_guard.reserve_rx::<O>(&mut rx_offset));
+                builder = builder.chain(rx_guard.reserve(&mut rx_offset, size_of::<O>()));
             }
             AllocStrategy::DmaPoolHeaderOnly => {}
             AllocStrategy::Send { data } => {
@@ -339,30 +216,25 @@ impl FuseTransporter for VirtioFsSession {
                 let mut dma = unsafe { dma_uninit.assume_init() };
 
                 dma.copy_from_slice(&data[..size]);
-                builder = builder.chain(Buffer::new_unsized(&dma));
-                _tx_bounce = Some(dma);
+                builder = builder.chain(Buffer::new_unsized(&Arc::new(dma)));
 
                 // 'AllocStrategy::Send' is only used for writes
                 // which return a small `fuse_write_out` struct.
                 out_payload_offset = rx_offset;
-                builder = builder.chain(rx_guard.reserve_rx::<O>(&mut rx_offset));
+                builder = builder.chain(rx_guard.reserve(&mut rx_offset, size_of::<O>()));
             }
             AllocStrategy::Recv { ref buf } => {
                 let dma_uninit =
                     Dma::zeroed_slice(buf.len()).map_err(|_| TransportError::OutOfMemory)?;
                 // SAFETY:
                 // - We only read from this region after host has indicated a successful write
-                let dma = unsafe { dma_uninit.assume_init() };
+                let dma = Arc::new(unsafe { dma_uninit.assume_init() });
 
                 builder =
                     builder.chain(Buffer::new_unsized(&dma).flags(DescriptorFlags::WRITE_ONLY));
                 rx_bounce = Some(dma);
             }
         }
-
-        // these must not exceed PAGE_SIZE because dma_pool only gives out PAGE_SIZEd chunks.
-        assert!(tx_offset <= PAGE_SIZE, "virtio-fsd: TX Pool Overflow");
-        assert!(rx_offset <= PAGE_SIZE, "virtio-fsd: RX Pool Overflow");
 
         // send and wait
 
@@ -424,18 +296,13 @@ impl FuseTransporter for VirtioFsSession {
     {
         let mut builder = ChainBuilder::new();
 
-        let mut tx_guard = self
-            .dma_pool
-            .get_memory_mut()
-            .ok_or(TransportError::OutOfMemory)?;
+        let mut tx_guard = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
         let mut tx_offset = 0;
 
-        builder = builder.chain(tx_guard.append_tx(&mut tx_offset, &request.fuse_in_header));
+        builder = builder.chain(tx_guard.append(&mut tx_offset, request.fuse_in_header.as_bytes()));
         if let Some(ref fuse_in) = request.fuse_in {
-            builder = builder.chain(tx_guard.append_tx(&mut tx_offset, fuse_in));
+            builder = builder.chain(tx_guard.append(&mut tx_offset, fuse_in.as_bytes()));
         }
-
-        assert!(tx_offset <= PAGE_SIZE, "virtio-fsd: TX Pool Overflow");
 
         let chain = builder.build();
 
