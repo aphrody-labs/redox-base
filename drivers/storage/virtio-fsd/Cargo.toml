@@ -18,6 +18,7 @@ pcid = { path = "../../pcid" }
 common = { path = "../../common" }
 scheme-utils = { path = "../../../scheme-utils" }
 
+redox-path = "0.4.1"
 log.workspace = true
 libredox.workspace = true
 redox-scheme = { workspace = true, features = ["std"] }
@@ -26,6 +27,6 @@ redox_syscall.workspace = true
 
 [features]
 default = []
-# adds '/scheme/virtio-fsd/.lru_evicted' path that
+# adds '/scheme/virtio-fsd.<tag>/.lru_evicted' path that
 # logs LRU evictions for testing purposes
 lru-debug = []

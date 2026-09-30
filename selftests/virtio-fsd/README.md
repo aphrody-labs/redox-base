@@ -1,6 +1,8 @@
 # virtio-fsd-selftest
 
-Guest tests for `/scheme/virtio-fsd`.
+Guest tests for `/scheme/virtio-fsd.<tag>`.
+
+The driver serves each virtio-fs share (PCI function) at `/scheme/virtio-fsd.<share_tag>`, where `<share_tag>` is the share's tag as given to the hypervisor (e.g. QEMU's `tag=` option). The first argument is that tag. Tests then run against `/scheme/virtio-fsd.<share_tag>`. With no tag, the program prints help and exits. `scripts/redoxer-run.sh` passes `virtiofs`, matching its `tag=` device option.
 
 | Group | Covers |
 | --- | --- |
@@ -67,10 +69,11 @@ fixtures
 
 ```text
 virtio-fsd-selftest
-virtio-fsd-selftest --list
-virtio-fsd-selftest --skip-perf
-virtio-fsd-selftest --perf-only --filter perf_concurrency_gain --threads 8 iterations 128
-virtio-fsd-selftest --filter io_golden
+virtio-fsd-selftest virtiofs
+virtio-fsd-selftest virtiofs --list
+virtio-fsd-selftest virtiofs --skip-perf
+virtio-fsd-selftest virtiofs --perf-only --filter perf_concurrency_gain --threads 8 iterations 128
+virtio-fsd-selftest virtiofs --filter io_golden
 ```
 
 ### Exit
@@ -86,6 +89,6 @@ make test-virtio-fs
 ```
 
 Starts host virtiofsd, generates fixtures, overlays the installed sysroot, and
-runs `virtio-fsd-selftest --skip-perf`. Overriding flags is possible with e.g. `SELFTEST_ARGS='--filter io_golden'`.
+runs `virtio-fsd-selftest virtiofs --skip-perf`. Overriding flags is possible with e.g. `SELFTEST_ARGS='--filter io_golden'`. The share tag stays `virtiofs`.
 
 It tries using `virtiofsd` from `VIRTIOFSD`, `PATH`, or `/usr/libexec`. Otherwise downloads the static x86_64 build from [virtio-fs/virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) (CI artifact on `main`) into `~/.cache/virtiofsd-redoxer`. `VIRTIOFSD_REFRESH=1` re-fetches.

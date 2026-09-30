@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use event::EventQueue;
-use log::warn;
+use log::{info, warn};
 use pcid_interface::PciFunctionHandle;
+use redox_path::RedoxScheme;
 use redox_scheme::Socket;
 use redox_scheme::scheme::register_async_scheme;
 
@@ -23,10 +24,13 @@ fn main() {
 }
 
 fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
+    let pci_config = pcid_handle.config();
+
+    // The share tag is not known yet, so we use the PCI function name for the log file.
     common::setup_logging(
         "storage",
         "pci",
-        "virtio-fsd",
+        &format!("virtio-fsd.{}", pci_config.func.name()),
         common::output_level(),
         common::file_level(),
     );
@@ -35,7 +39,6 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     // Double check that we have the right device.
     // virtio-fs: 0x105A
-    let pci_config = pcid_handle.config();
     assert_eq!(
         pci_config.func.full_device_id.device_id, 0x105A,
         "virtio-fsd: wrong device ID for virtio-fs"
@@ -48,6 +51,14 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
 
     let virtio_fs_session = VirtioFsSession::new(&device);
 
+    // Each share (PCI function) gets its own scheme, named after its tag.
+    let tag = virtio_fs_session.tag();
+    assert!(
+        RedoxScheme::new(tag).is_some(),
+        "virtio-fsd: tag {tag:?} is not usable as a scheme name (ASCII only, no NUL, '/' or ':')."
+    );
+    let scheme_name = format!("virtio-fsd.{tag}");
+
     // FUSE
 
     let fuse_session = match futures::executor::block_on(FuseSession::new(virtio_fs_session)) {
@@ -57,12 +68,13 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         }
     };
 
-    scheme_start(daemon, fuse_session);
+    scheme_start(daemon, fuse_session, &scheme_name);
 }
 
 fn scheme_start<T: FuseTransporter + 'static>(
     daemon: daemon::Daemon,
     fuse_session: FuseSession<T>,
+    scheme_name: &str,
 ) -> ! {
     // Socket must be non-blocking since `scheme.tick()` drains
     // until EAGAIN, then it runs the batch.
@@ -84,10 +96,12 @@ fn scheme_start<T: FuseTransporter + 'static>(
         .expect("virtio-fsd: failed to subscribe to the event queue.");
 
     let vfs = Vfs::new(fuse_session);
-    let mut scheme = VirtioFsScheme::new(Arc::clone(&scheme_file), vfs);
+    let mut scheme = VirtioFsScheme::new(Arc::clone(&scheme_file), vfs, scheme_name);
 
-    register_async_scheme(scheme_file.as_ref(), "virtio-fsd", &mut scheme)
-        .expect("virtio-fsd: can't register virtio-fsd scheme");
+    register_async_scheme(scheme_file.as_ref(), scheme_name, &mut scheme)
+        .unwrap_or_else(|err| panic!("virtio-fsd: can't register scheme {scheme_name}: {err}"));
+
+    info!("virtio-fsd: Share is available at '/scheme/{scheme_name}'.");
 
     daemon.ready();
 

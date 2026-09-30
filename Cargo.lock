@@ -2923,6 +2923,7 @@ dependencies = [
  "libredox",
  "log",
  "pcid",
+ "redox-path",
  "redox-scheme",
  "redox_event",
  "redox_syscall 0.9.5",

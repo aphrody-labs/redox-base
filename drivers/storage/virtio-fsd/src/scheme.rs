@@ -44,11 +44,11 @@ impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
 }
 
 impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
-    pub fn new(socket: Arc<Socket>, vfs: Vfs<T>) -> Self {
+    pub fn new(socket: Arc<Socket>, vfs: Vfs<T>, scheme_name: &str) -> Self {
         Self {
             vfs: Rc::new(vfs),
             socket,
-            scheme_name: Rc::from("virtio-fsd"),
+            scheme_name: Rc::from(scheme_name),
             lock_state: Rc::new(RefCell::new(SchemeState::new())),
         }
     }

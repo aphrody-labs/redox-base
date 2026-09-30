@@ -226,7 +226,7 @@ where
             );
         }
 
-        info!("virtio-fsd: Share is available at '/scheme/virtio-fsd'.");
+        info!("virtio-fsd: FUSE session is initialized.");
         Ok(session)
     }
 

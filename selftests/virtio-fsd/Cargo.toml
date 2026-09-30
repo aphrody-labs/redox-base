@@ -14,5 +14,5 @@ clap = { version = "4", features = ["derive"] }
 [features]
 default = []
 # Runs edge_forget_lru_pressure. Pair with virtio-fsd's lru-debug so
-# /scheme/virtio-fsd/.lru_evicted exists and eviction order is checked.
+# /scheme/virtio-fsd.<tag>/.lru_evicted exists and eviction order is checked.
 lru-debug = []

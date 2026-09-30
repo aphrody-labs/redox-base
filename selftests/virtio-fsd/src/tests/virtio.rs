@@ -23,7 +23,7 @@ const FORGET_PRESSURE_FILES: usize = 64 * 1024 + 256;
 
 #[cfg(feature = "lru-debug")]
 fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
-    match fsutil::clear_lru_eviction_log() {
+    match fsutil::clear_lru_eviction_log(&ctx.cfg.root) {
         Ok(()) => {}
         Err(err) if fsutil::is_errno(&err, fsutil::ENOENT) => {
             return Outcome::PassNote(
@@ -47,9 +47,7 @@ fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
         b"x"
     );
 
-    let log = check_ok!(fsutil::read_to_vec(std::path::Path::new(
-        "/scheme/virtio-fsd/.lru_evicted"
-    )));
+    let log = check_ok!(fsutil::read_to_vec(&ctx.cfg.root.join(".lru_evicted")));
     let log = check_ok!(std::str::from_utf8(&log));
     let run_token = format!("{}.{}.fg_", crate::config::WORK_PREFIX, ctx.cfg.run_id);
     let ours: Vec<usize> = log

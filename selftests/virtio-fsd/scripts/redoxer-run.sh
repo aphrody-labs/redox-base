@@ -6,6 +6,9 @@
 
 set -euo pipefail
 
+# Must match the share_tag passed to virtio-fsd-selftest below.
+SHARE_TAG=virtiofs
+
 VIRTIOFSD_URL="${VIRTIOFSD_URL:-https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/raw/target/x86_64-unknown-linux-musl/release/virtiofsd?job=publish}"
 
 find_virtiofsd() {
@@ -149,7 +152,7 @@ cmd=(
   -machine q35
   "\${filtered[@]}"
   -chardev socket,id=char0,path=${SOCK}
-  -device vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=virtiofs
+  -device vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=${SHARE_TAG}
 )
 {
   printf 'test-virtio-fs qemu command:\\n '
@@ -162,4 +165,4 @@ chmod +x "${WRAP}"
 
 # --folder overlays sysroot onto /. Unset REDOXER_SYSROOT to avoid a second overlay.
 env -u REDOXER_SYSROOT REDOXER_QEMU_BINARY="${WRAP}" \
-  redoxer exec --folder "${REDOXER_SYSROOT}/:/" /usr/bin/virtio-fsd-selftest ${SELFTEST_ARGS}
+  redoxer exec --folder "${REDOXER_SYSROOT}/:/" /usr/bin/virtio-fsd-selftest "${SHARE_TAG}" ${SELFTEST_ARGS}

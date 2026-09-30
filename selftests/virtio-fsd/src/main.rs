@@ -52,6 +52,7 @@ fn main() -> ExitCode {
     let cfg = Config::from_args(std::env::args());
 
     println!("virtio-fsd-selftest {}", env!("CARGO_PKG_VERSION"));
+    println!("  share_tag: {}", cfg.share_tag);
     println!("  root:      {}", cfg.root.display());
     println!("  run_id:    {}", cfg.run_id);
     println!(

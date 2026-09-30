@@ -193,9 +193,9 @@ pub fn owner(st: &libc::stat) -> (u32, u32) {
 }
 
 #[cfg(feature = "lru-debug")]
-pub fn clear_lru_eviction_log() -> io::Result<()> {
+pub fn clear_lru_eviction_log(root: &Path) -> io::Result<()> {
     let f = open_flags(
-        Path::new("/scheme/virtio-fsd/.lru_evicted"),
+        &root.join(".lru_evicted"),
         flag::O_RDONLY | flag::O_TRUNC,
         0,
     )?;

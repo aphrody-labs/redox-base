@@ -136,20 +136,25 @@ impl<'a> VirtioFsSession {
         }
     }
 
-    // TODO: use tag as the scheme name such that multiple shares can be
-    // represented by Redox if QEMU makes them available.
     /// Returns the VirtIO FS tag associated with this session.
     ///
     /// # Panics
-    /// This function panics if the tag is not valid UTF-8.
-    // pub fn tag(&self) -> &str {
-    //     let tag_len = self
-    //         .tag
-    //         .iter()
-    //         .position(|&c| c == 0)
-    //         .unwrap_or(self.tag.len());
-    //     core::str::from_utf8(&self.tag[..tag_len]).expect("virtio-fsd: tag is not valid UTF-8.")
-    // }
+    /// This function panics if the tag is empty or is not valid UTF-8.
+    pub fn tag(&self) -> &str {
+        // The tag is NUL-padded, but it is not NUL-terminated if it fills all
+        // `VIRTIO_FS_TAG_SIZE` bytes.
+        let tag_len = self
+            .tag
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(self.tag.len());
+        let tag = core::str::from_utf8(&self.tag[..tag_len])
+            .expect("virtio-fsd: tag is not valid UTF-8.");
+
+        assert!(!tag.is_empty(), "virtio-fsd: tag is empty.");
+
+        tag
+    }
 
     async fn send(&self, chain: Vec<Buffer>) -> Result<u32, TransportError> {
         let n = self.request_queues.len();

@@ -507,7 +507,7 @@ impl VfsState {
         let parent_id = inode.parent;
         if parent_id == nodeid {
             // we don't have the authority to look into the parent of root,
-            // hence when cwd is `/scheme/virtio-fsd`, `ls ..` is same as `ls .`.
+            // hence when cwd is `/scheme/virtio-fsd.<tag>`, `ls ..` is same as `ls .`.
             self.touch(FUSE_ROOT_ID);
             return Ok((FUSE_ROOT_ID, MODE_DIR));
         }
