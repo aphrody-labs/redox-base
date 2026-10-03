@@ -6,6 +6,6 @@ pub use fuse_abi::linux::{
 };
 pub use protocol::FuseReaddirOut;
 pub use session::{
-    AllocStrategy, Caller, FuseRequest, FuseResponse, FuseSession, FuseTransporter, OutPayload,
+    Caller, Data, FuseRequest, FuseResponse, FuseSession, FuseTransporter, OutPayload,
     TransportError,
 };

@@ -69,8 +69,10 @@ pub struct FuseRequest<I> {
 }
 
 pub enum OutPayload<O> {
+    /// A host error reply, or a reply type with no body (`O = ()`).
     None,
     Struct(O),
+    /// Bytes copied into the caller's `Data::In` buffer.
     Size(usize),
 }
 
@@ -105,25 +107,84 @@ impl<O> FuseResponse<O> {
     }
 }
 
-/// How the transporter should handle the FUSE data payload.
-pub enum AllocStrategy<'a> {
-    /// When everything fits in PAGE_SIZE and response has a header and a payload.
-    DmaPool,
-    /// When everything fits in PAGE_SIZE and response only has a header.
-    DmaPoolHeaderOnly,
-    /// Massive transmit (e.g. `FUSE_WRITE`).
-    /// `data` will directly get copied to DMA memory.
-    Send { data: &'a [u8] },
-    /// Massive Receive (e.g. `FUSE_READ`).
-    /// Data will directly get copied to `buf` from DMA memory.
-    Recv { buf: &'a mut [u8] },
+/// Variable-length bytes for one FUSE call, separate from the typed request and reply.
+/// `Out` is sent with the request; `In` receives the bytes the host wrote back.
+pub enum Data<'a> {
+    None,
+    Out(&'a [u8]),
+    In(&'a mut [u8]),
+}
+
+impl<O: FromBytes + Immutable> FuseResponse<O> {
+    /// Builds a response from the first `written` bytes of `rx`: a `fuse_out_header`, then `O`.
+    /// `Data::In` is the exception: those bytes are copied from `bounce` into the caller's buffer.
+    /// Bytes past `written` stay unread, since `rx` can hold stale data there.
+    pub fn from_wire(
+        rx: &[u8],
+        written: u32,
+        unique: u64,
+        data: Data<'_>,
+        bounce: Option<&[u8]>,
+    ) -> Result<Self, TransportError> {
+        let header_len = mem::size_of::<fuse_out_header>();
+        if (written as usize) < header_len || rx.len() < header_len {
+            return Err(TransportError::Generic);
+        }
+
+        let (fuse_out_header, _) = fuse_out_header::read_from_prefix(&rx[..header_len])
+            .map_err(|_| TransportError::Generic)?;
+
+        if fuse_out_header.len != written {
+            warn!(
+                "virtio-fsd: Potential data corruption. FUSE claimed {} was written, but wrote {}",
+                fuse_out_header.len, written
+            );
+            return Err(TransportError::Generic);
+        }
+        if fuse_out_header.unique != unique {
+            return Err(TransportError::Generic);
+        }
+
+        let payload = if fuse_out_header.error != 0 {
+            OutPayload::None
+        } else {
+            match data {
+                Data::In(buf) => {
+                    let n = written as usize - header_len;
+                    if n > buf.len() {
+                        return Err(TransportError::Generic);
+                    }
+                    if n > 0 {
+                        let src = bounce.and_then(|b| b.get(..n));
+                        buf[..n].copy_from_slice(src.ok_or(TransportError::Generic)?);
+                    }
+                    OutPayload::Size(n)
+                }
+                Data::None | Data::Out(_) if mem::size_of::<O>() == 0 => OutPayload::None,
+                Data::None | Data::Out(_) => {
+                    let end = header_len + mem::size_of::<O>();
+                    if (written as usize) < end || rx.len() < end {
+                        return Err(TransportError::Generic);
+                    }
+                    let (payload, _) = O::read_from_prefix(&rx[header_len..end])
+                        .map_err(|_| TransportError::Generic)?;
+                    OutPayload::Struct(payload)
+                }
+            }
+        };
+
+        Ok(Self {
+            fuse_out_header,
+            payload,
+        })
+    }
 }
 
 pub trait FuseTransporter {
     async fn send<I, O>(
         &self,
         request: FuseRequest<I>,
-        strategy: AllocStrategy<'_>,
+        data: Data<'_>,
     ) -> Result<FuseResponse<O>, TransportError>
     where
         I: IntoBytes + Immutable,
@@ -198,7 +259,7 @@ where
 
         let init_out = session
             .transporter
-            .send::<_, fuse_init_out>(request, AllocStrategy::DmaPool)
+            .send::<_, fuse_init_out>(request, Data::None)
             .await?
             .into_struct()?;
 
@@ -303,7 +364,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::DmaPool)
+            .send(request, Data::None)
             .await?
             .into_struct()
     }
@@ -334,7 +395,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::DmaPool)
+            .send(request, Data::None)
             .await?
             .into_struct()
     }
@@ -349,7 +410,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::DmaPool)
+            .send(request, Data::None)
             .await?
             .into_struct()
     }
@@ -374,7 +435,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::DmaPool)
+            .send(request, Data::None)
             .await?
             .into_struct()
     }
@@ -413,7 +474,7 @@ where
 
         let n = self
             .transporter
-            .send::<_, ()>(request, AllocStrategy::Recv { buf: &mut buf })
+            .send::<_, ()>(request, Data::In(&mut buf))
             .await?
             .into_size()?;
 
@@ -451,7 +512,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::DmaPool)
+            .send(request, Data::None)
             .await?
             .into_struct()
     }
@@ -526,7 +587,7 @@ where
         };
 
         self.transporter
-            .send::<_, ()>(request, AllocStrategy::Recv { buf })
+            .send::<_, ()>(request, Data::In(buf))
             .await?
             .into_size()
     }
@@ -608,7 +669,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::Send { data })
+            .send(request, Data::Out(data))
             .await?
             .into_struct()
     }
@@ -649,7 +710,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::Send { data: name })
+            .send(request, Data::Out(name))
             .await?
             .into_struct()
     }
@@ -686,7 +747,7 @@ where
         };
 
         self.transporter
-            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .send::<_, ()>(request, Data::None)
             .await?
             .into_unit()
     }
@@ -713,7 +774,7 @@ where
         };
 
         self.transporter
-            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .send::<_, ()>(request, Data::None)
             .await?
             .into_unit()
     }
@@ -751,7 +812,7 @@ where
         };
 
         self.transporter
-            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .send::<_, ()>(request, Data::None)
             .await?
             .into_unit()
     }
@@ -807,7 +868,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::Send { data: name })
+            .send(request, Data::Out(name))
             .await?
             .into_struct()
     }
@@ -842,7 +903,7 @@ where
         };
 
         self.transporter
-            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .send::<_, ()>(request, Data::None)
             .await?
             .into_unit()
     }
@@ -860,7 +921,7 @@ where
 
         let n = self
             .transporter
-            .send::<_, ()>(request, AllocStrategy::Recv { buf: &mut buf })
+            .send::<_, ()>(request, Data::In(&mut buf))
             .await?
             .into_size()?;
 
@@ -919,12 +980,7 @@ where
         };
 
         self.transporter
-            .send(
-                request,
-                AllocStrategy::Send {
-                    data: &data[..name_len + path_len],
-                },
-            )
+            .send(request, Data::Out(&data[..name_len + path_len]))
             .await?
             .into_struct()
     }
@@ -969,7 +1025,7 @@ where
         };
 
         self.transporter
-            .send::<_, ()>(request, AllocStrategy::DmaPoolHeaderOnly)
+            .send::<_, ()>(request, Data::None)
             .await?
             .into_unit()
     }
@@ -1005,7 +1061,7 @@ where
         };
 
         self.transporter
-            .send(request, AllocStrategy::Send { data: name })
+            .send(request, Data::Out(name))
             .await?
             .into_struct()
     }
@@ -1026,3 +1082,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;

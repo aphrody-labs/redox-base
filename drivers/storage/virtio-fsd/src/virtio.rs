@@ -3,15 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::dma::Dma;
-use log::{info, warn};
+use log::info;
 use virtio_core::spec::{Buffer, ChainBuilder, DescriptorFlags};
-use virtio_core::transport::Queue;
-use virtio_core::{Device, DmaPool};
+use virtio_core::transport::{Queue, Retired};
+use virtio_core::{Device, DmaPool, PooledPage};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fuse::{
-    AllocStrategy, FuseRequest, FuseResponse, FuseTransporter, OutPayload, TransportError,
-    fuse_out_header,
+    Data, FuseRequest, FuseResponse, FuseTransporter, TransportError, fuse_out_header,
 };
 
 pub const VIRTIO_FS_TAG_SIZE: usize = 36;
@@ -156,15 +155,30 @@ impl<'a> VirtioFsSession {
         tag
     }
 
-    async fn send(&self, chain: Vec<Buffer>) -> Result<u32, TransportError> {
+    async fn send(&self, chain: Vec<Buffer>) -> Result<Retired, TransportError> {
         let n = self.request_queues.len();
         let i = self.next_queue.fetch_add(1, Ordering::Relaxed) % n;
         Ok(self.request_queues[i].send(chain).await)
     }
 
-    async fn send_hiprio(&self, chain: Vec<Buffer>) -> Result<(), TransportError> {
-        self.hiprio_queue.send(chain).await;
-        Ok(())
+    fn request_page<I: IntoBytes + Immutable>(
+        &self,
+        request: &FuseRequest<I>,
+    ) -> Result<(PooledPage, usize), TransportError> {
+        let mut page = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
+        let header = request.fuse_in_header.as_bytes();
+        let body = request
+            .fuse_in
+            .as_ref()
+            .map(IntoBytes::as_bytes)
+            .unwrap_or(&[]);
+        let len = header.len() + body.len();
+        if len > page.len() {
+            return Err(TransportError::Generic);
+        }
+        page[..header.len()].copy_from_slice(header);
+        page[header.len()..len].copy_from_slice(body);
+        Ok((page, len))
     }
 }
 
@@ -173,120 +187,50 @@ impl FuseTransporter for VirtioFsSession {
     async fn send<I, O>(
         &self,
         request: FuseRequest<I>,
-        strategy: AllocStrategy<'_>,
+        data: Data<'_>,
     ) -> Result<FuseResponse<O>, TransportError>
     where
         I: IntoBytes + Immutable,
         O: FromBytes + Immutable,
     {
-        let mut builder = ChainBuilder::new();
-
-        // write fuse_in_header and fuse_*_in into a DMA memory
-
-        let mut tx_guard = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
-        let mut tx_offset = 0;
-
-        builder = builder.chain(tx_guard.append(&mut tx_offset, request.fuse_in_header.as_bytes()));
-        if let Some(ref fuse_in) = request.fuse_in {
-            builder = builder.chain(tx_guard.append(&mut tx_offset, fuse_in.as_bytes()));
-        }
-
-        // write fuse_out_header into a DMA memory
-
-        let mut rx_guard = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
-        let mut rx_offset = 0;
-
-        builder = builder.chain(rx_guard.reserve(&mut rx_offset, size_of::<fuse_out_header>()));
-
-        // decide how to send the data based on AllocStrategy
-
-        // read back once virtio finishes
-        let mut rx_bounce = None;
-
-        let mut out_payload_offset = 0;
-
-        match strategy {
-            AllocStrategy::DmaPool => {
-                out_payload_offset = rx_offset;
-                builder = builder.chain(rx_guard.reserve(&mut rx_offset, size_of::<O>()));
-            }
-            AllocStrategy::DmaPoolHeaderOnly => {}
-            AllocStrategy::Send { data } => {
-                let size = data.len();
-
-                let dma_uninit =
-                    Dma::zeroed_slice(size).map_err(|_| TransportError::OutOfMemory)?;
-                // SAFETY:
-                // - We only read from this region after host has indicated a successful write
-                let mut dma = unsafe { dma_uninit.assume_init() };
-
-                dma.copy_from_slice(&data[..size]);
-                builder = builder.chain(Buffer::new_unsized(&Arc::new(dma)));
-
-                // 'AllocStrategy::Send' is only used for writes
-                // which return a small `fuse_write_out` struct.
-                out_payload_offset = rx_offset;
-                builder = builder.chain(rx_guard.reserve(&mut rx_offset, size_of::<O>()));
-            }
-            AllocStrategy::Recv { ref buf } => {
-                let dma_uninit =
-                    Dma::zeroed_slice(buf.len()).map_err(|_| TransportError::OutOfMemory)?;
-                // SAFETY:
-                // - We only read from this region after host has indicated a successful write
-                let dma = Arc::new(unsafe { dma_uninit.assume_init() });
-
-                builder =
-                    builder.chain(Buffer::new_unsized(&dma).flags(DescriptorFlags::WRITE_ONLY));
-                rx_bounce = Some(dma);
-            }
-        }
-
-        // send and wait
-
-        let chain = builder.build();
-        let virtio_written = self.send(chain).await?;
-
-        // parse the header
-
-        // header is always at the begining of the DMA region
-        let out_header_bytes = &rx_guard[..size_of::<fuse_out_header>()];
-        let (parsed_out_header, _) = fuse_out_header::read_from_prefix(out_header_bytes)
-            .map_err(|_| TransportError::Generic)?;
-
-        let fuse_written_claim = parsed_out_header.len;
-        if virtio_written != fuse_written_claim {
-            warn!(
-                "virtio-fsd: Potential data corruption. FUSE claimed {} was written, but wrote {}",
-                fuse_written_claim, virtio_written
-            );
+        // [request page, data out?, reply page, data in?]
+        let (tx_page, tx_len) = self.request_page(&request)?;
+        let rx_page = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
+        let rx_len = size_of::<fuse_out_header>() + size_of::<O>();
+        if rx_len > rx_page.len() {
             return Err(TransportError::Generic);
         }
 
-        // parse the data
-
-        let payload_size =
-            virtio_written.saturating_sub(size_of::<fuse_out_header>() as u32) as usize;
-
-        let parsed_out_payload = match strategy {
-            AllocStrategy::DmaPoolHeaderOnly => OutPayload::None,
-            AllocStrategy::DmaPool | AllocStrategy::Send { .. } => {
-                // payload starts right after the begining header
-                let bytes = &rx_guard[out_payload_offset..out_payload_offset + size_of::<O>()];
-                let (payload, _) =
-                    O::read_from_prefix(bytes).map_err(|_| TransportError::Generic)?;
-                OutPayload::Struct(payload)
-            }
-            AllocStrategy::Recv { buf } => {
-                let dma = rx_bounce.as_ref().unwrap();
-                buf[..payload_size].copy_from_slice(&dma[..payload_size]);
-                OutPayload::Size(payload_size as usize)
-            }
+        let mut chain = ChainBuilder::new().chain(Buffer::new_sized(tx_page, tx_len));
+        if let Data::Out(data) = &data
+            && !data.is_empty()
+        {
+            let mut dma = get_dma_init(data.len())?;
+            dma.copy_from_slice(data);
+            chain = chain.chain(Buffer::new(dma));
+        }
+        chain = chain.chain(Buffer::new_sized(rx_page, rx_len).flags(DescriptorFlags::WRITE_ONLY));
+        let recv_len = match &data {
+            Data::In(buf) => buf.len(),
+            _ => 0,
         };
+        if recv_len > 0 {
+            chain = chain
+                .chain(Buffer::new(get_dma_init(recv_len)?).flags(DescriptorFlags::WRITE_ONLY));
+        }
 
-        Ok(FuseResponse {
-            fuse_out_header: parsed_out_header,
-            payload: parsed_out_payload,
-        })
+        let unique = request.fuse_in_header.unique;
+        let Retired {
+            mut buffers,
+            written,
+        } = self.send(chain.build()).await?;
+
+        // chain is [tx, data out?, rx, data in?], so the reply side comes off the end
+        let bounce = (recv_len > 0).then(|| buffers.pop().unwrap().into_inner::<Dma<[u8]>>());
+        let rx_page = buffers.pop().unwrap().into_inner::<PooledPage>();
+        drop(buffers);
+
+        FuseResponse::from_wire(&rx_page, written, unique, data, bounce.as_deref())
     }
 
     /// Sends a FUSE request that does not expect a response, into the high-priority queue.
@@ -299,20 +243,20 @@ impl FuseTransporter for VirtioFsSession {
     where
         I: IntoBytes + Immutable,
     {
-        let mut builder = ChainBuilder::new();
+        let (tx_page, tx_len) = self.request_page(&request)?;
+        let chain = ChainBuilder::new()
+            .chain(Buffer::new_sized(tx_page, tx_len))
+            .build();
 
-        let mut tx_guard = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
-        let mut tx_offset = 0;
-
-        builder = builder.chain(tx_guard.append(&mut tx_offset, request.fuse_in_header.as_bytes()));
-        if let Some(ref fuse_in) = request.fuse_in {
-            builder = builder.chain(tx_guard.append(&mut tx_offset, fuse_in.as_bytes()));
-        }
-
-        let chain = builder.build();
-
-        self.send_hiprio(chain).await?;
+        // dropping the completed chain returns the page to the pool
+        self.hiprio_queue.send(chain).await;
 
         Ok(())
     }
+}
+
+fn get_dma_init(len: usize) -> Result<Dma<[u8]>, TransportError> {
+    let dma = Dma::<[u8]>::zeroed_slice(len).map_err(|_| TransportError::OutOfMemory)?;
+    // SAFETY: a slice of zeros is a valid slice of u8.
+    Ok(unsafe { dma.assume_init() })
 }

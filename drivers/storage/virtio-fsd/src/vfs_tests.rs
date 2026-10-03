@@ -12,7 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use super::*;
 use crate::fuse::{
-    AllocStrategy, Caller, FUSE_ROOT_ID, FuseRequest, FuseResponse, FuseSession, FuseTransporter,
+    Caller, Data, FUSE_ROOT_ID, FuseRequest, FuseResponse, FuseSession, FuseTransporter,
     OutPayload, TransportError,
 };
 use crate::linux_abi;
@@ -118,7 +118,7 @@ impl FuseTransporter for Mock {
     async fn send<I, O>(
         &self,
         request: FuseRequest<I>,
-        strategy: AllocStrategy<'_>,
+        data: Data<'_>,
     ) -> Result<FuseResponse<O>, TransportError>
     where
         I: IntoBytes + Immutable,
@@ -150,9 +150,9 @@ impl FuseTransporter for Mock {
             MockReply::Host(errno) => (errno.wrapping_neg(), OutPayload::None),
             MockReply::Unit => (0, OutPayload::None),
             MockReply::Bytes(buf) => {
-                let payload = match strategy {
-                    AllocStrategy::DmaPoolHeaderOnly => OutPayload::None,
-                    AllocStrategy::Recv { buf: dst } => OutPayload::Size(dst.len()),
+                let payload = match &data {
+                    Data::In(dst) => OutPayload::Size(dst.len()),
+                    _ if size_of::<O>() == 0 => OutPayload::None,
                     _ => OutPayload::Struct(
                         O::read_from_prefix(&buf)
                             .map(|(s, _)| s)
