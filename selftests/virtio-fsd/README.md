@@ -82,6 +82,31 @@ virtio-fsd-selftest virtiofs --filter io_golden
 - `1` failures
 - `2` test root is missing
 
+## Live system (`make qemu`)
+
+On a booted Redox with the `virtio-fsd-selftest` package installed (add `virtio-fsd-selftest = {}` to the `[packages]` of the config you build):
+
+1. Generate the fixtures in the host directory you share. This only touches `<dir>/fixtures` (it is deleted and recreated):
+
+```bash
+./scripts/gen-fixtures.sh "$HOME/shared"
+```
+
+2. Start Redox with that directory shared. The tag is the part before `=`, and a bare directory gets the tag `host`:
+
+```bash
+make qemu share="$HOME/shared"                         # tag "host"
+make qemu share="one=$HOME/shared two=$HOME/shared1"   # tags "one" and "two"
+```
+
+3. In the guest, pass the tag:
+
+```text
+virtio-fsd-selftest host <FLAGS>
+```
+
+Without `fixtures/` the fixture-based tests are a SKIP, not a FAIL.
+
 ## redoxer
 
 ```bash
