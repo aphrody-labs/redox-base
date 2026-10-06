@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use fuse_abi::linux::{fuse_attr, fuse_entry_out, fuse_opcode, fuse_open_out, fuse_out_header};
+use fuse_abi::linux::{fuse_attr, fuse_entry_out, fuse_opcode, fuse_open_out};
 use futures::executor::{LocalPool, block_on};
 use futures::task::LocalSpawnExt;
 use syscall::{ENOENT, ESTALE, MODE_DIR, MODE_FILE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR};
@@ -12,8 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use super::*;
 use crate::fuse::{
-    Caller, Data, FUSE_ROOT_ID, FuseRequest, FuseResponse, FuseSession, FuseTransporter,
-    OutPayload, TransportError,
+    Caller, Data, FUSE_ROOT_ID, FuseError, FuseReply, FuseRequest, FuseSession, FuseTransporter,
 };
 use crate::linux_abi;
 
@@ -119,7 +118,7 @@ impl FuseTransporter for Mock {
         &self,
         request: FuseRequest<I>,
         data: Data<'_>,
-    ) -> Result<FuseResponse<O>, TransportError>
+    ) -> Result<FuseReply<O>, FuseError>
     where
         I: IntoBytes + Immutable,
         O: FromBytes + Immutable,
@@ -140,40 +139,29 @@ impl FuseTransporter for Mock {
             }
         }
         self.ops.borrow_mut().push(opcode);
-        let unique = request.fuse_in_header.unique;
         let reply = self
             .replies
             .borrow_mut()
             .pop_front()
-            .ok_or(TransportError::Generic)?;
-        let (error, payload) = match reply {
-            MockReply::Host(errno) => (errno.wrapping_neg(), OutPayload::None),
-            MockReply::Unit => (0, OutPayload::None),
-            MockReply::Bytes(buf) => {
-                let payload = match &data {
-                    Data::In(dst) => OutPayload::Size(dst.len()),
-                    _ if size_of::<O>() == 0 => OutPayload::None,
-                    _ => OutPayload::Struct(
-                        O::read_from_prefix(&buf)
-                            .map(|(s, _)| s)
-                            .or_else(|_| O::read_from_bytes(&buf))
-                            .map_err(|_| TransportError::Generic)?,
-                    ),
-                };
-                (0, payload)
-            }
-        };
-        Ok(FuseResponse {
-            fuse_out_header: fuse_out_header {
-                len: 0,
-                error,
-                unique,
+            .ok_or(FuseError::MalformedPayload)?;
+        match reply {
+            MockReply::Host(errno) => Err(FuseError::Host(errno)),
+            MockReply::Unit => Ok(FuseReply::Struct(
+                O::read_from_bytes(&[]).map_err(|_| FuseError::MalformedPayload)?,
+            )),
+            MockReply::Bytes(buf) => match &data {
+                Data::In(dst) => Ok(FuseReply::Size(dst.len())),
+                _ => Ok(FuseReply::Struct(
+                    O::read_from_prefix(&buf)
+                        .map(|(s, _)| s)
+                        .or_else(|_| O::read_from_bytes(&buf))
+                        .map_err(|_| FuseError::MalformedPayload)?,
+                )),
             },
-            payload,
-        })
+        }
     }
 
-    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), TransportError>
+    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), FuseError>
     where
         I: IntoBytes + Immutable,
     {

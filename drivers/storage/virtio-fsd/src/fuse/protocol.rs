@@ -36,14 +36,10 @@ impl<'a> Iterator for FuseDirentIterator<'a> {
         if name_len > rest.len() {
             return None;
         }
-
         let name = &rest[..name_len];
 
-        let header_size = size_of::<fuse_dirent>();
-
         // Fuse pads each dirent to the next 8-byte boundary
-        let padded_len = (header_size + name_len).next_multiple_of(8);
-
+        let padded_len = (size_of::<fuse_dirent>() + name_len).next_multiple_of(8);
         if padded_len <= self.inner.len() {
             self.inner = &self.inner[padded_len..]
         } else {

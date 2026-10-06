@@ -9,9 +9,7 @@ use virtio_core::transport::{Queue, Retired};
 use virtio_core::{Device, DmaPool, PooledPage};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::fuse::{
-    Data, FuseRequest, FuseResponse, FuseTransporter, TransportError, fuse_out_header,
-};
+use crate::fuse::{Data, FuseError, FuseReply, FuseRequest, FuseTransporter, fuse_out_header};
 
 pub const VIRTIO_FS_TAG_SIZE: usize = 36;
 pub const VIRTIO_FS_F_NOTIFICATION: u32 = 0;
@@ -155,30 +153,44 @@ impl<'a> VirtioFsSession {
         tag
     }
 
-    async fn send(&self, chain: Vec<Buffer>) -> Result<Retired, TransportError> {
+    async fn send(&self, chain: Vec<Buffer>) -> Result<Retired, FuseError> {
         let n = self.request_queues.len();
         let i = self.next_queue.fetch_add(1, Ordering::Relaxed) % n;
         Ok(self.request_queues[i].send(chain).await)
     }
 
-    fn request_page<I: IntoBytes + Immutable>(
+    /// Appends `request` to `chain`. The header and body occupy one page.
+    /// `out` follows in the leftover space when it fits, and in its own
+    /// DMA buffer if it doesn't fit in the page.
+    fn chain_request<I: IntoBytes + Immutable>(
         &self,
+        chain: ChainBuilder,
         request: &FuseRequest<I>,
-    ) -> Result<(PooledPage, usize), TransportError> {
-        let mut page = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
+        out: &[u8],
+    ) -> Result<ChainBuilder, FuseError> {
+        let mut page = self.dma_pool.lease().ok_or(FuseError::OutOfMemory)?;
+
         let header = request.fuse_in_header.as_bytes();
-        let body = request
-            .fuse_in
-            .as_ref()
-            .map(IntoBytes::as_bytes)
-            .unwrap_or(&[]);
+        let body = request.fuse_in.as_bytes();
+
         let len = header.len() + body.len();
         if len > page.len() {
-            return Err(TransportError::Generic);
+            return Err(FuseError::MalformedPayload);
         }
+
         page[..header.len()].copy_from_slice(header);
         page[header.len()..len].copy_from_slice(body);
-        Ok((page, len))
+
+        if out.len() <= page.len() - len {
+            page[len..len + out.len()].copy_from_slice(out);
+            return Ok(chain.chain(Buffer::new_sized(page, len + out.len())));
+        }
+
+        let mut dma = get_dma_init(out.len())?;
+        dma.copy_from_slice(out);
+        Ok(chain
+            .chain(Buffer::new_sized(page, len))
+            .chain(Buffer::new(dma)))
     }
 }
 
@@ -188,27 +200,23 @@ impl FuseTransporter for VirtioFsSession {
         &self,
         request: FuseRequest<I>,
         data: Data<'_>,
-    ) -> Result<FuseResponse<O>, TransportError>
+    ) -> Result<FuseReply<O>, FuseError>
     where
         I: IntoBytes + Immutable,
         O: FromBytes + Immutable,
     {
         // [request page, data out?, reply page, data in?]
-        let (tx_page, tx_len) = self.request_page(&request)?;
-        let rx_page = self.dma_pool.lease().ok_or(TransportError::OutOfMemory)?;
+        let out = match &data {
+            Data::Out(bytes) => *bytes,
+            _ => &[],
+        };
+        let mut chain = self.chain_request(ChainBuilder::new(), &request, out)?;
+        let rx_page = self.dma_pool.lease().ok_or(FuseError::OutOfMemory)?;
         let rx_len = size_of::<fuse_out_header>() + size_of::<O>();
         if rx_len > rx_page.len() {
-            return Err(TransportError::Generic);
+            return Err(FuseError::MalformedPayload);
         }
 
-        let mut chain = ChainBuilder::new().chain(Buffer::new_sized(tx_page, tx_len));
-        if let Data::Out(data) = &data
-            && !data.is_empty()
-        {
-            let mut dma = get_dma_init(data.len())?;
-            dma.copy_from_slice(data);
-            chain = chain.chain(Buffer::new(dma));
-        }
         chain = chain.chain(Buffer::new_sized(rx_page, rx_len).flags(DescriptorFlags::WRITE_ONLY));
         let recv_len = match &data {
             Data::In(buf) => buf.len(),
@@ -230,7 +238,7 @@ impl FuseTransporter for VirtioFsSession {
         let rx_page = buffers.pop().unwrap().into_inner::<PooledPage>();
         drop(buffers);
 
-        FuseResponse::from_wire(&rx_page, written, unique, data, bounce.as_deref())
+        FuseReply::from_wire(&rx_page, written, unique, data, bounce.as_deref())
     }
 
     /// Sends a FUSE request that does not expect a response, into the high-priority queue.
@@ -239,13 +247,12 @@ impl FuseTransporter for VirtioFsSession {
     /// - `FUSE_FORGET`
     /// - `FUSE_BATCH_FORGET`
     /// - `FUSE_INTERRUPT`
-    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), TransportError>
+    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), FuseError>
     where
         I: IntoBytes + Immutable,
     {
-        let (tx_page, tx_len) = self.request_page(&request)?;
-        let chain = ChainBuilder::new()
-            .chain(Buffer::new_sized(tx_page, tx_len))
+        let chain = self
+            .chain_request(ChainBuilder::new(), &request, &[])?
             .build();
 
         // dropping the completed chain returns the page to the pool
@@ -255,8 +262,8 @@ impl FuseTransporter for VirtioFsSession {
     }
 }
 
-fn get_dma_init(len: usize) -> Result<Dma<[u8]>, TransportError> {
-    let dma = Dma::<[u8]>::zeroed_slice(len).map_err(|_| TransportError::OutOfMemory)?;
+fn get_dma_init(len: usize) -> Result<Dma<[u8]>, FuseError> {
+    let dma = Dma::<[u8]>::zeroed_slice(len).map_err(|_| FuseError::OutOfMemory)?;
     // SAFETY: a slice of zeros is a valid slice of u8.
     Ok(unsafe { dma.assume_init() })
 }

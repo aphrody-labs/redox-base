@@ -12,96 +12,57 @@ use fuse_abi::linux::{
 };
 use log::{info, warn};
 use syscall::PAGE_SIZE;
-use syscall::error::{EAGAIN, EIO, ENODEV, ENOMEM, Error};
+use syscall::error::{EIO, ENOMEM, Error};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fuse::protocol::*;
 
 #[derive(Debug, Error)]
-pub enum TransportError {
-    #[error("Memory exhausted.")]
-    OutOfMemory,
-    #[error("Device is offline.")]
-    DeviceOffline, // TODO: virtio-core must be patched to return this error when the device goes offline, instead of panicking or blocking indefinitely.
-    #[error("Device is busy processing other requests.")]
-    Busy, // TODO: virtio-core must be patched to return this error when the virtqueue is full, instead of blocking until space is available.
-    #[error("Generic transport error")]
-    Generic,
-}
-
-#[derive(Debug, Error)]
 pub enum FuseError {
-    #[error("Transport failed: {0}")]
-    Transport(#[from] TransportError),
     #[error("Host rejected request with POSIX code: {0}")]
     Host(i32),
     #[error("Received malformed payload from transport")]
     MalformedPayload,
+    #[error("Memory exhausted.")]
+    OutOfMemory,
 }
 
 impl FuseError {
-    pub fn from_fuse_header(error: i32) -> Result<(), Self> {
-        if error == 0 {
-            Ok(())
-        } else {
-            Err(Self::Host(error.wrapping_neg()))
-        }
-    }
-
     pub fn into_syscall(self, op: &str) -> Error {
         if !matches!(self, Self::Host(_)) {
             warn!("virtio-fsd: {op}: {self}");
         }
         match self {
             Self::Host(errno) => Error::new(errno),
-            Self::Transport(TransportError::OutOfMemory) => Error::new(ENOMEM),
-            Self::Transport(TransportError::Busy) => Error::new(EAGAIN),
-            Self::Transport(TransportError::DeviceOffline) => Error::new(ENODEV),
-            Self::Transport(TransportError::Generic) | Self::MalformedPayload => Error::new(EIO),
+            Self::OutOfMemory => Error::new(ENOMEM),
+            Self::MalformedPayload => Error::new(EIO),
         }
     }
 }
 
 pub struct FuseRequest<I> {
     pub fuse_in_header: fuse_in_header,
-    pub fuse_in: Option<I>,
+    pub fuse_in: I,
 }
 
-pub enum OutPayload<O> {
-    /// A host error reply, or a reply type with no body (`O = ()`).
-    None,
+pub enum FuseReply<O> {
     Struct(O),
     /// Bytes copied into the caller's `Data::In` buffer.
     Size(usize),
 }
 
-pub struct FuseResponse<O> {
-    pub fuse_out_header: fuse_out_header,
-    pub payload: OutPayload<O>,
-}
-
-impl<O> FuseResponse<O> {
+impl<O> FuseReply<O> {
     pub fn into_struct(self) -> Result<O, FuseError> {
-        FuseError::from_fuse_header(self.fuse_out_header.error)?;
-        match self.payload {
-            OutPayload::Struct(s) => Ok(s),
-            _ => Err(FuseError::MalformedPayload),
-        }
-    }
-
-    pub fn into_unit(self) -> Result<(), FuseError> {
-        FuseError::from_fuse_header(self.fuse_out_header.error)?;
-        match self.payload {
-            OutPayload::None => Ok(()),
+        match self {
+            Self::Struct(s) => Ok(s),
             _ => Err(FuseError::MalformedPayload),
         }
     }
 
     pub fn into_size(self) -> Result<usize, FuseError> {
-        FuseError::from_fuse_header(self.fuse_out_header.error)?;
-        match self.payload {
-            OutPayload::Size(n) => Ok(n),
+        match self {
+            Self::Size(n) => Ok(n),
             _ => Err(FuseError::MalformedPayload),
         }
     }
@@ -115,8 +76,8 @@ pub enum Data<'a> {
     In(&'a mut [u8]),
 }
 
-impl<O: FromBytes + Immutable> FuseResponse<O> {
-    /// Builds a response from the first `written` bytes of `rx`: a `fuse_out_header`, then `O`.
+impl<O: FromBytes + Immutable> FuseReply<O> {
+    /// Builds the payload from the first `written` bytes of `rx`: a `fuse_out_header`, then `O`.
     /// `Data::In` is the exception: those bytes are copied from `bounce` into the caller's buffer.
     /// Bytes past `written` stay unread, since `rx` can hold stale data there.
     pub fn from_wire(
@@ -125,58 +86,54 @@ impl<O: FromBytes + Immutable> FuseResponse<O> {
         unique: u64,
         data: Data<'_>,
         bounce: Option<&[u8]>,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, FuseError> {
         let header_len = mem::size_of::<fuse_out_header>();
         if (written as usize) < header_len || rx.len() < header_len {
-            return Err(TransportError::Generic);
+            return Err(FuseError::MalformedPayload);
         }
 
         let (fuse_out_header, _) = fuse_out_header::read_from_prefix(&rx[..header_len])
-            .map_err(|_| TransportError::Generic)?;
+            .map_err(|_| FuseError::MalformedPayload)?;
 
         if fuse_out_header.len != written {
-            warn!(
-                "virtio-fsd: Potential data corruption. FUSE claimed {} was written, but wrote {}",
+            panic!(
+                "virtio-fsd: reply length '{}' does not match bytes written '{}'",
                 fuse_out_header.len, written
             );
-            return Err(TransportError::Generic);
         }
         if fuse_out_header.unique != unique {
-            return Err(TransportError::Generic);
+            panic!(
+                "virtio-fsd: reply unique value '{}' does not match request '{}'",
+                fuse_out_header.unique, unique
+            );
         }
 
-        let payload = if fuse_out_header.error != 0 {
-            OutPayload::None
-        } else {
-            match data {
-                Data::In(buf) => {
-                    let n = written as usize - header_len;
-                    if n > buf.len() {
-                        return Err(TransportError::Generic);
-                    }
-                    if n > 0 {
-                        let src = bounce.and_then(|b| b.get(..n));
-                        buf[..n].copy_from_slice(src.ok_or(TransportError::Generic)?);
-                    }
-                    OutPayload::Size(n)
-                }
-                Data::None | Data::Out(_) if mem::size_of::<O>() == 0 => OutPayload::None,
-                Data::None | Data::Out(_) => {
-                    let end = header_len + mem::size_of::<O>();
-                    if (written as usize) < end || rx.len() < end {
-                        return Err(TransportError::Generic);
-                    }
-                    let (payload, _) = O::read_from_prefix(&rx[header_len..end])
-                        .map_err(|_| TransportError::Generic)?;
-                    OutPayload::Struct(payload)
-                }
-            }
-        };
+        if fuse_out_header.error != 0 {
+            return Err(FuseError::Host(fuse_out_header.error.wrapping_neg()));
+        }
 
-        Ok(Self {
-            fuse_out_header,
-            payload,
-        })
+        match data {
+            Data::In(buf) => {
+                let n = written as usize - header_len;
+                if n > buf.len() {
+                    return Err(FuseError::MalformedPayload);
+                }
+                if n > 0 {
+                    let src = bounce.and_then(|b| b.get(..n));
+                    buf[..n].copy_from_slice(src.ok_or(FuseError::MalformedPayload)?);
+                }
+                Ok(Self::Size(n))
+            }
+            Data::None | Data::Out(_) => {
+                let end = header_len + mem::size_of::<O>();
+                if written as usize != end || rx.len() < end {
+                    return Err(FuseError::MalformedPayload);
+                }
+                let (payload, _) = O::read_from_prefix(&rx[header_len..end])
+                    .map_err(|_| FuseError::MalformedPayload)?;
+                Ok(Self::Struct(payload))
+            }
+        }
     }
 }
 
@@ -185,12 +142,12 @@ pub trait FuseTransporter {
         &self,
         request: FuseRequest<I>,
         data: Data<'_>,
-    ) -> Result<FuseResponse<O>, TransportError>
+    ) -> Result<FuseReply<O>, FuseError>
     where
         I: IntoBytes + Immutable,
         O: FromBytes + Immutable;
 
-    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), TransportError>
+    async fn send_hiprio_noreply<I>(&self, request: FuseRequest<I>) -> Result<(), FuseError>
     where
         I: IntoBytes + Immutable;
 }
@@ -226,21 +183,12 @@ where
     const CLIENT_INIT_FLAGS: u64 = FUSE_MAX_PAGES as u64 | FUSE_ATOMIC_O_TRUNC as u64;
 
     /// Initializes the FUSE session by sending a FUSE_INIT request to the device.
-    #[must_use = "The function returns a future that must be awaited to ensure the sent request is completed."]
     pub async fn new(transporter: T) -> Result<Self, FuseError> {
         let mut session = Self {
             transporter,
             init: fuse_init_out::default(),
             next_unique: AtomicU64::new(1),
         };
-
-        let fuse_in_header = session.in_header(
-            fuse_opcode::FUSE_INIT.into(),
-            FUSE_ROOT_ID,
-            mem::size_of::<fuse_init_in>(),
-            None,
-            Caller::NONE,
-        );
 
         let flags = Self::CLIENT_INIT_FLAGS;
         let init_in = fuse_init_in {
@@ -252,10 +200,14 @@ where
             unused: [0; 11],
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(init_in),
-        };
+        let request = session.request(
+            fuse_opcode::FUSE_INIT.into(),
+            FUSE_ROOT_ID,
+            init_in,
+            0,
+            None,
+            Caller::NONE,
+        );
 
         let init_out = session
             .transporter
@@ -314,18 +266,20 @@ where
         pages.saturating_mul(PAGE_SIZE).max(PAGE_SIZE)
     }
 
-    /// `extra_len` is the size of the in-payload after this header (`len` = header + extra_len).
+    /// Builds a request for `fuse_in`. `extra_len` is the number of bytes sent after it as
+    /// `Data::Out` (`len` = header + `fuse_in` + extra_len).
     /// `unique` is allocated from `next_unique` when `None`. FUSE_FORGET must send `Some(0)`.
-    fn in_header(
+    fn request<I>(
         &self,
         opcode: u32,
         nodeid: u64,
+        fuse_in: I,
         extra_len: usize,
         unique: Option<u64>,
         caller: Caller,
-    ) -> fuse_in_header {
-        fuse_in_header {
-            len: (mem::size_of::<fuse_in_header>() + extra_len) as u32,
+    ) -> FuseRequest<I> {
+        let fuse_in_header = fuse_in_header {
+            len: (mem::size_of::<fuse_in_header>() + mem::size_of::<I>() + extra_len) as u32,
             opcode,
             unique: unique.unwrap_or_else(|| self.next_unique.fetch_add(1, Ordering::SeqCst)),
             nodeid,
@@ -334,6 +288,11 @@ where
             pid: caller.pid,
             total_extlen: 0,
             padding: 0,
+        };
+
+        FuseRequest {
+            fuse_in_header,
+            fuse_in,
         }
     }
 
@@ -350,18 +309,12 @@ where
         } else {
             fuse_opcode::FUSE_OPEN.into()
         };
-        let fuse_in_header =
-            self.in_header(opcode, nodeid, mem::size_of::<fuse_open_in>(), None, caller);
-
         let fuse_in = fuse_open_in {
             flags,
             open_flags: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(opcode, nodeid, fuse_in, 0, None, caller);
 
         self.transporter
             .send(request, Data::None)
@@ -375,24 +328,20 @@ where
         fh: Option<u64>,
         caller: Caller,
     ) -> Result<fuse_attr_out, FuseError> {
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_GETATTR.into(),
-            nodeid,
-            mem::size_of::<fuse_getattr_in>(),
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_getattr_in {
             getattr_flags: if fh.is_some() { FUSE_GETATTR_FH } else { 0 },
             dummy: 0,
-            fh: if fh.is_some() { fh.unwrap() } else { 0 },
+            fh: fh.unwrap_or(0),
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_GETATTR.into(),
+            nodeid,
+            fuse_in,
+            0,
+            None,
+            caller,
+        );
 
         self.transporter
             .send(request, Data::None)
@@ -401,13 +350,7 @@ where
     }
 
     pub async fn statfs(&self, nodeid: u64, caller: Caller) -> Result<fuse_statfs_out, FuseError> {
-        let fuse_in_header =
-            self.in_header(fuse_opcode::FUSE_STATFS.into(), nodeid, 0, None, caller);
-
-        let request: FuseRequest<()> = FuseRequest {
-            fuse_in_header,
-            fuse_in: None,
-        };
+        let request = self.request(fuse_opcode::FUSE_STATFS.into(), nodeid, (), 0, None, caller);
 
         self.transporter
             .send(request, Data::None)
@@ -421,18 +364,14 @@ where
         fuse_in: fuse_setattr_in,
         caller: Caller,
     ) -> Result<fuse_attr_out, FuseError> {
-        let fuse_in_header = self.in_header(
+        let request = self.request(
             fuse_opcode::FUSE_SETATTR.into(),
             nodeid,
-            mem::size_of::<fuse_setattr_in>(),
+            fuse_in,
+            0,
             None,
             caller,
         );
-
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
 
         self.transporter
             .send(request, Data::None)
@@ -447,14 +386,6 @@ where
         offset: u64,
         caller: Caller,
     ) -> Result<FuseReaddirOut, FuseError> {
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_READDIR.into(),
-            nodeid,
-            mem::size_of::<fuse_read_in>(),
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_read_in {
             fh,
             offset,
@@ -465,10 +396,14 @@ where
             padding: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_READDIR.into(),
+            nodeid,
+            fuse_in,
+            0,
+            None,
+            caller,
+        );
 
         let mut buf = vec![0u8; FUSE_READDIR_BUFFER_SIZE as usize];
 
@@ -495,24 +430,17 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let mut name_buf = [0u8; NAME_MAX];
-        name_buf[..name.len()].copy_from_slice(&name);
-
-        let fuse_in_header = self.in_header(
+        let request = self.request(
             fuse_opcode::FUSE_LOOKUP.into(),
             parent_nodeid,
+            (),
             name_len,
             None,
             caller,
         );
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(name_buf),
-        };
-
         self.transporter
-            .send(request, Data::None)
+            .send(request, Data::Out(name))
             .await?
             .into_struct()
     }
@@ -563,14 +491,6 @@ where
         flags: u32,
         caller: Caller,
     ) -> Result<usize, FuseError> {
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_READ.into(),
-            nodeid,
-            mem::size_of::<fuse_read_in>(),
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_read_in {
             fh,
             offset,
@@ -581,10 +501,14 @@ where
             padding: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_READ.into(),
+            nodeid,
+            fuse_in,
+            0,
+            None,
+            caller,
+        );
 
         self.transporter
             .send::<_, ()>(request, Data::In(buf))
@@ -645,14 +569,6 @@ where
         caller: Caller,
     ) -> Result<fuse_write_out, FuseError> {
         let size = data.len();
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_WRITE.into(),
-            nodeid,
-            mem::size_of::<fuse_write_in>() + size,
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_write_in {
             fh,
             offset,
@@ -663,10 +579,14 @@ where
             padding: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_WRITE.into(),
+            nodeid,
+            fuse_in,
+            size,
+            None,
+            caller,
+        );
 
         self.transporter
             .send(request, Data::Out(data))
@@ -689,14 +609,6 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_CREATE.into(),
-            parent_nodeid,
-            mem::size_of::<fuse_create_in>() + name_len,
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_create_in {
             flags,
             mode,
@@ -704,10 +616,14 @@ where
             open_flags: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_CREATE.into(),
+            parent_nodeid,
+            fuse_in,
+            name_len,
+            None,
+            caller,
+        );
 
         self.transporter
             .send(request, Data::Out(name))
@@ -727,40 +643,21 @@ where
         } else {
             fuse_opcode::FUSE_FSYNC.into()
         };
-        let fuse_in_header = self.in_header(
-            opcode,
-            nodeid,
-            mem::size_of::<fuse_fsync_in>(),
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_fsync_in {
             fh,
             fsync_flags: 0,
             padding: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(opcode, nodeid, fuse_in, 0, None, caller);
 
         self.transporter
             .send::<_, ()>(request, Data::None)
             .await?
-            .into_unit()
+            .into_struct()
     }
 
     pub async fn flush(&self, nodeid: u64, fh: u64, caller: Caller) -> Result<(), FuseError> {
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_FLUSH.into(),
-            nodeid,
-            mem::size_of::<fuse_flush_in>(),
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_flush_in {
             fh,
             unused: 0,
@@ -768,15 +665,19 @@ where
             lock_owner: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_FLUSH.into(),
+            nodeid,
+            fuse_in,
+            0,
+            None,
+            caller,
+        );
 
         self.transporter
             .send::<_, ()>(request, Data::None)
             .await?
-            .into_unit()
+            .into_struct()
     }
 
     pub async fn release(
@@ -791,14 +692,6 @@ where
         } else {
             fuse_opcode::FUSE_RELEASE.into()
         };
-        let fuse_in_header = self.in_header(
-            opcode,
-            nodeid,
-            mem::size_of::<fuse_release_in>(),
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_release_in {
             fh,
             flags: 0,
@@ -806,32 +699,25 @@ where
             lock_owner: 0,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(opcode, nodeid, fuse_in, 0, None, caller);
 
         self.transporter
             .send::<_, ()>(request, Data::None)
             .await?
-            .into_unit()
+            .into_struct()
     }
 
     pub async fn forget(&self, nodeid: u64, nlookup: u64, caller: Caller) -> Result<(), FuseError> {
-        let fuse_in_header = self.in_header(
+        let fuse_in = fuse_forget_in { nlookup };
+
+        let request = self.request(
             fuse_opcode::FUSE_FORGET.into(),
             nodeid,
-            mem::size_of::<fuse_forget_in>(),
+            fuse_in,
+            0,
             Some(0),
             caller,
         );
-
-        let fuse_in = fuse_forget_in { nlookup };
-
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
 
         self.transporter.send_hiprio_noreply(request).await?;
 
@@ -852,20 +738,16 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = self.in_header(
+        let fuse_in = fuse_mkdir_in { mode, umask: 0 };
+
+        let request = self.request(
             fuse_opcode::FUSE_MKDIR.into(),
             parent_nodeid,
-            mem::size_of::<fuse_mkdir_in>() + name_len,
+            fuse_in,
+            name_len,
             None,
             caller,
         );
-
-        let fuse_in = fuse_mkdir_in { mode, umask: 0 };
-
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
 
         self.transporter
             .send(request, Data::Out(name))
@@ -887,35 +769,28 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let mut name_buf = [0u8; NAME_MAX];
-        name_buf[..name.len()].copy_from_slice(&name);
-
         let opcode = if is_dir {
             fuse_opcode::FUSE_RMDIR.into()
         } else {
             fuse_opcode::FUSE_UNLINK.into()
         };
-        let fuse_in_header = self.in_header(opcode, parent_nodeid, name_len, None, caller);
-
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(name_buf),
-        };
+        let request = self.request(opcode, parent_nodeid, (), name_len, None, caller);
 
         self.transporter
-            .send::<_, ()>(request, Data::None)
+            .send::<_, ()>(request, Data::Out(name))
             .await?
-            .into_unit()
+            .into_struct()
     }
 
     pub async fn readlink(&self, nodeid: u64, caller: Caller) -> Result<String, FuseError> {
-        let fuse_in_header =
-            self.in_header(fuse_opcode::FUSE_READLINK.into(), nodeid, 0, None, caller);
-
-        let request: FuseRequest<()> = FuseRequest {
-            fuse_in_header,
-            fuse_in: None,
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_READLINK.into(),
+            nodeid,
+            (),
+            0,
+            None,
+            caller,
+        );
 
         let mut buf = vec![0u8; FUSE_READLINK_MAX];
 
@@ -961,23 +836,19 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_SYMLINK.into(),
-            parent_nodeid,
-            name_len + path_len,
-            None,
-            caller,
-        );
-
         let mut data = [0u8; FUSE_SYMLINK_MAX];
 
         data[..name_len].copy_from_slice(name);
         data[name_len..name_len + path_len].copy_from_slice(path);
 
-        let request: FuseRequest<()> = FuseRequest {
-            fuse_in_header,
-            fuse_in: None,
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_SYMLINK.into(),
+            parent_nodeid,
+            (),
+            name_len + path_len,
+            None,
+            caller,
+        );
 
         self.transporter
             .send(request, Data::Out(&data[..name_len + path_len]))
@@ -993,41 +864,31 @@ where
         new_name: CString,
         caller: Caller,
     ) -> Result<(), FuseError> {
-        const RENAME_IN_LEN: usize = mem::size_of::<fuse_rename_in>();
-
         let old = old_name.as_bytes_with_nul();
         let new = new_name.as_bytes_with_nul();
         if old.len() > NAME_MAX || new.len() > NAME_MAX {
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let extra = RENAME_IN_LEN + old.len() + new.len();
-        let fuse_in_header = self.in_header(
+        let mut names = [0u8; NAME_MAX * 2];
+        names[..old.len()].copy_from_slice(old);
+        names[old.len()..old.len() + new.len()].copy_from_slice(new);
+        let names = &names[..old.len() + new.len()];
+
+        let request = self.request(
             // switch to FUSE_RENAME2 if scheme starts accepting flags
             fuse_opcode::FUSE_RENAME.into(),
             old_parent,
-            extra,
+            fuse_rename_in { newdir: new_parent },
+            names.len(),
             None,
             caller,
         );
 
-        let rename_in = fuse_rename_in { newdir: new_parent };
-
-        let mut data = [0u8; RENAME_IN_LEN + NAME_MAX * 2];
-
-        data[..RENAME_IN_LEN].copy_from_slice(rename_in.as_bytes());
-        data[RENAME_IN_LEN..RENAME_IN_LEN + old.len()].copy_from_slice(old);
-        data[RENAME_IN_LEN + old.len()..RENAME_IN_LEN + old.len() + new.len()].copy_from_slice(new);
-
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(data),
-        };
-
         self.transporter
-            .send::<_, ()>(request, Data::None)
+            .send::<_, ()>(request, Data::Out(names))
             .await?
-            .into_unit()
+            .into_struct()
     }
 
     pub async fn link(
@@ -1043,22 +904,18 @@ where
             return Err(FuseError::Host(syscall::ENAMETOOLONG as i32));
         }
 
-        let fuse_in_header = self.in_header(
-            fuse_opcode::FUSE_LINK.into(),
-            new_parent,
-            mem::size_of::<fuse_link_in>() + name_len,
-            None,
-            caller,
-        );
-
         let fuse_in = fuse_link_in {
             oldnodeid: old_nodeid,
         };
 
-        let request = FuseRequest {
-            fuse_in_header,
-            fuse_in: Some(fuse_in),
-        };
+        let request = self.request(
+            fuse_opcode::FUSE_LINK.into(),
+            new_parent,
+            fuse_in,
+            name_len,
+            None,
+            caller,
+        );
 
         self.transporter
             .send(request, Data::Out(name))
