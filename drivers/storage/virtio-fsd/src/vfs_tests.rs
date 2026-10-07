@@ -4,7 +4,10 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use fuse_abi::linux::{fuse_attr, fuse_entry_out, fuse_opcode, fuse_open_out};
+use fuse_abi::linux::{
+    fuse_attr, fuse_attr_out, fuse_entry_out, fuse_opcode, fuse_open_out, fuse_statfs_out,
+    fuse_write_out,
+};
 use futures::executor::{LocalPool, block_on};
 use futures::task::LocalSpawnExt;
 use syscall::{ENOENT, ESTALE, MODE_DIR, MODE_FILE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR};
@@ -20,6 +23,8 @@ use crate::linux_abi;
 struct Mock {
     replies: Rc<RefCell<VecDeque<MockReply>>>,
     ops: Rc<RefCell<Vec<u32>>>,
+    // (opcode, header uid) of every request sent through `send`.
+    uids: Rc<RefCell<Vec<(u32, u32)>>>,
     yield_once: Rc<Cell<bool>>,
     // When set, the first `FUSE_READ` stays inside `send` until a second read enters.
     gate_reads: Rc<Cell<bool>>,
@@ -37,6 +42,7 @@ impl Mock {
         Self {
             replies: Rc::new(RefCell::new(replies.into_iter().collect())),
             ops: Rc::new(RefCell::new(Vec::new())),
+            uids: Rc::new(RefCell::new(Vec::new())),
             yield_once: Rc::new(Cell::new(false)),
             gate_reads: Rc::new(Cell::new(false)),
             reads_entered: Rc::new(Cell::new(0)),
@@ -139,6 +145,9 @@ impl FuseTransporter for Mock {
             }
         }
         self.ops.borrow_mut().push(opcode);
+        self.uids
+            .borrow_mut()
+            .push((opcode, request.fuse_in_header.uid));
         let reply = self
             .replies
             .borrow_mut()
@@ -415,7 +424,12 @@ fn symlink_rollback_drops_committed_dentry() {
     let (vfs, mock) = vfs_with([file(30, 1), MockReply::Unit]);
     mock.yield_once.set(true);
     let fd = vfs
-        .pre_create_symlink(FUSE_ROOT_ID, "link".into(), vec!["link".into()])
+        .pre_create_symlink(
+            FUSE_ROOT_ID,
+            "link".into(),
+            vec!["link".into()],
+            Caller::NONE,
+        )
         .unwrap();
     let vfs = Rc::new(vfs);
 
@@ -426,7 +440,7 @@ fn symlink_rollback_drops_committed_dentry() {
             let vfs = Rc::clone(&vfs);
             async move {
                 let err = vfs
-                    .write(fd, b"target", 0, O_RDWR as u32, Caller::NONE)
+                    .write(fd, b"target", 0, O_RDWR as u32)
                     .await
                     .expect_err("fd closed during symlink");
                 assert_eq!(err.errno, syscall::EBADF);
@@ -482,10 +496,7 @@ fn concurrent_reads_overlap_in_send() {
         spawner
             .spawn_local(async move {
                 let mut buf = [0u8; 8];
-                let n = vfs
-                    .read(fd, &mut buf, 0, O_RDONLY as u32, Caller::NONE)
-                    .await
-                    .unwrap();
+                let n = vfs.read(fd, &mut buf, 0, O_RDONLY as u32).await.unwrap();
                 assert_eq!(n, 8);
                 done.set(done.get() + 1);
             })
@@ -494,6 +505,116 @@ fn concurrent_reads_overlap_in_send() {
     pool.run();
     assert_eq!(done.get(), 2);
     assert!(mock.reads_entered.get() >= 2);
+}
+
+const OPENER: Caller = Caller {
+    uid: 1000,
+    gid: 1000,
+    pid: 7,
+};
+
+/// Opens a file as `OPENER`, runs `op` as another user and returns the uid of the single
+/// `opcode` request it sent. `reply` answers that request.
+fn uid_on_open_handle(
+    reply: MockReply,
+    opcode: fuse_opcode,
+    op: impl AsyncFnOnce(&Vfs<Mock>, usize, Caller),
+) -> u32 {
+    let other = Caller {
+        uid: 0,
+        gid: 0,
+        pid: 8,
+    };
+    // The trailing reply is for the RELEASE that `close` sends after FLUSH.
+    let (vfs, mock) = vfs_with([file(10, 1), bytes(&open_out(1)), reply, MockReply::Unit]);
+    block_on(async {
+        lookup(&vfs, "f").await;
+        let fd = vfs
+            .open(10, O_RDWR, false, vec!["f".into()], OPENER)
+            .await
+            .unwrap();
+        op(&vfs, fd, other).await;
+    });
+
+    let uids = mock.uids.borrow();
+    let mut sent = uids.iter().filter(|(op, _)| *op == u32::from(opcode));
+    let (_, uid) = sent.next().expect("request was not sent");
+    assert!(sent.next().is_none(), "request was sent more than once");
+    *uid
+}
+
+#[test]
+fn read_carries_the_opener() {
+    let uid = uid_on_open_handle(
+        MockReply::Bytes(vec![0xAB]),
+        fuse_opcode::FUSE_READ,
+        async |vfs, fd, _| {
+            vfs.read(fd, &mut [0u8; 1], 0, O_RDWR as u32).await.unwrap();
+        },
+    );
+    assert_eq!(uid, OPENER.uid);
+}
+
+#[test]
+fn write_carries_the_opener() {
+    let reply = bytes(&fuse_write_out {
+        size: 1,
+        padding: 0,
+    });
+    let uid = uid_on_open_handle(reply, fuse_opcode::FUSE_WRITE, async |vfs, fd, _| {
+        vfs.write(fd, b"x", 0, O_RDWR as u32).await.unwrap();
+    });
+    assert_eq!(uid, OPENER.uid);
+}
+
+#[test]
+fn ftruncate_carries_the_opener() {
+    let reply = bytes(&fuse_attr_out::default());
+    let uid = uid_on_open_handle(reply, fuse_opcode::FUSE_SETATTR, async |vfs, fd, _| {
+        vfs.ftruncate(fd, 0).await.unwrap();
+    });
+    assert_eq!(uid, OPENER.uid);
+}
+
+#[test]
+fn statfs_carries_the_opener() {
+    let reply = bytes(&fuse_statfs_out::default());
+    let uid = uid_on_open_handle(reply, fuse_opcode::FUSE_STATFS, async |vfs, fd, _| {
+        vfs.statfs(fd).await.unwrap();
+    });
+    assert_eq!(uid, OPENER.uid);
+}
+
+#[test]
+fn fsync_carries_the_opener() {
+    let uid = uid_on_open_handle(
+        MockReply::Unit,
+        fuse_opcode::FUSE_FSYNC,
+        async |vfs, fd, _| {
+            vfs.fsync(fd).await.unwrap();
+        },
+    );
+    assert_eq!(uid, OPENER.uid);
+}
+
+#[test]
+fn close_flush_carries_the_opener() {
+    let uid = uid_on_open_handle(
+        MockReply::Unit,
+        fuse_opcode::FUSE_FLUSH,
+        async |vfs, fd, other| vfs.close(fd, other).await,
+    );
+    assert_eq!(uid, OPENER.uid);
+}
+
+#[test]
+fn close_release_carries_the_opener() {
+    let uid = uid_on_open_handle(
+        MockReply::Unit,
+        fuse_opcode::FUSE_RELEASE,
+        async |vfs, fd, other| vfs.close(fd, other).await,
+    );
+    assert_eq!(uid, OPENER.uid);
 }
 
 #[test]

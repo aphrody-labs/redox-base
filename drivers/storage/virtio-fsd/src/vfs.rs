@@ -94,11 +94,14 @@ impl Dentry {
     }
 }
 
+// `caller` is who opened the handle. Requests on an open handle carry it instead of
+// whoever calls read/write later, since the fd may have been passed to another process.
 enum Handle {
     File {
         nodeid: u64,
         fh: u64,
         path: String,
+        caller: Caller,
     },
     Directory {
         nodeid: u64,
@@ -109,11 +112,13 @@ enum Handle {
     StatOnly {
         nodeid: u64,
         path: String,
+        caller: Caller,
     },
     Symlink {
         nodeid: u64,
         path: String,
         target: String,
+        caller: Caller,
     },
     /// Redox doesn't have a dedicated symlink creation scheme call,
     /// relibc splits that into a create plus a write.
@@ -121,10 +126,47 @@ enum Handle {
         parent_nodeid: u64,
         name: String,
         path: String,
+        caller: Caller,
     },
     SchemeRoot,
     #[cfg(feature = "lru-debug")]
     LruLog,
+}
+
+impl Handle {
+    fn opener(&self) -> Caller {
+        match self {
+            Handle::File { caller, .. }
+            | Handle::Directory { caller, .. }
+            | Handle::StatOnly { caller, .. }
+            | Handle::Symlink { caller, .. }
+            | Handle::SymlinkPreCreate { caller, .. } => *caller,
+            // The scheme root is opened by the daemon itself, so it has no opener.
+            Handle::SchemeRoot => Caller::NONE,
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => Caller::NONE,
+        }
+    }
+
+    fn nodeid(&self) -> Result<u64> {
+        match self {
+            Handle::File { nodeid, .. }
+            | Handle::Directory { nodeid, .. }
+            | Handle::StatOnly { nodeid, .. }
+            | Handle::Symlink { nodeid, .. } => Ok(*nodeid),
+            Handle::SchemeRoot => Ok(FUSE_ROOT_ID),
+            Handle::SymlinkPreCreate { .. } => Err(Error::new(EBADF)),
+            #[cfg(feature = "lru-debug")]
+            Handle::LruLog => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn fh(&self) -> Option<u64> {
+        match self {
+            Handle::File { fh, .. } | Handle::Directory { fh, .. } => Some(*fh),
+            _ => None,
+        }
+    }
 }
 
 struct VfsState {
@@ -349,6 +391,7 @@ impl VfsState {
         nodeid: u64,
         path: String,
         target: String,
+        caller: Caller,
     ) -> Result<()> {
         self.increment_fd_count(nodeid)?;
         match self.handles.get_mut(fd) {
@@ -357,6 +400,7 @@ impl VfsState {
                     nodeid,
                     path,
                     target,
+                    caller,
                 };
                 Ok(())
             }
@@ -750,6 +794,7 @@ impl<T: FuseTransporter> Vfs<T> {
                     nodeid,
                     fh,
                     path: path.join("/"),
+                    caller,
                 }))
             }
         };
@@ -815,13 +860,14 @@ impl<T: FuseTransporter> Vfs<T> {
                     nodeid,
                     fh,
                     path: path.join("/"),
+                    caller,
                 }
             };
             g.handles.insert(handle)
         };
 
         if trunc && !atomic_trunc {
-            if let Err(err) = self.ftruncate(fd, 0, caller).await {
+            if let Err(err) = self.ftruncate(fd, 0).await {
                 self.close(fd, caller).await;
                 return Err(err);
             }
@@ -832,8 +878,8 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(fd)
     }
 
-    pub async fn getattr(&self, fd: usize, caller: Caller) -> Result<fuse_attr> {
-        let (nodeid, fh) = {
+    pub async fn getattr(&self, fd: usize) -> Result<fuse_attr> {
+        let (nodeid, fh, caller) = {
             let g = self.state.borrow();
             #[cfg(feature = "lru-debug")]
             if matches!(g.handles.get(fd)?, Handle::LruLog) {
@@ -844,16 +890,8 @@ impl<T: FuseTransporter> Vfs<T> {
                     ..fuse_attr::default()
                 });
             }
-            match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
-                    (*nodeid, Some(*fh))
-                }
-                Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
-                Handle::SchemeRoot => (FUSE_ROOT_ID, None),
-                Handle::SymlinkPreCreate { .. } => return Err(Error::new(EBADF)),
-                #[cfg(feature = "lru-debug")]
-                Handle::LruLog => unreachable!("handled above"),
-            }
+            let handle = g.handles.get(fd)?;
+            (handle.nodeid()?, handle.fh(), handle.opener())
         };
 
         let _pin = self.pin(nodeid)?;
@@ -893,8 +931,12 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(payload.attr)
     }
 
-    pub async fn statfs(&self, fd: usize, caller: Caller) -> Result<fuse_kstatfs> {
-        let nodeid = self.get_inode(fd)?;
+    pub async fn statfs(&self, fd: usize) -> Result<fuse_kstatfs> {
+        let (nodeid, caller) = {
+            let g = self.state.borrow();
+            let handle = g.handles.get(fd)?;
+            (handle.nodeid()?, handle.opener())
+        };
         let _pin = self.pin(nodeid)?;
 
         Ok(self
@@ -911,11 +953,10 @@ impl<T: FuseTransporter> Vfs<T> {
         buf: &mut [u8],
         offset: u64,
         fcntl_flags: u32,
-        caller: Caller,
     ) -> Result<usize> {
         let can_read = matches!(fcntl_flags as usize & O_ACCMODE, O_RDONLY | O_RDWR);
 
-        let (nodeid, fh) = {
+        let (nodeid, fh, caller) = {
             let g = self.state.borrow();
             #[cfg(feature = "lru-debug")]
             if matches!(g.handles.get(fd)?, Handle::LruLog) {
@@ -932,14 +973,16 @@ impl<T: FuseTransporter> Vfs<T> {
                 return Ok(n);
             }
             match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } => {
+                Handle::File {
+                    nodeid, fh, caller, ..
+                } => {
                     if !can_read {
                         return Err(Error::new(EBADF));
                     }
                     if buf.is_empty() {
                         return Ok(0);
                     }
-                    (*nodeid, *fh)
+                    (*nodeid, *fh, *caller)
                 }
                 Handle::Symlink { target, .. } => {
                     if !can_read {
@@ -986,7 +1029,6 @@ impl<T: FuseTransporter> Vfs<T> {
         buf: &[u8],
         offset: u64,
         fcntl_flags: u32,
-        caller: Caller,
     ) -> Result<usize> {
         let can_write = matches!(fcntl_flags as usize & O_ACCMODE, O_WRONLY | O_RDWR);
 
@@ -1002,22 +1044,31 @@ impl<T: FuseTransporter> Vfs<T> {
             },
         }
 
-        let target = {
+        let (target, caller) = {
             let g = self.state.borrow();
             match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } => WriteTarget::File {
-                    nodeid: *nodeid,
-                    fh: *fh,
-                },
+                Handle::File {
+                    nodeid, fh, caller, ..
+                } => (
+                    WriteTarget::File {
+                        nodeid: *nodeid,
+                        fh: *fh,
+                    },
+                    *caller,
+                ),
                 Handle::SymlinkPreCreate {
                     parent_nodeid,
                     name,
                     path,
-                } => WriteTarget::SymLink {
-                    parent_nodeid: *parent_nodeid,
-                    name: name.clone(),
-                    path: path.clone(),
-                },
+                    caller,
+                } => (
+                    WriteTarget::SymLink {
+                        parent_nodeid: *parent_nodeid,
+                        name: name.clone(),
+                        path: path.clone(),
+                    },
+                    *caller,
+                ),
                 Handle::Directory { .. } => return Err(Error::new(EISDIR)),
                 Handle::Symlink { .. } | Handle::StatOnly { .. } | Handle::SchemeRoot => {
                     return Err(Error::new(EBADF));
@@ -1097,9 +1148,10 @@ impl<T: FuseTransporter> Vfs<T> {
                         Err(err)
                     } else {
                         g.invalidate_attr(parent_nodeid);
-                        g.commit_symlink(fd, nodeid, path, target).inspect_err(|_| {
-                            g.unmerge_entry(parent_nodeid, &name, nodeid);
-                        })
+                        g.commit_symlink(fd, nodeid, path, target, caller)
+                            .inspect_err(|_| {
+                                g.unmerge_entry(parent_nodeid, &name, nodeid);
+                            })
                     }
                 };
                 if let Err(err) = merged {
@@ -1114,12 +1166,16 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    pub async fn fsync(&self, fd: usize, caller: Caller) -> Result<()> {
-        let (nodeid, fh, is_dir) = {
+    pub async fn fsync(&self, fd: usize) -> Result<()> {
+        let (nodeid, fh, is_dir, caller) = {
             let g = self.state.borrow();
             match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } => (*nodeid, *fh, false),
-                Handle::Directory { nodeid, fh, .. } => (*nodeid, *fh, true),
+                Handle::File {
+                    nodeid, fh, caller, ..
+                } => (*nodeid, *fh, false, *caller),
+                Handle::Directory {
+                    nodeid, fh, caller, ..
+                } => (*nodeid, *fh, true, *caller),
                 _ => {
                     warn!("virtio-fsd: fsync is called on an invalid fd: {fd}");
                     return Err(Error::new(EBADF));
@@ -1153,11 +1209,13 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(())
     }
 
-    pub async fn ftruncate(&self, fd: usize, len: u64, caller: Caller) -> Result<()> {
-        let (nodeid, fh) = {
+    pub async fn ftruncate(&self, fd: usize, len: u64) -> Result<()> {
+        let (nodeid, fh, caller) = {
             let g = self.state.borrow();
             match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } => (*nodeid, Some(*fh)),
+                Handle::File {
+                    nodeid, fh, caller, ..
+                } => (*nodeid, Some(*fh), *caller),
                 Handle::Directory { .. } => return Err(Error::new(EISDIR)),
                 _ => return Err(Error::new(EBADF)),
             }
@@ -1182,13 +1240,8 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let (nodeid, fh) = {
             let g = self.state.borrow();
-            match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
-                    (*nodeid, Some(*fh))
-                }
-                Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
-                _ => return Err(Error::new(EBADF)),
-            }
+            let handle = g.handles.get(fd)?;
+            (handle.nodeid()?, handle.fh())
         };
 
         let mut fuse_in = fuse_setattr_in::default();
@@ -1208,13 +1261,8 @@ impl<T: FuseTransporter> Vfs<T> {
     pub async fn fchmod(&self, fd: usize, new_mode: u16, caller: Caller) -> Result<()> {
         let (nodeid, fh, type_bits) = {
             let g = self.state.borrow();
-            let (nodeid, fh) = match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
-                    (*nodeid, Some(*fh))
-                }
-                Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
-                _ => return Err(Error::new(EBADF)),
-            };
+            let handle = g.handles.get(fd)?;
+            let (nodeid, fh) = (handle.nodeid()?, handle.fh());
             let type_bits = g
                 .inodes
                 .get(&nodeid)
@@ -1239,13 +1287,8 @@ impl<T: FuseTransporter> Vfs<T> {
     pub async fn fchown(&self, fd: usize, uid: u32, gid: u32, caller: Caller) -> Result<()> {
         let (nodeid, fh) = {
             let g = self.state.borrow();
-            match g.handles.get(fd)? {
-                Handle::File { nodeid, fh, .. } | Handle::Directory { nodeid, fh, .. } => {
-                    (*nodeid, Some(*fh))
-                }
-                Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => (*nodeid, None),
-                _ => return Err(Error::new(EBADF)),
-            }
+            let handle = g.handles.get(fd)?;
+            (handle.nodeid()?, handle.fh())
         };
 
         let mut fuse_in = fuse_setattr_in::default();
@@ -1273,17 +1316,27 @@ impl<T: FuseTransporter> Vfs<T> {
         let handle = self.state.borrow_mut().handles.remove(fd);
         match handle {
             Some(handle) => match handle {
-                Handle::File { nodeid, fh, .. } => {
-                    if let Err(err) = self.fuse.flush(nodeid, fh, caller).await {
+                Handle::File {
+                    nodeid,
+                    fh,
+                    caller: opener,
+                    ..
+                } => {
+                    if let Err(err) = self.fuse.flush(nodeid, fh, opener).await {
                         warn!("virtio-fsd: FUSE_FLUSH: {err}");
                     }
-                    if let Err(err) = self.fuse.release(nodeid, fh, false, caller).await {
+                    if let Err(err) = self.fuse.release(nodeid, fh, false, opener).await {
                         warn!("virtio-fsd: FUSE_RELEASE: {err}");
                     }
                     self.state.borrow_mut().decrement_fd_count(nodeid);
                 }
-                Handle::Directory { nodeid, fh, .. } => {
-                    if let Err(err) = self.fuse.release(nodeid, fh, true, caller).await {
+                Handle::Directory {
+                    nodeid,
+                    fh,
+                    caller: opener,
+                    ..
+                } => {
+                    if let Err(err) = self.fuse.release(nodeid, fh, true, opener).await {
                         warn!("virtio-fsd: FUSE_RELEASE: {err}");
                     }
                     self.state.borrow_mut().decrement_fd_count(nodeid);
@@ -1417,7 +1470,7 @@ impl<T: FuseTransporter> Vfs<T> {
                     let mode = g.inode_mode(*nodeid)?;
                     Ok((*nodeid, mode, path_components(path)))
                 }
-                Handle::StatOnly { nodeid, path } => {
+                Handle::StatOnly { nodeid, path, .. } => {
                     let mode = g.inode_mode(*nodeid)?;
                     if mode != MODE_DIR {
                         return Err(Error::new(ENOTDIR));
@@ -1597,7 +1650,7 @@ impl<T: FuseTransporter> Vfs<T> {
             match g.handles.get(fd)? {
                 Handle::File { nodeid, path, .. }
                 | Handle::Directory { nodeid, path, .. }
-                | Handle::StatOnly { nodeid, path }
+                | Handle::StatOnly { nodeid, path, .. }
                 | Handle::Symlink { nodeid, path, .. } => (*nodeid, path.clone()),
                 _ => return Err(Error::new(EBADF)),
             }
@@ -1755,18 +1808,7 @@ impl<T: FuseTransporter> Vfs<T> {
     }
 
     pub fn get_inode(&self, fd: usize) -> Result<u64> {
-        let g = self.state.borrow();
-        let nodeid = match g.handles.get(fd)? {
-            Handle::File { nodeid, .. }
-            | Handle::Directory { nodeid, .. }
-            | Handle::StatOnly { nodeid, .. }
-            | Handle::Symlink { nodeid, .. } => *nodeid,
-            Handle::SchemeRoot => FUSE_ROOT_ID,
-            Handle::SymlinkPreCreate { .. } => return Err(Error::new(EBADF)),
-            #[cfg(feature = "lru-debug")]
-            Handle::LruLog => return Err(Error::new(EBADF)),
-        };
-        Ok(nodeid)
+        self.state.borrow().handles.get(fd)?.nodeid()
     }
 
     pub fn get_path(&self, fd: usize) -> Result<String> {
@@ -1783,22 +1825,35 @@ impl<T: FuseTransporter> Vfs<T> {
         }
     }
 
-    pub fn insert_stat_only(&self, nodeid: u64, path: Vec<String>) -> Result<usize> {
+    pub fn insert_stat_only(
+        &self,
+        nodeid: u64,
+        path: Vec<String>,
+        caller: Caller,
+    ) -> Result<usize> {
         let mut g = self.state.borrow_mut();
         g.increment_fd_count(nodeid)?;
         Ok(g.handles.insert(Handle::StatOnly {
             nodeid,
             path: path.join("/"),
+            caller,
         }))
     }
 
-    pub fn insert_symlink(&self, nodeid: u64, path: Vec<String>, target: String) -> Result<usize> {
+    pub fn insert_symlink(
+        &self,
+        nodeid: u64,
+        path: Vec<String>,
+        target: String,
+        caller: Caller,
+    ) -> Result<usize> {
         let mut g = self.state.borrow_mut();
         g.increment_fd_count(nodeid)?;
         Ok(g.handles.insert(Handle::Symlink {
             nodeid,
             path: path.join("/"),
             target,
+            caller,
         }))
     }
 
@@ -1807,6 +1862,7 @@ impl<T: FuseTransporter> Vfs<T> {
         parent_nodeid: u64,
         name: String,
         path: Vec<String>,
+        caller: Caller,
     ) -> Result<usize> {
         Ok(self
             .state
@@ -1816,6 +1872,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 parent_nodeid,
                 name,
                 path: path.join("/"),
+                caller,
             }))
     }
 }

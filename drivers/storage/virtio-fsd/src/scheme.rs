@@ -253,7 +253,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
             if o_symlink {
                 let fd = self
                     .vfs
-                    .pre_create_symlink(walk.nodeid, name, walk.rel_path)?;
+                    .pre_create_symlink(walk.nodeid, name, walk.rel_path, caller)?;
                 return Ok(OpenResult::ThisScheme {
                     number: fd,
                     flags: NewFdFlags::POSITIONED,
@@ -290,7 +290,9 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         }
 
         if o_stat {
-            let fd = self.vfs.insert_stat_only(walk.nodeid, walk.rel_path)?;
+            let fd = self
+                .vfs
+                .insert_stat_only(walk.nodeid, walk.rel_path, caller)?;
             return Ok(OpenResult::ThisScheme {
                 number: fd,
                 flags: NewFdFlags::POSITIONED,
@@ -301,7 +303,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
             let target = self.vfs.readlink(walk.nodeid, caller).await?;
             let fd = self
                 .vfs
-                .insert_symlink(walk.nodeid, walk.rel_path, target)?;
+                .insert_symlink(walk.nodeid, walk.rel_path, target, caller)?;
             return Ok(OpenResult::ThisScheme {
                 number: fd,
                 flags: NewFdFlags::POSITIONED,
@@ -354,11 +356,9 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         buf: &mut [u8],
         offset: u64,
         fcntl_flags: u32,
-        ctx: &CallerCtx,
+        _ctx: &CallerCtx,
     ) -> Result<usize> {
-        self.vfs
-            .read(id, buf, offset, fcntl_flags, caller(ctx))
-            .await
+        self.vfs.read(id, buf, offset, fcntl_flags).await
     }
 
     async fn write(
@@ -367,15 +367,13 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         buf: &[u8],
         offset: u64,
         fcntl_flags: u32,
-        ctx: &CallerCtx,
+        _ctx: &CallerCtx,
     ) -> Result<usize> {
-        self.vfs
-            .write(id, buf, offset, fcntl_flags, caller(ctx))
-            .await
+        self.vfs.write(id, buf, offset, fcntl_flags).await
     }
 
-    async fn fsize(&mut self, id: usize, ctx: &CallerCtx) -> Result<u64> {
-        Ok(self.vfs.getattr(id, caller(ctx)).await?.size)
+    async fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> Result<u64> {
+        Ok(self.vfs.getattr(id).await?.size)
     }
 
     async fn fchmod(&mut self, id: usize, new_mode: u16, ctx: &CallerCtx) -> Result<()> {
@@ -441,8 +439,8 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         Ok(0)
     }
 
-    async fn fstat(&mut self, id: usize, stat: &mut Stat, ctx: &CallerCtx) -> Result<()> {
-        let attrs = self.vfs.getattr(id, caller(ctx)).await?;
+    async fn fstat(&mut self, id: usize, stat: &mut Stat, _ctx: &CallerCtx) -> Result<()> {
+        let attrs = self.vfs.getattr(id).await?;
 
         *stat = Stat {
             // the device ID of the filesystem itself. we are the filesystem, so we just invent a unique id.
@@ -469,8 +467,8 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         return Ok(());
     }
 
-    async fn fstatvfs(&mut self, id: usize, stat: &mut StatVfs, ctx: &CallerCtx) -> Result<()> {
-        let k = self.vfs.statfs(id, caller(ctx)).await?;
+    async fn fstatvfs(&mut self, id: usize, stat: &mut StatVfs, _ctx: &CallerCtx) -> Result<()> {
+        let k = self.vfs.statfs(id).await?;
         let bsize = if k.bsize != 0 { k.bsize } else { k.frsize };
 
         *stat = StatVfs {
@@ -483,12 +481,12 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         Ok(())
     }
 
-    async fn fsync(&mut self, id: usize, ctx: &CallerCtx) -> Result<()> {
-        self.vfs.fsync(id, caller(ctx)).await
+    async fn fsync(&mut self, id: usize, _ctx: &CallerCtx) -> Result<()> {
+        self.vfs.fsync(id).await
     }
 
-    async fn ftruncate(&mut self, id: usize, len: u64, ctx: &CallerCtx) -> Result<()> {
-        self.vfs.ftruncate(id, len, caller(ctx)).await
+    async fn ftruncate(&mut self, id: usize, len: u64, _ctx: &CallerCtx) -> Result<()> {
+        self.vfs.ftruncate(id, len).await
     }
 
     async fn futimens(&mut self, id: usize, times: &[TimeSpec], ctx: &CallerCtx) -> Result<()> {
