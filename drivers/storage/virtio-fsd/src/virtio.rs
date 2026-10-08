@@ -159,15 +159,16 @@ impl<'a> VirtioFsSession {
         Ok(self.request_queues[i].send(chain).await)
     }
 
-    /// Appends `request` to `chain`. The header and body occupy one page.
-    /// `out` follows in the leftover space when it fits, and in its own
-    /// DMA buffer if it doesn't fit in the page.
-    fn chain_request<I: IntoBytes + Immutable>(
+    /// Appends `request` to a new `chain`. The header and body occupy one page.
+    /// `out` follows in the leftover space when it fits, and in its own DMA
+    ///  buffer if it doesn't fit in the page.
+    fn chained_request<I: IntoBytes + Immutable>(
         &self,
-        chain: ChainBuilder,
         request: &FuseRequest<I>,
         out: &[u8],
     ) -> Result<ChainBuilder, FuseError> {
+        let chain = ChainBuilder::new();
+
         let mut page = self.dma_pool.lease().ok_or(FuseError::OutOfMemory)?;
 
         let header = request.fuse_in_header.as_bytes();
@@ -210,7 +211,7 @@ impl FuseTransporter for VirtioFsSession {
             Data::Out(bytes) => *bytes,
             _ => &[],
         };
-        let mut chain = self.chain_request(ChainBuilder::new(), &request, out)?;
+        let mut chain = self.chained_request(&request, out)?;
         let rx_page = self.dma_pool.lease().ok_or(FuseError::OutOfMemory)?;
         let rx_len = size_of::<fuse_out_header>() + size_of::<O>();
         if rx_len > rx_page.len() {
@@ -251,9 +252,7 @@ impl FuseTransporter for VirtioFsSession {
     where
         I: IntoBytes + Immutable,
     {
-        let chain = self
-            .chain_request(ChainBuilder::new(), &request, &[])?
-            .build();
+        let chain = self.chained_request(&request, &[])?.build();
 
         // dropping the completed chain returns the page to the pool
         self.hiprio_queue.send(chain).await;
