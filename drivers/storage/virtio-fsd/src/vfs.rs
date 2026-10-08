@@ -68,8 +68,9 @@ struct Inode {
     child_count: u64,
     pin_count: u64,
     used: u64,
-    /// Shared for reads, exclusive for writes. Held across the whole chunk
-    /// loop so a write cannot interleave with other I/O on this inode.
+    /// Shared for reads, exclusive for writes. Held for the whole call so a
+    /// write cannot interleave with other I/O on this inode, and so the
+    /// `O_APPEND` getattr-then-write sequence is atomic.
     io_lock: Rc<RwLock<()>>,
 }
 

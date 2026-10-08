@@ -445,9 +445,7 @@ where
             .into_struct()
     }
 
-    /// Chunked at `max_read`. `Vfs` holds a shared per-inode lock for the whole
-    /// call, so these chunks stay ordered for this read. Other reads of the
-    /// same inode may interleave but a write cannot.
+    /// Issues a single `FUSE_READ` for at most `max_read_len()` bytes of `buf`.
     pub async fn read(
         &self,
         nodeid: u64,
@@ -458,43 +456,16 @@ where
         flags: u32,
         caller: Caller,
     ) -> Result<usize, FuseError> {
-        let max = self.max_read_len();
-        let mut done = 0;
-        while done < buf.len() {
-            let n = (buf.len() - done).min(max);
-            let got = self
-                .read_one(
-                    nodeid,
-                    fh,
-                    offset + done as u64,
-                    &mut buf[done..done + n],
-                    read_flags,
-                    flags,
-                    caller,
-                )
-                .await?;
-            done += got;
-            if got < n {
-                break;
-            }
+        if buf.is_empty() {
+            return Ok(0);
         }
-        Ok(done)
-    }
+        let n = buf.len().min(self.max_read_len());
+        let buf = &mut buf[..n];
 
-    async fn read_one(
-        &self,
-        nodeid: u64,
-        fh: u64,
-        offset: u64,
-        buf: &mut [u8],
-        read_flags: u32,
-        flags: u32,
-        caller: Caller,
-    ) -> Result<usize, FuseError> {
         let fuse_in = fuse_read_in {
             fh,
             offset,
-            size: buf.len() as u32,
+            size: n as u32,
             read_flags,
             lock_owner: 0,
             flags,
@@ -516,8 +487,7 @@ where
             .into_size()
     }
 
-    /// Chunked at `max_write`. `Vfs` holds an exclusive per-inode lock for the
-    /// whole call, so these chunks cannot interleave with other I/O on this inode.
+    /// Issues a single `FUSE_WRITE` for at most `max_write_len()` bytes of `data`.
     pub async fn write(
         &self,
         nodeid: u64,
@@ -528,47 +498,15 @@ where
         flags: u32,
         caller: Caller,
     ) -> Result<fuse_write_out, FuseError> {
-        let max = self.max_write_len();
-        let mut done = 0u32;
-        while (done as usize) < data.len() {
-            let rest = &data[done as usize..];
-            let n = rest.len().min(max);
-            let out = self
-                .write_one(
-                    nodeid,
-                    fh,
-                    offset + u64::from(done),
-                    &rest[..n],
-                    write_flags,
-                    flags,
-                    caller,
-                )
-                .await?;
-            if out.size == 0 {
-                break;
-            }
-            done = done.saturating_add(out.size);
-            if (out.size as usize) < n {
-                break;
-            }
+        if data.is_empty() {
+            return Ok(fuse_write_out {
+                size: 0,
+                padding: 0,
+            });
         }
-        Ok(fuse_write_out {
-            size: done,
-            padding: 0,
-        })
-    }
+        let size = data.len().min(self.max_write_len());
+        let data = &data[..size];
 
-    async fn write_one(
-        &self,
-        nodeid: u64,
-        fh: u64,
-        offset: u64,
-        data: &[u8],
-        write_flags: u32,
-        flags: u32,
-        caller: Caller,
-    ) -> Result<fuse_write_out, FuseError> {
-        let size = data.len();
         let fuse_in = fuse_write_in {
             fh,
             offset,

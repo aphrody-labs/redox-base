@@ -20,6 +20,7 @@ pub fn cases() -> Vec<TestCase> {
         func io_chunked_unaligned,
         func io_chunked_overwrite_span,
         func io_chunked_read_span,
+        func io_short_count_retry,
         func io_read_past_eof,
         func io_seek_end_empty,
         func io_seek_end_matches_len,
@@ -111,7 +112,9 @@ fn io_patterned(len: usize) -> Vec<u8> {
 }
 
 fn io_chunked_write_read(ctx: &TestCtx) -> Outcome {
-    // Bigger than virtiofsd's usual 1 MiB max_write / 128 KiB max_pages.
+    // Bigger than virtiofsd's usual 1 MiB max_write / 128 KiB max_pages. The
+    // driver sends one capped FUSE request per call and returns a short count,
+    // so `write_all` / `read_exact` must retry the remainder.
     let len = 2 * 1024 * 1024 + 4097;
     let path = ctx.work("io_chunk.bin");
     let data = io_patterned(len);
@@ -159,6 +162,43 @@ fn io_chunked_read_span(ctx: &TestCtx) -> Outcome {
     let got = check_ok!(fsutil::read_exact_at(&mut f, at as u64, n));
     check_eq!(got.as_slice(), &data[at..at + n]);
     Outcome::Pass
+}
+
+// Single raw pwrite/pread calls (no std retry loop): each may return fewer
+// bytes than asked, never zero or more than asked, and retrying the remainder
+// must reproduce the data.
+fn io_short_count_retry(ctx: &TestCtx) -> Outcome {
+    let len = 2 * 1024 * 1024 + 4097;
+    let path = ctx.work("io_short_retry.bin");
+    let data = io_patterned(len);
+    let f = check_ok!(fsutil::create_rw(&path));
+
+    let (mut off, mut writes) = (0, 0);
+    while off < len {
+        let n = check_ok!(fsutil::pwrite(&f, off as u64, &data[off..]));
+        check!(
+            n > 0 && n <= len - off,
+            "pwrite at {off} returned {n}, asked {}",
+            len - off
+        );
+        off += n;
+        writes += 1;
+    }
+
+    let mut got = Vec::with_capacity(len);
+    let mut reads = 0;
+    while got.len() < len {
+        let chunk = check_ok!(fsutil::pread(&f, got.len() as u64, len - got.len()));
+        check!(
+            !chunk.is_empty(),
+            "pread at {} hit EOF early (want {len})",
+            got.len()
+        );
+        got.extend_from_slice(&chunk);
+        reads += 1;
+    }
+    check!(got == data, "short-count retry mismatch");
+    Outcome::PassNote(format!("{writes} writes, {reads} reads"))
 }
 
 fn io_read_past_eof(ctx: &TestCtx) -> Outcome {

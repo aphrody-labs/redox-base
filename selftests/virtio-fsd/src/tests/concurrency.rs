@@ -16,7 +16,9 @@ pub fn cases() -> Vec<TestCase> {
     ]
 }
 
-// Larger than a typical `max_write` so the session chunk loop actually runs.
+// Must stay within the host's `max_write` (virtiofsd default 1 MiB): the driver
+// sends one FUSE_WRITE per call, so a write larger than that would be split by
+// the caller's retry loop and no longer be atomic against other writers.
 const CHUNK: usize = 64 * 1024;
 
 fn join_ok<A, B, E: std::fmt::Display>(
