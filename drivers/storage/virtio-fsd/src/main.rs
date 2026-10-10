@@ -5,7 +5,7 @@ use log::{info, warn};
 use pcid_interface::PciFunctionHandle;
 use redox_path::RedoxScheme;
 use redox_scheme::Socket;
-use redox_scheme::scheme::register_async_scheme;
+use redox_scheme::scheme::{SchemeAsync, register_scheme_inner};
 
 use crate::fuse::{FuseSession, FuseTransporter};
 use crate::scheme::VirtioFsScheme;
@@ -58,6 +58,7 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         "virtio-fsd: tag {tag:?} is not usable as a scheme name (ASCII only, no NUL, '/' or ':')."
     );
     let scheme_name = format!("virtio-fsd.{tag}");
+    let debug_scheme_name = format!("virtio-fsd-debug.{tag}");
 
     // FUSE
 
@@ -68,13 +69,14 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         }
     };
 
-    scheme_start(daemon, fuse_session, &scheme_name);
+    scheme_start(daemon, fuse_session, &scheme_name, &debug_scheme_name);
 }
 
 fn scheme_start<T: FuseTransporter + 'static>(
     daemon: daemon::Daemon,
     fuse_session: FuseSession<T>,
     scheme_name: &str,
+    debug_scheme_name: &str,
 ) -> ! {
     // Socket must be non-blocking since `scheme.tick()` drains
     // until EAGAIN, then it runs the batch.
@@ -96,12 +98,31 @@ fn scheme_start<T: FuseTransporter + 'static>(
         .expect("virtio-fsd: failed to subscribe to the event queue.");
 
     let vfs = Vfs::new(fuse_session);
-    let mut scheme = VirtioFsScheme::new(Arc::clone(&scheme_file), vfs, scheme_name);
+    let mut scheme = VirtioFsScheme::new(
+        Arc::clone(&scheme_file),
+        vfs,
+        scheme_name,
+        debug_scheme_name,
+    );
 
-    register_async_scheme(scheme_file.as_ref(), scheme_name, &mut scheme)
-        .unwrap_or_else(|err| panic!("virtio-fsd: can't register scheme {scheme_name}: {err}"));
+    register_scheme_inner(
+        scheme_file.as_ref(),
+        scheme_name,
+        scheme
+            .scheme_root()
+            .expect("virtio-fsd: failed to get scheme root"),
+    )
+    .unwrap_or_else(|err| panic!("virtio-fsd: can't register scheme {scheme_name}: {err}"));
+
+    register_scheme_inner(
+        scheme_file.as_ref(),
+        debug_scheme_name,
+        scheme.debug_scheme_root(),
+    )
+    .unwrap_or_else(|err| panic!("virtio-fsd: can't register scheme {debug_scheme_name}: {err}"));
 
     info!("virtio-fsd: Share is available at '/scheme/{scheme_name}'.");
+    info!("virtio-fsd: Debug nodes are available at '/scheme/{debug_scheme_name}'.");
 
     daemon.ready();
 

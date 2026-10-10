@@ -31,6 +31,9 @@ pub struct Config {
 
     #[arg(skip)]
     pub root: PathBuf,
+
+    #[arg(skip)]
+    pub debug_root: PathBuf,
 }
 
 impl Deref for Config {
@@ -67,6 +70,7 @@ impl Config {
         };
 
         cfg.root = PathBuf::from(format!("/scheme/virtio-fsd.{}", cfg.share_tag));
+        cfg.debug_root = PathBuf::from(format!("/scheme/virtio-fsd-debug.{}", cfg.share_tag));
 
         if let Ok(v) = env::var("VIRTIO_FSD_SELFTEST_THREADS") {
             if let Ok(n) = v.parse() {

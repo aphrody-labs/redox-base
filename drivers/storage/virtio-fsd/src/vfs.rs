@@ -41,12 +41,8 @@ const INODES_MAX_LEN: usize = 8;
 const SYMLOOP_MAX: u32 = 40;
 const FORGET_QUEUE_MIN_CAP: usize = 1024;
 
-#[cfg(feature = "lru-debug")]
-const EVICT_LOG_CAP: usize = 8192;
-
-#[cfg(feature = "lru-debug")]
-/// Debug node at the scheme root: one evicted dcache name per line, LRU order.
-pub const LRU_EVICTED_NAME: &str = ".lru_evicted";
+const LRU_EVICT_LOG_CAP: usize = 8192;
+pub const LRU_DEBUG_EVICTED_NAME: &str = "lru_evicted";
 
 pub struct WalkResult {
     pub nodeid: u64,
@@ -130,7 +126,9 @@ enum Handle {
         caller: Caller,
     },
     SchemeRoot,
-    #[cfg(feature = "lru-debug")]
+    /// Root of the debug scheme. It only contains the synthetic debug nodes
+    /// and never reaches the FUSE filesystem.
+    DebugRoot,
     LruLog,
 }
 
@@ -143,9 +141,7 @@ impl Handle {
             | Handle::Symlink { caller, .. }
             | Handle::SymlinkPreCreate { caller, .. } => *caller,
             // The scheme root is opened by the daemon itself, so it has no opener.
-            Handle::SchemeRoot => Caller::NONE,
-            #[cfg(feature = "lru-debug")]
-            Handle::LruLog => Caller::NONE,
+            Handle::SchemeRoot | Handle::DebugRoot | Handle::LruLog => Caller::NONE,
         }
     }
 
@@ -156,9 +152,9 @@ impl Handle {
             | Handle::StatOnly { nodeid, .. }
             | Handle::Symlink { nodeid, .. } => Ok(*nodeid),
             Handle::SchemeRoot => Ok(FUSE_ROOT_ID),
-            Handle::SymlinkPreCreate { .. } => Err(Error::new(EBADF)),
-            #[cfg(feature = "lru-debug")]
-            Handle::LruLog => Err(Error::new(EBADF)),
+            Handle::SymlinkPreCreate { .. } | Handle::DebugRoot | Handle::LruLog => {
+                Err(Error::new(EBADF))
+            }
         }
     }
 
@@ -178,8 +174,7 @@ struct VfsState {
     handles: HandleMap<Handle>,
     forget_queue: VecDeque<(u64, u64)>,
     next_used: u64,
-    #[cfg(feature = "lru-debug")]
-    evicted_names: Vec<String>,
+    evicted_names: VecDeque<String>,
 }
 
 pub struct Vfs<T: FuseTransporter> {
@@ -448,11 +443,22 @@ impl VfsState {
         Some(dentry.nodeid)
     }
 
-    #[cfg(feature = "lru-debug")]
     fn dcache_name(&self, nodeid: u64) -> Option<String> {
         self.dentry_index
             .get(&nodeid)
             .and_then(|set| set.iter().next().map(|(_, name)| name.clone()))
+    }
+
+    /// The eviction log as served by `lru_evicted`: one name per line.
+    fn eviction_log(&self) -> String {
+        let mut log = String::new();
+        for (i, name) in self.evicted_names.iter().enumerate() {
+            if i > 0 {
+                log.push('\n');
+            }
+            log.push_str(name);
+        }
+        log
     }
 
     fn refresh_attr(&mut self, nodeid: u64, payload: fuse_attr_out) -> u16 {
@@ -496,14 +502,11 @@ impl VfsState {
         if nodeid == FUSE_ROOT_ID {
             return;
         }
-        #[cfg(feature = "lru-debug")]
-        {
-            if let Some(name) = self.dcache_name(nodeid) {
-                if self.evicted_names.len() >= EVICT_LOG_CAP {
-                    self.evicted_names.remove(0);
-                }
-                self.evicted_names.push(name);
+        if let Some(name) = self.dcache_name(nodeid) {
+            if self.evicted_names.len() >= LRU_EVICT_LOG_CAP {
+                self.evicted_names.pop_front();
             }
+            self.evicted_names.push_back(name);
         }
 
         let Some(inode) = self.inodes.remove(&nodeid) else {
@@ -615,8 +618,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 handles: HandleMap::new(),
                 forget_queue: VecDeque::with_capacity(FORGET_QUEUE_MIN_CAP),
                 next_used: 0,
-                #[cfg(feature = "lru-debug")]
-                evicted_names: Vec::new(),
+                evicted_names: VecDeque::new(),
             }),
         }
     }
@@ -882,11 +884,10 @@ impl<T: FuseTransporter> Vfs<T> {
     pub async fn getattr(&self, fd: usize) -> Result<fuse_attr> {
         let (nodeid, fh, caller) = {
             let g = self.state.borrow();
-            #[cfg(feature = "lru-debug")]
             if matches!(g.handles.get(fd)?, Handle::LruLog) {
                 return Ok(fuse_attr {
                     ino: 0,
-                    size: g.evicted_names.join("\n").len() as u64,
+                    size: g.eviction_log().len() as u64,
                     mode: 0o100000,
                     ..fuse_attr::default()
                 });
@@ -959,12 +960,11 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let (nodeid, fh, caller) = {
             let g = self.state.borrow();
-            #[cfg(feature = "lru-debug")]
             if matches!(g.handles.get(fd)?, Handle::LruLog) {
                 if !can_read {
                     return Err(Error::new(EBADF));
                 }
-                let data = g.evicted_names.join("\n");
+                let data = g.eviction_log();
                 let off = offset as usize;
                 if off >= data.len() {
                     return Ok(0);
@@ -998,10 +998,12 @@ impl<T: FuseTransporter> Vfs<T> {
                     buf[..n].copy_from_slice(&data[off..off + n]);
                     return Ok(n);
                 }
-                #[cfg(feature = "lru-debug")]
                 Handle::LruLog => unreachable!("handled above"),
                 Handle::Directory { .. } => return Err(Error::new(EISDIR)),
-                Handle::StatOnly { .. } | Handle::SchemeRoot | Handle::SymlinkPreCreate { .. } => {
+                Handle::StatOnly { .. }
+                | Handle::SchemeRoot
+                | Handle::DebugRoot
+                | Handle::SymlinkPreCreate { .. } => {
                     return Err(Error::new(EBADF));
                 }
             }
@@ -1071,11 +1073,13 @@ impl<T: FuseTransporter> Vfs<T> {
                     *caller,
                 ),
                 Handle::Directory { .. } => return Err(Error::new(EISDIR)),
-                Handle::Symlink { .. } | Handle::StatOnly { .. } | Handle::SchemeRoot => {
+                Handle::Symlink { .. }
+                | Handle::StatOnly { .. }
+                | Handle::SchemeRoot
+                | Handle::DebugRoot
+                | Handle::LruLog => {
                     return Err(Error::new(EBADF));
                 }
-                #[cfg(feature = "lru-debug")]
-                Handle::LruLog => return Err(Error::new(EBADF)),
             }
         };
 
@@ -1345,10 +1349,8 @@ impl<T: FuseTransporter> Vfs<T> {
                 Handle::StatOnly { nodeid, .. } | Handle::Symlink { nodeid, .. } => {
                     self.state.borrow_mut().decrement_fd_count(nodeid);
                 }
-                Handle::SchemeRoot => {}
+                Handle::SchemeRoot | Handle::DebugRoot | Handle::LruLog => {}
                 Handle::SymlinkPreCreate { .. } => {}
-                #[cfg(feature = "lru-debug")]
-                Handle::LruLog => {}
             },
             None => {
                 warn!("virtio-fsd: close: fd '{fd}' was not found in handles");
@@ -1381,48 +1383,37 @@ impl<T: FuseTransporter> Vfs<T> {
         self.state.borrow_mut().handles.insert(Handle::SchemeRoot)
     }
 
-    #[cfg(feature = "lru-debug")]
-    pub fn open_lru_log(&self, clear: bool) -> usize {
-        let mut g = self.state.borrow_mut();
-        if clear {
-            g.evicted_names.clear();
-        }
-        g.handles.insert(Handle::LruLog)
+    /// Root handle of the debug scheme (`virtio-fsd-debug.<tag>`).
+    pub fn debug_root(&self) -> usize {
+        self.state.borrow_mut().handles.insert(Handle::DebugRoot)
     }
 
-    /// Open the synthetic `.lru_evicted` debug node, or leave the call to FUSE.
+    pub fn is_debug(&self, fd: usize) -> bool {
+        matches!(
+            self.state.borrow().handles.get(fd),
+            Ok(Handle::DebugRoot | Handle::LruLog)
+        )
+    }
+
+    /// Open a node of the debug scheme. `fd` must be a debug scheme handle.
     ///
-    /// That name is not a FUSE inode. It exists only at scheme root, so this
-    /// matches a single path component from an absolute path, a scheme-root
-    /// handle, or a directory whose nodeid is `FUSE_ROOT_ID`. Nested
-    /// `.lru_evicted` (and every other path) returns `Ok(None)` and is walked
-    /// normally. `O_TRUNC` clears the in-memory eviction log.
-    #[cfg(feature = "lru-debug")]
-    pub fn try_open_lru_log(&self, fd: usize, path: &str, flags: usize) -> Result<Option<usize>> {
-        let parts: Vec<&str> = path_components(path);
-        if parts.as_slice() != [LRU_EVICTED_NAME] {
-            return Ok(None);
+    /// Only the root has children, and the only child is `lru_evicted`. These
+    /// names are not FUSE inodes, so nothing here reaches the host.
+    /// `O_TRUNC` clears the in-memory eviction log.
+    pub fn open_debug(&self, fd: usize, path: &str, flags: usize) -> Result<usize> {
+        let mut g = self.state.borrow_mut();
+        match g.handles.get(fd)? {
+            Handle::DebugRoot => {}
+            Handle::LruLog => return Err(Error::new(ENOTDIR)),
+            _ => return Err(Error::new(EBADF)),
         }
-        let at_root = if path.starts_with('/') {
-            true
-        } else {
-            let g = self.state.borrow();
-            match g.handles.get(fd)? {
-                Handle::SchemeRoot => true,
-                Handle::Directory { nodeid, .. } | Handle::StatOnly { nodeid, .. } => {
-                    *nodeid == FUSE_ROOT_ID
-                }
-                Handle::File { .. }
-                | Handle::Symlink { .. }
-                | Handle::SymlinkPreCreate { .. }
-                | Handle::LruLog => false,
-            }
-        };
-        if !at_root {
-            return Ok(None);
+        if path_components::<&str>(path).as_slice() != [LRU_DEBUG_EVICTED_NAME] {
+            return Err(Error::new(ENOENT));
         }
-        let clear = flags & syscall::O_TRUNC != 0;
-        Ok(Some(self.open_lru_log(clear)))
+        if flags & syscall::O_TRUNC != 0 {
+            g.evicted_names.clear();
+        }
+        Ok(g.handles.insert(Handle::LruLog))
     }
 
     pub(crate) async fn follow_chain(
@@ -1457,6 +1448,12 @@ impl<T: FuseTransporter> Vfs<T> {
             last_to_be_created: false,
         };
 
+        // Debug scheme handles have no FUSE path. Reject them before the absolute
+        // path shortcut below, which never looks at `fd`.
+        if self.is_debug(fd) {
+            return Err(Error::new(EPERM));
+        }
+
         (walk.nodeid, walk.node_mode, walk.rel_path) = if path.starts_with('/') {
             (FUSE_ROOT_ID, MODE_DIR, Vec::new())
         } else {
@@ -1465,8 +1462,8 @@ impl<T: FuseTransporter> Vfs<T> {
                 Handle::File { .. } | Handle::Symlink { .. } | Handle::SymlinkPreCreate { .. } => {
                     Err(Error::new(ENOTDIR))
                 }
-                #[cfg(feature = "lru-debug")]
-                Handle::LruLog => Err(Error::new(ENOTDIR)),
+                // Rejected above.
+                Handle::DebugRoot | Handle::LruLog => Err(Error::new(EPERM)),
                 Handle::Directory { nodeid, path, .. } => {
                     let mode = g.inode_mode(*nodeid)?;
                     Ok((*nodeid, mode, path_components(path)))
@@ -1721,9 +1718,7 @@ impl<T: FuseTransporter> Vfs<T> {
                     | Handle::StatOnly { path, .. }
                     | Handle::Symlink { path, .. }
                     | Handle::SymlinkPreCreate { path, .. } => path,
-                    Handle::SchemeRoot => continue,
-                    #[cfg(feature = "lru-debug")]
-                    Handle::LruLog => continue,
+                    Handle::SchemeRoot | Handle::DebugRoot | Handle::LruLog => continue,
                 };
                 if path == &src_path {
                     *path = new_path.clone();
@@ -1820,9 +1815,8 @@ impl<T: FuseTransporter> Vfs<T> {
             | Handle::StatOnly { path, .. }
             | Handle::Symlink { path, .. }
             | Handle::SymlinkPreCreate { path, .. } => Ok(path.clone()),
-            Handle::SchemeRoot => Ok(String::new()),
-            #[cfg(feature = "lru-debug")]
-            Handle::LruLog => Ok(LRU_EVICTED_NAME.to_owned()),
+            Handle::SchemeRoot | Handle::DebugRoot => Ok(String::new()),
+            Handle::LruLog => Ok(LRU_DEBUG_EVICTED_NAME.to_owned()),
         }
     }
 

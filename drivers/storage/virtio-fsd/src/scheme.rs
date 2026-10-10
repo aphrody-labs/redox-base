@@ -29,6 +29,7 @@ pub struct VirtioFsScheme<T: FuseTransporter> {
     socket: Arc<Socket>,
     vfs: Rc<Vfs<T>>,
     scheme_name: Rc<str>,
+    debug_scheme_name: Rc<str>,
     lock_state: Rc<RefCell<SchemeState>>,
 }
 
@@ -38,19 +39,31 @@ impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
             socket: Arc::clone(&self.socket),
             vfs: Rc::clone(&self.vfs),
             scheme_name: Rc::clone(&self.scheme_name),
+            debug_scheme_name: Rc::clone(&self.debug_scheme_name),
             lock_state: Rc::clone(&self.lock_state),
         }
     }
 }
 
 impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
-    pub fn new(socket: Arc<Socket>, vfs: Vfs<T>, scheme_name: &str) -> Self {
+    pub fn new(
+        socket: Arc<Socket>,
+        vfs: Vfs<T>,
+        scheme_name: &str,
+        debug_scheme_name: &str,
+    ) -> Self {
         Self {
             vfs: Rc::new(vfs),
             socket,
             scheme_name: Rc::from(scheme_name),
+            debug_scheme_name: Rc::from(debug_scheme_name),
             lock_state: Rc::new(RefCell::new(SchemeState::new())),
         }
+    }
+
+    /// Root handle for the debug scheme, to be registered under `debug_scheme_name`.
+    pub fn debug_scheme_root(&self) -> usize {
+        self.vfs.debug_root()
     }
 
     pub async fn shutdown(&mut self) {
@@ -200,8 +213,10 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         let flags = flags | fcntl_flags as usize;
         let caller = caller(ctx);
 
-        #[cfg(feature = "lru-debug")]
-        if let Some(number) = self.vfs.try_open_lru_log(fd, path, flags)? {
+        // The debug scheme is served by the same socket. Its handles never
+        // touch the share, so keep them out of the path walk below.
+        if self.vfs.is_debug(fd) {
+            let number = self.vfs.open_debug(fd, path, flags)?;
             return Ok(OpenResult::ThisScheme {
                 number,
                 flags: NewFdFlags::POSITIONED,
@@ -426,8 +441,13 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
 
     async fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
         let path = self.vfs.get_path(id)?;
+        let scheme_name = if self.vfs.is_debug(id) {
+            &self.debug_scheme_name
+        } else {
+            &self.scheme_name
+        };
 
-        FpathWriter::with(buf, self.scheme_name.as_ref(), |w| {
+        FpathWriter::with(buf, scheme_name.as_ref(), |w| {
             w.push_str(&path);
             Ok(())
         })

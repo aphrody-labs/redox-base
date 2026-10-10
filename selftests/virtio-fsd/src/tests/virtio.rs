@@ -1,37 +1,44 @@
-#[cfg(feature = "lru-debug")]
 use std::io::Write;
 use std::os::fd::AsRawFd;
 
-use crate::{Outcome, TestCase, TestCtx, cases, check_errno_any, check_ok, fsutil};
-#[cfg(feature = "lru-debug")]
-use crate::{check, check_bytes};
+use crate::{
+    Outcome, TestCase, TestCtx, cases, check, check_bytes, check_errno, check_errno_any, check_ok,
+    fsutil,
+};
 
 pub fn cases() -> Vec<TestCase> {
-    #[cfg(feature = "lru-debug")]
-    {
-        cases![edge forget_lru_pressure, edge mmap_file]
+    cases![edge debug_nodes_stay_in_debug_scheme, edge forget_lru_pressure, edge mmap_file]
+}
+
+// The debug nodes are served by `virtio-fsd-debug.<tag>` only: the share must
+// not expose them, and the debug scheme must not expose anything else.
+fn debug_nodes_stay_in_debug_scheme(ctx: &TestCtx) -> Outcome {
+    for name in ["lru_evicted", ".lru_evicted"] {
+        check_errno!(
+            fsutil::open_ro(&ctx.cfg.root.join(name)),
+            fsutil::ENOENT,
+            "share must not expose debug node"
+        );
     }
-    #[cfg(not(feature = "lru-debug"))]
-    {
-        cases![edge mmap_file]
-    }
+    check_ok!(fsutil::open_ro(&ctx.cfg.debug_root.join("lru_evicted")));
+    check_errno!(
+        fsutil::open_ro(&ctx.cfg.debug_root.join("fixtures")),
+        fsutil::ENOENT,
+        "debug scheme must not expose share paths"
+    );
+    Outcome::Pass
 }
 
 // virtio-fsd INODES_MAX_LEN is 64k; this has to be past that to force FORGET.
-#[cfg(feature = "lru-debug")]
 const FORGET_PRESSURE_FILES: usize = 64 * 1024 + 256;
 
-#[cfg(feature = "lru-debug")]
 fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
-    match fsutil::clear_lru_eviction_log(&ctx.cfg.root) {
-        Ok(()) => {}
-        Err(err) if fsutil::is_errno(&err, fsutil::ENOENT) => {
-            return Outcome::PassNote(
-                "driver built without lru-debug; eviction order not checked".into(),
-            );
-        }
-        Err(err) => return Outcome::Fail(format!("truncate .lru_evicted: {err:?}")),
-    }
+    // The log lives in the driver's debug scheme, not in the share.
+    check_ok!(
+        fsutil::clear_lru_eviction_log(&ctx.cfg.debug_root),
+        "truncate {}/lru_evicted",
+        ctx.cfg.debug_root.display()
+    );
 
     for i in 0..FORGET_PRESSURE_FILES {
         let path = ctx.work(&format!("fg_{i}"));
@@ -47,7 +54,7 @@ fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
         b"x"
     );
 
-    let log = check_ok!(fsutil::read_to_vec(&ctx.cfg.root.join(".lru_evicted")));
+    let log = check_ok!(fsutil::read_to_vec(&ctx.cfg.debug_root.join("lru_evicted")));
     let log = check_ok!(std::str::from_utf8(&log));
     let run_token = format!("{}.{}.fg_", crate::config::WORK_PREFIX, ctx.cfg.run_id);
     let ours: Vec<usize> = log
@@ -62,7 +69,7 @@ fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
         .collect();
     check!(
         !ours.is_empty(),
-        "expected {run_token}* evictions in .lru_evicted, got:\n{log}"
+        "expected {run_token}* evictions in lru_evicted, got:\n{log}"
     );
     check!(
         ours.windows(2).all(|w| w[0] < w[1]),

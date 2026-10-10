@@ -57,7 +57,6 @@ test: all
 	$(MAKE) install
 	REDOXER_SYSROOT=$(DESTDIR) redoxer exec true
 
-test-selftests: FEATURES += lru-debug
 test-selftests: all
 	$(MAKE) install
 	$(MAKE) selftests
@@ -73,7 +72,6 @@ test-selftests: all
 		fi; \
 	done
 
-test-virtio-fs: FEATURES += lru-debug
 test-virtio-fs: all
 	$(MAKE) install
 	$(MAKE) selftests

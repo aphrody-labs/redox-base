@@ -192,10 +192,9 @@ pub fn owner(st: &libc::stat) -> (u32, u32) {
     (st.st_uid, st.st_gid)
 }
 
-#[cfg(feature = "lru-debug")]
-pub fn clear_lru_eviction_log(root: &Path) -> io::Result<()> {
+pub fn clear_lru_eviction_log(debug_root: &Path) -> io::Result<()> {
     let f = open_flags(
-        &root.join(".lru_evicted"),
+        &debug_root.join("lru_evicted"),
         flag::O_RDONLY | flag::O_TRUNC,
         0,
     )?;

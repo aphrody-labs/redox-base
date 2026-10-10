@@ -10,7 +10,10 @@ use fuse_abi::linux::{
 };
 use futures::executor::{LocalPool, block_on};
 use futures::task::LocalSpawnExt;
-use syscall::{ENOENT, ESTALE, MODE_DIR, MODE_FILE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR};
+use syscall::{
+    ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR,
+    O_TRUNC,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use super::*;
@@ -623,4 +626,85 @@ fn append_is_per_write_not_open() {
     assert_eq!(open & linux_abi::O_APPEND, 0);
     let io = fuse_io_flags((O_RDWR | O_APPEND) as u32);
     assert_ne!(io & linux_abi::O_APPEND, 0);
+}
+
+fn read_debug_log(vfs: &Vfs<Mock>, fd: usize) -> String {
+    let mut buf = [0u8; 256];
+    let n = block_on(vfs.read(fd, &mut buf, 0, O_RDONLY as u32)).unwrap();
+    String::from_utf8(buf[..n].to_vec()).unwrap()
+}
+
+#[test]
+fn debug_root_only_serves_lru_evicted() {
+    let (vfs, mock) = vfs_with([]);
+    let root = vfs.debug_root();
+    assert!(vfs.is_debug(root));
+
+    let fd = vfs.open_debug(root, "lru_evicted", O_RDONLY).unwrap();
+    assert!(vfs.is_debug(fd));
+    assert_eq!(read_debug_log(&vfs, fd), "");
+
+    for path in ["", "/", ".lru_evicted", "fixtures", "lru_evicted/x"] {
+        let err = vfs.open_debug(root, path, O_RDONLY).unwrap_err();
+        assert_eq!(err.errno, ENOENT, "{path:?}");
+    }
+    // A node is not a directory.
+    let err = vfs.open_debug(fd, "lru_evicted", O_RDONLY).unwrap_err();
+    assert_eq!(err.errno, ENOTDIR);
+    // The debug scheme never reaches the host.
+    assert!(mock.ops().is_empty());
+}
+
+#[test]
+fn share_root_does_not_expose_debug_nodes() {
+    let (vfs, mock) = vfs_with([MockReply::Host(ENOENT), MockReply::Host(ENOENT)]);
+    let root = vfs.scheme_root();
+    assert!(!vfs.is_debug(root));
+
+    for name in ["lru_evicted", ".lru_evicted"] {
+        let err = block_on(vfs.walk_path(root, name, O_RDONLY, Caller::NONE))
+            .err()
+            .unwrap();
+        assert_eq!(err.errno, ENOENT);
+    }
+    // Both names went to the host as ordinary lookups.
+    assert_eq!(mock.ops(), vec![u32::from(fuse_opcode::FUSE_LOOKUP); 2]);
+}
+
+#[test]
+fn evictions_are_logged_and_truncate_clears_them() {
+    // One more lookup than fits, so the least recently used name is evicted.
+    let (vfs, _mock) = vfs_with((2..=9).map(|i| file(i, 1)));
+    for i in 2..=9 {
+        block_on(vfs.lookup(FUSE_ROOT_ID, &format!("f{i}"), Caller::NONE)).unwrap();
+    }
+
+    let root = vfs.debug_root();
+    let fd = vfs.open_debug(root, "lru_evicted", O_RDONLY).unwrap();
+    let log = read_debug_log(&vfs, fd);
+    assert_eq!(log.lines().next(), Some("f2"), "{log:?}");
+
+    let cleared = vfs
+        .open_debug(root, "lru_evicted", O_RDONLY | O_TRUNC)
+        .unwrap();
+    assert_eq!(read_debug_log(&vfs, cleared), "");
+}
+
+#[test]
+fn debug_handles_cannot_walk_the_share() {
+    let (vfs, mock) = vfs_with([]);
+    let root = vfs.debug_root();
+    let log = vfs.open_debug(root, "lru_evicted", O_RDONLY).unwrap();
+
+    // Absolute paths resolve from the share root for ordinary handles. They
+    // must not do that for debug handles (this is how `unlinkat` gets here).
+    for fd in [root, log] {
+        for path in ["/", "/file", "file", "../file"] {
+            let err = block_on(vfs.walk_path(fd, path, O_RDONLY, Caller::NONE))
+                .err()
+                .unwrap();
+            assert_eq!(err.errno, EPERM, "fd {fd} path {path:?}");
+        }
+    }
+    assert!(mock.ops().is_empty());
 }
