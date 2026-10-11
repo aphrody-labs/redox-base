@@ -41,6 +41,13 @@ pub fn cases() -> Vec<TestCase> {
         func link_open_both,
         func link_dest_through_symlink_parent,
         func link_via_linkat,
+        func link_cross_dir_unlink_src,
+        func link_unlink_one_open_fd,
+        func link_rename_cross_dir,
+        func link_rename_onto_same_inode,
+        func link_rename_over_one_link,
+        func link_symlink_resolves_per_dir,
+        func link_churn,
         edge edge_link_eexist,
         edge edge_link_dir,
         edge edge_link_missing_parent,
@@ -565,6 +572,177 @@ fn link_via_linkat(ctx: &TestCtx) -> Outcome {
         check_ok!(fsutil::read_to_vec(&dir.join("inside.txt"))),
         b"at"
     );
+    Outcome::Pass
+}
+
+fn link_cross_dir_unlink_src(ctx: &TestCtx) -> Outcome {
+    let a = ctx.work("ln_xd_a");
+    let b = ctx.work("ln_xd_b");
+    check_ok!(fsutil::make_dir(&a));
+    check_ok!(fsutil::make_dir(&b));
+    let src = a.join("f.txt");
+    let dst = b.join("f.txt");
+    check_ok!(fsutil::write_all_path(&src, b"xdir"));
+    check_ok!(fsutil::link(&src, &dst));
+    let ino = check_ok!(fsutil::stat(&dst)).st_ino;
+
+    check_ok!(fsutil::unlink(&src));
+    check!(fsutil::gone(&src), "unlinked name still opens");
+    check!(
+        !check_ok!(fsutil::listed(&a, "f.txt")),
+        "unlinked name still in its dir"
+    );
+    check!(
+        check_ok!(fsutil::listed(&b, "f.txt")),
+        "surviving name missing from its dir"
+    );
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"xdir");
+    let st = check_ok!(fsutil::stat(&dst));
+    check_eq!(st.st_ino, ino);
+    check_eq!(st.st_nlink as u64, 1);
+
+    check_ok!(fsutil::unlink(&dst));
+    check!(fsutil::gone(&dst), "last name still opens");
+    Outcome::Pass
+}
+
+fn link_unlink_one_open_fd(ctx: &TestCtx) -> Outcome {
+    let a = ctx.work("ln_ofd_a.txt");
+    let b = ctx.work("ln_ofd_b.txt");
+    let mut f = check_ok!(fsutil::create_rw(&a));
+    check_ok!(f.write_all(b"held"));
+    check_ok!(fsutil::link(&a, &b));
+    check_eq!(check_ok!(fsutil::fstat(&f)).st_nlink as u64, 2);
+
+    check_ok!(fsutil::unlink(&b));
+    check!(fsutil::gone(&b), "unlinked name still opens");
+    check_eq!(check_ok!(fsutil::fstat(&f)).st_nlink as u64, 1);
+    check_eq!(check_ok!(fsutil::stat(&a)).st_nlink as u64, 1);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&a)), b"held");
+
+    check_ok!(f.write_all(b"+more"));
+    drop(f);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&a)), b"held+more");
+    Outcome::Pass
+}
+
+fn link_rename_cross_dir(ctx: &TestCtx) -> Outcome {
+    let a = ctx.work("ln_rx_a");
+    let b = ctx.work("ln_rx_b");
+    check_ok!(fsutil::make_dir(&a));
+    check_ok!(fsutil::make_dir(&b));
+    let keep = a.join("keep.txt");
+    let from = a.join("from.txt");
+    let to = b.join("to.txt");
+    check_ok!(fsutil::write_all_path(&keep, b"one-inode"));
+    check_ok!(fsutil::link(&keep, &from));
+    let ino = check_ok!(fsutil::stat(&keep)).st_ino;
+
+    check_ok!(fsutil::rename(&from, &to));
+    check!(fsutil::gone(&from), "old name still opens");
+    check!(
+        !check_ok!(fsutil::listed(&a, "from.txt")),
+        "old name still in source dir"
+    );
+    check!(
+        check_ok!(fsutil::listed(&b, "to.txt")),
+        "new name missing from dest dir"
+    );
+    for p in [&keep, &to] {
+        let st = check_ok!(fsutil::stat(p));
+        check_eq!(st.st_ino, ino, "{} lost its inode", p.display());
+        check_eq!(st.st_nlink as u64, 2, "{} nlink", p.display());
+    }
+
+    let f = check_ok!(fsutil::open_rw(&to));
+    check_ok!(f.set_len(3));
+    drop(f);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&keep)), b"one");
+    Outcome::Pass
+}
+
+// POSIX: renaming a name onto another name of the same inode does nothing.
+fn link_rename_onto_same_inode(ctx: &TestCtx) -> Outcome {
+    let (src, dst) = check_out!(linked_pair(ctx, "ln_rs_a.txt", "ln_rs_b.txt", b"same"));
+    check_ok!(fsutil::rename(&src, &dst));
+    check_bytes!(check_ok!(fsutil::read_to_vec(&src)), b"same");
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"same");
+    let (s, d) = (check_ok!(fsutil::stat(&src)), check_ok!(fsutil::stat(&dst)));
+    check_eq!(s.st_ino, d.st_ino);
+    check_eq!(s.st_nlink as u64, 2);
+    Outcome::Pass
+}
+
+fn link_rename_over_one_link(ctx: &TestCtx) -> Outcome {
+    let (kept, replaced) = check_out!(linked_pair(ctx, "ln_ro_a.txt", "ln_ro_b.txt", b"old"));
+    let other = ctx.work("ln_ro_c.txt");
+    check_ok!(fsutil::write_all_path(&other, b"new"));
+    let old_ino = check_ok!(fsutil::stat(&kept)).st_ino;
+    let new_ino = check_ok!(fsutil::stat(&other)).st_ino;
+
+    check_ok!(fsutil::rename(&other, &replaced));
+    check!(fsutil::gone(&other), "renamed-from name still opens");
+
+    let k = check_ok!(fsutil::stat(&kept));
+    check_eq!(k.st_ino, old_ino);
+    check_eq!(k.st_nlink as u64, 1);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&kept)), b"old");
+    let r = check_ok!(fsutil::stat(&replaced));
+    check_eq!(r.st_ino, new_ino);
+    check_eq!(r.st_nlink as u64, 1);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&replaced)), b"new");
+    Outcome::Pass
+}
+
+// A relative symlink target is resolved against the directory of the name it was
+// reached through, not against wherever the inode was last looked up.
+fn link_symlink_resolves_per_dir(ctx: &TestCtx) -> Outcome {
+    let a = ctx.work("ln_hs_a");
+    let b = ctx.work("ln_hs_b");
+    check_ok!(fsutil::make_dir(&a));
+    check_ok!(fsutil::make_dir(&b));
+    check_ok!(fsutil::write_all_path(&a.join("t.txt"), b"from-a"));
+    check_ok!(fsutil::write_all_path(&b.join("t.txt"), b"from-b"));
+    let in_a = a.join("l");
+    let in_b = b.join("l");
+    check_ok!(fsutil::symlink("t.txt", &in_a));
+    check_ok!(fsutil::link(&in_a, &in_b));
+
+    // Alternate, so a wrong "parent of the inode" would show up in one of the two.
+    for _ in 0..3 {
+        check_bytes!(check_ok!(fsutil::read_to_vec(&in_b)), b"from-b");
+        check_bytes!(check_ok!(fsutil::read_to_vec(&in_a)), b"from-a");
+    }
+    check_str!(check_ok!(fsutil::readlink(&in_a)), "t.txt");
+    check_str!(check_ok!(fsutil::readlink(&in_b)), "t.txt");
+    Outcome::Pass
+}
+
+// Repeatedly add and drop names for one inode, so dentries are inserted, replaced
+// and removed over and over while the inode itself stays.
+fn link_churn(ctx: &TestCtx) -> Outcome {
+    let dir = ctx.work("ln_churn");
+    check_ok!(fsutil::make_dir(&dir));
+    let mut cur = dir.join("x.txt");
+    let mut other = dir.join("y.txt");
+    check_ok!(fsutil::write_all_path(&cur, b"churn"));
+    let ino = check_ok!(fsutil::stat(&cur)).st_ino;
+
+    for i in 0..32 {
+        check_ok!(fsutil::link(&cur, &other), "round {i}: link");
+        check_eq!(
+            check_ok!(fsutil::stat(&cur)).st_nlink as u64,
+            2,
+            "round {i}: nlink after link"
+        );
+        check_ok!(fsutil::unlink(&cur), "round {i}: unlink");
+        check!(fsutil::gone(&cur), "round {i}: unlinked name still opens");
+        let st = check_ok!(fsutil::stat(&other));
+        check_eq!(st.st_ino, ino, "round {i}: inode changed");
+        check_eq!(st.st_nlink as u64, 1, "round {i}: nlink after unlink");
+        std::mem::swap(&mut cur, &mut other);
+    }
+    check_bytes!(check_ok!(fsutil::read_to_vec(&cur)), b"churn");
     Outcome::Pass
 }
 
