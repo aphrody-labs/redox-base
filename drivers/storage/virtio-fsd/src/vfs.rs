@@ -552,7 +552,7 @@ impl VfsState {
         let parent_id = inode.parent;
         if parent_id == nodeid {
             // we don't have the authority to look into the parent of root,
-            // hence when cwd is `/scheme/virtio-fsd.<tag>`, `ls ..` is same as `ls .`.
+            // hence when cwd is `/scheme/virtio-fs.<tag>`, `ls ..` is same as `ls .`.
             self.touch(NodeId::ROOT);
             return Ok((NodeId::ROOT, MODE_DIR));
         }
@@ -1391,7 +1391,7 @@ impl<T: FuseTransporter> Vfs<T> {
         self.state.borrow_mut().handles.insert(Handle::SchemeRoot)
     }
 
-    /// Root handle of the debug scheme (`virtio-fsd-debug.<tag>`).
+    /// Root handle of the debug scheme (`virtio-fs-debug.<tag>`).
     pub fn debug_root(&self) -> usize {
         self.state.borrow_mut().handles.insert(Handle::DebugRoot)
     }

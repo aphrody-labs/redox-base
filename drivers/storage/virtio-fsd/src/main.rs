@@ -57,8 +57,8 @@ fn init(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> ! {
         RedoxScheme::new(tag).is_some(),
         "virtio-fsd: tag {tag:?} is not usable as a scheme name (ASCII only, no NUL, '/' or ':')."
     );
-    let scheme_name = format!("virtio-fsd.{tag}");
-    let debug_scheme_name = format!("virtio-fsd-debug.{tag}");
+    let scheme_name = format!("virtio-fs.{tag}");
+    let debug_scheme_name = format!("virtio-fs-debug.{tag}");
 
     // FUSE
 

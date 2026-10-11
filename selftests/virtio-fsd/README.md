@@ -1,8 +1,8 @@
 # virtio-fsd-selftest
 
-Guest tests for `/scheme/virtio-fsd.<tag>`.
+Guest tests for `/scheme/virtio-fs.<tag>`.
 
-The driver serves each virtio-fs share (PCI function) at `/scheme/virtio-fsd.<share_tag>`, where `<share_tag>` is the share's tag as given to the hypervisor (e.g. QEMU's `tag=` option). The first argument is that tag. Tests then run against `/scheme/virtio-fsd.<share_tag>`. The driver also serves debug nodes (e.g. `lru_evicted`) from a separate `/scheme/virtio-fsd-debug.<share_tag>`, which the eviction test reads. With no tag, the program prints help and exits. `scripts/redoxer-run.sh` passes `virtiofs`, matching its `tag=` device option.
+The driver serves each virtio-fs share (PCI function) at `/scheme/virtio-fs.<share_tag>`, where `<share_tag>` is the share's tag as given to the hypervisor (e.g. QEMU's `tag=` option). The first argument is that tag. Tests then run against `/scheme/virtio-fs.<share_tag>`. The driver also serves debug nodes (e.g. `lru_evicted`) from a separate `/scheme/virtio-fs-debug.<share_tag>`, which the eviction test reads. With no tag, the program prints help and exits. `scripts/redoxer-run.sh` passes `virtiofs`, matching its `tag=` device option.
 
 | Group | Covers |
 | --- | --- |

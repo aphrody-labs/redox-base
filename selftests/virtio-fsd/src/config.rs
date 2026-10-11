@@ -18,7 +18,7 @@ pub const CP_SRC_600_MARKER: &str = "virtio-fsd-selftest:cp-600\n";
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "virtio-fsd-selftest",
-    about = "Guest tests for /scheme/virtio-fsd.<SHARE_TAG> and Redox VFS schemes",
+    about = "Guest tests for /scheme/virtio-fs.<SHARE_TAG> and Redox VFS schemes",
     override_usage = "virtio-fsd-selftest <SHARE_TAG> [OPTIONS]",
     arg_required_else_help = true
 )]
@@ -69,8 +69,8 @@ impl Config {
             }
         };
 
-        cfg.root = PathBuf::from(format!("/scheme/virtio-fsd.{}", cfg.share_tag));
-        cfg.debug_root = PathBuf::from(format!("/scheme/virtio-fsd-debug.{}", cfg.share_tag));
+        cfg.root = PathBuf::from(format!("/scheme/virtio-fs.{}", cfg.share_tag));
+        cfg.debug_root = PathBuf::from(format!("/scheme/virtio-fs-debug.{}", cfg.share_tag));
 
         if let Ok(v) = env::var("VIRTIO_FSD_SELFTEST_THREADS") {
             if let Ok(n) = v.parse() {

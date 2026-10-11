@@ -10,7 +10,7 @@ pub fn cases() -> Vec<TestCase> {
     cases![edge debug_nodes_stay_in_debug_scheme, edge forget_lru_pressure, edge mmap_file]
 }
 
-// The debug nodes are served by `virtio-fsd-debug.<tag>` only: the share must
+// The debug nodes are served by `virtio-fs-debug.<tag>` only: the share must
 // not expose them, and the debug scheme must not expose anything else.
 fn debug_nodes_stay_in_debug_scheme(ctx: &TestCtx) -> Outcome {
     for name in ["lru_evicted", ".lru_evicted"] {
