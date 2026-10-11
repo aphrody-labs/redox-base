@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fuse_abi::linux::{
     FUSE_ATOMIC_O_TRUNC, FUSE_EXPORT_SUPPORT, FUSE_GETATTR_FH, FUSE_KERNEL_MINOR_VERSION,
-    FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, FUSE_ROOT_ID, fuse_attr_out,
-    fuse_create_in, fuse_entry_out, fuse_flush_in, fuse_forget_in, fuse_fsync_in, fuse_getattr_in,
-    fuse_in_header, fuse_init_in, fuse_init_out, fuse_link_in, fuse_mkdir_in, fuse_opcode,
-    fuse_open_in, fuse_open_out, fuse_out_header, fuse_read_in, fuse_release_in, fuse_rename_in,
-    fuse_setattr_in, fuse_statfs_out, fuse_write_in, fuse_write_out,
+    FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_NO_EXPORT_SUPPORT, fuse_attr_out, fuse_create_in,
+    fuse_flush_in, fuse_forget_in, fuse_fsync_in, fuse_getattr_in, fuse_in_header, fuse_init_in,
+    fuse_init_out, fuse_link_in, fuse_mkdir_in, fuse_opcode, fuse_open_in, fuse_out_header,
+    fuse_read_in, fuse_release_in, fuse_rename_in, fuse_setattr_in, fuse_statfs_out, fuse_write_in,
+    fuse_write_out,
 };
 use log::{info, warn};
 use syscall::PAGE_SIZE;
@@ -202,7 +202,7 @@ where
 
         let request = session.request(
             fuse_opcode::FUSE_INIT.into(),
-            FUSE_ROOT_ID,
+            NodeId::ROOT,
             init_in,
             0,
             None,
@@ -272,7 +272,7 @@ where
     fn request<I>(
         &self,
         opcode: u32,
-        nodeid: u64,
+        nodeid: NodeId,
         fuse_in: I,
         extra_len: usize,
         unique: Option<u64>,
@@ -282,7 +282,7 @@ where
             len: (mem::size_of::<fuse_in_header>() + mem::size_of::<I>() + extra_len) as u32,
             opcode,
             unique: unique.unwrap_or_else(|| self.next_unique.fetch_add(1, Ordering::SeqCst)),
-            nodeid,
+            nodeid: nodeid.into(),
             uid: caller.uid,
             gid: caller.gid,
             pid: caller.pid,
@@ -299,11 +299,11 @@ where
     /// Handles both `open` and `opendir` opcodes based on `is_dir`.
     pub async fn open(
         &self,
-        nodeid: u64,
+        nodeid: NodeId,
         flags: u32,
         is_dir: bool,
         caller: Caller,
-    ) -> Result<fuse_open_out, FuseError> {
+    ) -> Result<FuseOpenOut, FuseError> {
         let opcode = if is_dir {
             fuse_opcode::FUSE_OPENDIR.into()
         } else {
@@ -324,14 +324,14 @@ where
 
     pub async fn getattr(
         &self,
-        nodeid: u64,
-        fh: Option<u64>,
+        nodeid: NodeId,
+        fh: Option<FileHandle>,
         caller: Caller,
     ) -> Result<fuse_attr_out, FuseError> {
         let fuse_in = fuse_getattr_in {
             getattr_flags: if fh.is_some() { FUSE_GETATTR_FH } else { 0 },
             dummy: 0,
-            fh: fh.unwrap_or(0),
+            fh: fh.map_or(0, u64::from),
         };
 
         let request = self.request(
@@ -349,7 +349,11 @@ where
             .into_struct()
     }
 
-    pub async fn statfs(&self, nodeid: u64, caller: Caller) -> Result<fuse_statfs_out, FuseError> {
+    pub async fn statfs(
+        &self,
+        nodeid: NodeId,
+        caller: Caller,
+    ) -> Result<fuse_statfs_out, FuseError> {
         let request = self.request(fuse_opcode::FUSE_STATFS.into(), nodeid, (), 0, None, caller);
 
         self.transporter
@@ -360,7 +364,7 @@ where
 
     pub async fn setattr(
         &self,
-        nodeid: u64,
+        nodeid: NodeId,
         fuse_in: fuse_setattr_in,
         caller: Caller,
     ) -> Result<fuse_attr_out, FuseError> {
@@ -381,13 +385,13 @@ where
 
     pub async fn readdir(
         &self,
-        nodeid: u64,
-        fh: u64,
+        nodeid: NodeId,
+        fh: FileHandle,
         offset: u64,
         caller: Caller,
     ) -> Result<FuseReaddirOut, FuseError> {
         let fuse_in = fuse_read_in {
-            fh,
+            fh: fh.into(),
             offset,
             size: FUSE_READDIR_BUFFER_SIZE,
             read_flags: 0,
@@ -419,10 +423,10 @@ where
 
     pub async fn lookup(
         &self,
-        parent_nodeid: u64,
+        parent_nodeid: NodeId,
         name: CString,
         caller: Caller,
-    ) -> Result<fuse_entry_out, FuseError> {
+    ) -> Result<FuseEntryOut, FuseError> {
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
 
@@ -448,8 +452,8 @@ where
     /// Issues a single `FUSE_READ` for at most `max_read_len()` bytes of `buf`.
     pub async fn read(
         &self,
-        nodeid: u64,
-        fh: u64,
+        nodeid: NodeId,
+        fh: FileHandle,
         offset: u64,
         buf: &mut [u8],
         read_flags: u32,
@@ -463,7 +467,7 @@ where
         let buf = &mut buf[..n];
 
         let fuse_in = fuse_read_in {
-            fh,
+            fh: fh.into(),
             offset,
             size: n as u32,
             read_flags,
@@ -490,8 +494,8 @@ where
     /// Issues a single `FUSE_WRITE` for at most `max_write_len()` bytes of `data`.
     pub async fn write(
         &self,
-        nodeid: u64,
-        fh: u64,
+        nodeid: NodeId,
+        fh: FileHandle,
         offset: u64,
         data: &[u8],
         write_flags: u32,
@@ -508,7 +512,7 @@ where
         let data = &data[..size];
 
         let fuse_in = fuse_write_in {
-            fh,
+            fh: fh.into(),
             offset,
             size: size as u32,
             write_flags,
@@ -534,7 +538,7 @@ where
 
     pub async fn create(
         &self,
-        parent_nodeid: u64,
+        parent_nodeid: NodeId,
         name: CString,
         flags: u32,
         mode: u32,
@@ -571,8 +575,8 @@ where
 
     pub async fn fsync(
         &self,
-        nodeid: u64,
-        fh: u64,
+        nodeid: NodeId,
+        fh: FileHandle,
         is_dir: bool,
         caller: Caller,
     ) -> Result<(), FuseError> {
@@ -582,7 +586,7 @@ where
             fuse_opcode::FUSE_FSYNC.into()
         };
         let fuse_in = fuse_fsync_in {
-            fh,
+            fh: fh.into(),
             fsync_flags: 0,
             padding: 0,
         };
@@ -595,9 +599,14 @@ where
             .into_struct()
     }
 
-    pub async fn flush(&self, nodeid: u64, fh: u64, caller: Caller) -> Result<(), FuseError> {
+    pub async fn flush(
+        &self,
+        nodeid: NodeId,
+        fh: FileHandle,
+        caller: Caller,
+    ) -> Result<(), FuseError> {
         let fuse_in = fuse_flush_in {
-            fh,
+            fh: fh.into(),
             unused: 0,
             padding: 0,
             lock_owner: 0,
@@ -620,8 +629,8 @@ where
 
     pub async fn release(
         &self,
-        nodeid: u64,
-        fh: u64,
+        nodeid: NodeId,
+        fh: FileHandle,
         is_dir: bool,
         caller: Caller,
     ) -> Result<(), FuseError> {
@@ -631,7 +640,7 @@ where
             fuse_opcode::FUSE_RELEASE.into()
         };
         let fuse_in = fuse_release_in {
-            fh,
+            fh: fh.into(),
             flags: 0,
             release_flags: 0,
             lock_owner: 0,
@@ -645,7 +654,12 @@ where
             .into_struct()
     }
 
-    pub async fn forget(&self, nodeid: u64, nlookup: u64, caller: Caller) -> Result<(), FuseError> {
+    pub async fn forget(
+        &self,
+        nodeid: NodeId,
+        nlookup: u64,
+        caller: Caller,
+    ) -> Result<(), FuseError> {
         let fuse_in = fuse_forget_in { nlookup };
 
         let request = self.request(
@@ -664,11 +678,11 @@ where
 
     pub async fn mkdir(
         &self,
-        parent_nodeid: u64,
+        parent_nodeid: NodeId,
         name: CString,
         mode: u32,
         caller: Caller,
-    ) -> Result<fuse_entry_out, FuseError> {
+    ) -> Result<FuseEntryOut, FuseError> {
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
 
@@ -695,7 +709,7 @@ where
 
     pub async fn rm(
         &self,
-        parent_nodeid: u64,
+        parent_nodeid: NodeId,
         name: CString,
         is_dir: bool,
         caller: Caller,
@@ -720,7 +734,7 @@ where
             .into_struct()
     }
 
-    pub async fn readlink(&self, nodeid: u64, caller: Caller) -> Result<String, FuseError> {
+    pub async fn readlink(&self, nodeid: NodeId, caller: Caller) -> Result<String, FuseError> {
         let request = self.request(
             fuse_opcode::FUSE_READLINK.into(),
             nodeid,
@@ -756,11 +770,11 @@ where
 
     pub async fn symlink(
         &self,
-        parent_nodeid: u64,
+        parent_nodeid: NodeId,
         name: &CString,
         path: &CString,
         caller: Caller,
-    ) -> Result<fuse_entry_out, FuseError> {
+    ) -> Result<FuseEntryOut, FuseError> {
         let name = name.as_bytes_with_nul();
         let path = path.as_bytes_with_nul();
 
@@ -796,9 +810,9 @@ where
 
     pub async fn rename(
         &self,
-        old_parent: u64,
+        old_parent: NodeId,
         old_name: CString,
-        new_parent: u64,
+        new_parent: NodeId,
         new_name: CString,
         caller: Caller,
     ) -> Result<(), FuseError> {
@@ -817,7 +831,9 @@ where
             // switch to FUSE_RENAME2 if scheme starts accepting flags
             fuse_opcode::FUSE_RENAME.into(),
             old_parent,
-            fuse_rename_in { newdir: new_parent },
+            fuse_rename_in {
+                newdir: new_parent.into(),
+            },
             names.len(),
             None,
             caller,
@@ -831,11 +847,11 @@ where
 
     pub async fn link(
         &self,
-        new_parent: u64,
-        old_nodeid: u64,
+        new_parent: NodeId,
+        old_nodeid: NodeId,
         name: CString,
         caller: Caller,
-    ) -> Result<fuse_entry_out, FuseError> {
+    ) -> Result<FuseEntryOut, FuseError> {
         let name = name.as_bytes_with_nul();
         let name_len = name.len();
         if name_len > NAME_MAX {
@@ -843,7 +859,7 @@ where
         }
 
         let fuse_in = fuse_link_in {
-            oldnodeid: old_nodeid,
+            oldnodeid: old_nodeid.into(),
         };
 
         let request = self.request(

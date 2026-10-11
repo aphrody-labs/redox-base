@@ -76,7 +76,7 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
         };
         self.lock_state
             .borrow_mut()
-            .on_detach(id, inode as usize, pid);
+            .on_detach(id, u64::from(inode) as usize, pid);
     }
 
     pub fn tick(&mut self) -> io::Result<()> {
@@ -181,7 +181,9 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
                     );
                 }
                 RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {}
-                RequestKind::Cancellation(_cancellation_request) => {}
+                RequestKind::Cancellation(_cancellation_request) => {
+                    // TODO: send FUSE_INTERRUPT.
+                }
             }
         }
 
@@ -199,7 +201,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
     }
 
     async fn inode(&self, id: usize) -> Result<usize> {
-        self.vfs.get_inode(id).map(|ino| ino as usize)
+        self.vfs.get_inode(id).map(|ino| u64::from(ino) as usize)
     }
 
     async fn openat(

@@ -17,9 +17,7 @@ use syscall::{
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use super::*;
-use crate::fuse::{
-    Caller, Data, FUSE_ROOT_ID, FuseError, FuseReply, FuseRequest, FuseSession, FuseTransporter,
-};
+use crate::fuse::{Caller, Data, FuseError, FuseReply, FuseRequest, FuseSession, FuseTransporter};
 use crate::linux_abi;
 
 #[derive(Clone)]
@@ -187,30 +185,30 @@ fn vfs_with(replies: impl IntoIterator<Item = MockReply>) -> (Vfs<Mock>, Mock) {
     (Vfs::new(FuseSession::for_test(mock.clone())), mock)
 }
 
-fn has_inode(vfs: &Vfs<Mock>, id: u64) -> bool {
-    vfs.state.borrow().inodes.contains_key(&id)
+fn has_inode(vfs: &Vfs<Mock>, raw: u64) -> bool {
+    vfs.state.borrow().inodes.contains_key(&NodeId::new(raw))
 }
 
-fn forget_queued(vfs: &Vfs<Mock>, id: u64) -> bool {
+fn forget_queued(vfs: &Vfs<Mock>, raw: u64) -> bool {
     vfs.state
         .borrow()
         .forget_queue
         .iter()
-        .any(|(n, _)| *n == id)
+        .any(|(n, _)| *n == NodeId::new(raw))
 }
 
-async fn lookup(vfs: &Vfs<Mock>, name: &str) -> u64 {
-    vfs.lookup(FUSE_ROOT_ID, name, Caller::NONE)
+async fn lookup(vfs: &Vfs<Mock>, name: &str) -> NodeId {
+    vfs.lookup(NodeId::ROOT, name, Caller::NONE)
         .await
         .unwrap()
         .0
 }
 
-fn file_walk(nodeid: u64, name: &str) -> WalkResult {
+fn file_walk(nodeid: NodeId, name: &str) -> WalkResult {
     WalkResult {
         nodeid,
         node_mode: MODE_FILE,
-        parent_nodeid: FUSE_ROOT_ID,
+        parent_nodeid: Some(NodeId::ROOT),
         rel_path: vec![name.into()],
         last_to_be_created: false,
     }
@@ -233,11 +231,11 @@ fn create_rolls_back_host_file_on_generation_mismatch() {
     ]);
 
     block_on(async {
-        assert_eq!(lookup(&vfs, "f").await, 10);
+        assert_eq!(lookup(&vfs, "f").await, NodeId::new(10));
         assert!(has_inode(&vfs, 10));
         let err = vfs
             .create(
-                FUSE_ROOT_ID,
+                NodeId::ROOT,
                 "f",
                 O_CREAT | O_RDWR,
                 MODE_FILE as u32,
@@ -271,7 +269,7 @@ fn rm_sends_unlink_after_inode_eviction() {
             "victim should have been LRU-evicted, cache len={}",
             vfs.state.borrow().inodes.len()
         );
-        vfs.rm(file_walk(2, "victim"), false, Caller::NONE)
+        vfs.rm(file_walk(NodeId::new(2), "victim"), false, Caller::NONE)
             .await
             .expect("rm must not fail with ENOENT after eviction");
     });
@@ -308,15 +306,15 @@ fn rm_forgets_the_removed_inode_before_returning() {
 fn lookup_getattr_refresh_does_not_return_forgotten_nodeid() {
     let (vfs, _) = vfs_with([file(4, 1), MockReply::Host(ENOENT)]);
     block_on(async {
-        assert_eq!(lookup(&vfs, "stale").await, 4);
+        assert_eq!(lookup(&vfs, "stale").await, NodeId::new(4));
         vfs.state
             .borrow_mut()
             .inodes
-            .get_mut(&4)
+            .get_mut(&NodeId::new(4))
             .unwrap()
             .attr_expiry = Instant::now() - Duration::from_secs(1);
         let err = vfs
-            .lookup(FUSE_ROOT_ID, "stale", Caller::NONE)
+            .lookup(NodeId::ROOT, "stale", Caller::NONE)
             .await
             .expect_err("ENOENT getattr must not return the stale nodeid");
         assert_eq!(err.errno, ENOENT);
@@ -348,7 +346,7 @@ fn interleaved_lookup_cannot_evict_pinned_unlink_target() {
             async move {
                 for i in 3..=8 {
                     let _ = vfs
-                        .lookup(FUSE_ROOT_ID, &format!("f{i}"), Caller::NONE)
+                        .lookup(NodeId::ROOT, &format!("f{i}"), Caller::NONE)
                         .await;
                 }
             }
@@ -365,7 +363,7 @@ fn mkdir_uses_rollback_helper_on_merge_failure() {
     block_on(async {
         lookup(&vfs, "d").await;
         let err = vfs
-            .mkdir(FUSE_ROOT_ID, "d", MODE_DIR as u32, Caller::NONE)
+            .mkdir(NodeId::ROOT, "d", MODE_DIR as u32, Caller::NONE)
             .await
             .expect_err("mkdir generation mismatch");
         assert_eq!(err.errno, ESTALE);
@@ -386,7 +384,13 @@ fn link_rolls_back_on_generation_mismatch() {
     block_on(async {
         lookup(&vfs, "src").await;
         let fd = vfs
-            .open(20, O_RDWR, false, vec!["src".into()], Caller::NONE)
+            .open(
+                NodeId::new(20),
+                O_RDWR,
+                false,
+                vec!["src".into()],
+                Caller::NONE,
+            )
             .await
             .unwrap();
         let err = vfs
@@ -409,15 +413,21 @@ fn rename_keeps_parent_child_count() {
     block_on(async {
         lookup(&vfs, "a").await;
         let fd = vfs
-            .open(10, O_RDWR, false, vec!["a".into()], Caller::NONE)
+            .open(
+                NodeId::new(10),
+                O_RDWR,
+                false,
+                vec!["a".into()],
+                Caller::NONE,
+            )
             .await
             .unwrap();
         vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
     });
     let g = vfs.state.borrow();
-    assert_eq!(g.inodes[&FUSE_ROOT_ID].child_count, 1);
-    assert!(g.dcache[&FUSE_ROOT_ID].get("a").is_none());
-    assert_eq!(g.dcache[&FUSE_ROOT_ID]["b"].nodeid, 10);
+    assert_eq!(g.inodes[&NodeId::ROOT].child_count, 1);
+    assert!(g.dcache[&NodeId::ROOT].get("a").is_none());
+    assert_eq!(g.dcache[&NodeId::ROOT]["b"].nodeid, NodeId::new(10));
     drop(g);
     mock.assert_sent(fuse_opcode::FUSE_RENAME);
 }
@@ -428,7 +438,7 @@ fn symlink_rollback_drops_committed_dentry() {
     mock.yield_once.set(true);
     let fd = vfs
         .pre_create_symlink(
-            FUSE_ROOT_ID,
+            NodeId::ROOT,
             "link".into(),
             vec!["link".into()],
             Caller::NONE,
@@ -464,11 +474,11 @@ fn symlink_rollback_drops_committed_dentry() {
     let g = vfs.state.borrow();
     assert!(
         g.dcache
-            .get(&FUSE_ROOT_ID)
+            .get(&NodeId::ROOT)
             .and_then(|names| names.get("link"))
             .is_none()
     );
-    assert_eq!(g.inodes[&FUSE_ROOT_ID].child_count, 0);
+    assert_eq!(g.inodes[&NodeId::ROOT].child_count, 0);
     drop(g);
     mock.assert_sent(fuse_opcode::FUSE_UNLINK);
 }
@@ -485,9 +495,15 @@ fn concurrent_reads_overlap_in_send() {
     let vfs = Rc::new(vfs);
     let fd = block_on(async {
         lookup(&vfs, "f").await;
-        vfs.open(10, O_RDONLY, false, vec!["f".into()], Caller::NONE)
-            .await
-            .unwrap()
+        vfs.open(
+            NodeId::new(10),
+            O_RDONLY,
+            false,
+            vec!["f".into()],
+            Caller::NONE,
+        )
+        .await
+        .unwrap()
     });
 
     let mut pool = LocalPool::new();
@@ -533,7 +549,7 @@ fn uid_on_open_handle(
     block_on(async {
         lookup(&vfs, "f").await;
         let fd = vfs
-            .open(10, O_RDWR, false, vec!["f".into()], OPENER)
+            .open(NodeId::new(10), O_RDWR, false, vec!["f".into()], OPENER)
             .await
             .unwrap();
         op(&vfs, fd, other).await;
@@ -676,7 +692,7 @@ fn evictions_are_logged_and_truncate_clears_them() {
     // One more lookup than fits, so the least recently used name is evicted.
     let (vfs, _mock) = vfs_with((2..=9).map(|i| file(i, 1)));
     for i in 2..=9 {
-        block_on(vfs.lookup(FUSE_ROOT_ID, &format!("f{i}"), Caller::NONE)).unwrap();
+        block_on(vfs.lookup(NodeId::ROOT, &format!("f{i}"), Caller::NONE)).unwrap();
     }
 
     let root = vfs.debug_root();
