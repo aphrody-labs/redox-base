@@ -33,6 +33,8 @@ use crate::linux_abi;
 const UTIME_NOW: i32 = 0x3fffffff;
 const UTIME_OMIT: i32 = 0x3ffffffe;
 
+// TODO: Make scheme accept a config option to set the maximum number of inodes.
+// Consequently selftests would need to be made aware of the value dynamically.
 #[cfg(not(test))]
 const INODES_MAX_LEN: usize = 64 * 1024;
 #[cfg(test)]
