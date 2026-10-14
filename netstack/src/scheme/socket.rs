@@ -178,6 +178,8 @@ where
     type DataT;
     type SettingT: Copy;
 
+    const BASE_PATH: &'static str;
+
     fn new_scheme_data() -> Self::SchemeDataT;
 
     fn can_send(&self) -> bool;
@@ -884,15 +886,21 @@ where
     fn fpath(&mut self, fd: usize, buf: &mut [u8], _ctx: &CallerCtx) -> SyscallResult<usize> {
         let file = self.handles.get_mut(fd)?;
 
-        let file = match *file {
-            Handle::File(ref mut f) => f,
-            _ => return Err(SyscallError::new(syscall::EBADF)),
-        };
+        match *file {
+            Handle::File(ref mut f) => {
+                let socket_set = self.socket_set.borrow();
+                let socket = socket_set.get::<SocketT>(f.socket_handle());
 
-        let socket_set = self.socket_set.borrow();
-        let socket = socket_set.get::<SocketT>(file.socket_handle());
+                socket.fpath(f, buf)
+            }
+            Handle::Null(_) => {
+                let path = SocketT::BASE_PATH.as_bytes();
+                buf[0..path.len()].copy_from_slice(path);
 
-        socket.fpath(file, buf)
+                Ok(path.len())
+            }
+            _ => Err(SyscallError::new(syscall::EBADF)),
+        }
     }
 
     fn fcntl(

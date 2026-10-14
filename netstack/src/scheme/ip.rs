@@ -19,6 +19,8 @@ impl<'a> SchemeSocket for RawSocket<'a> {
     type DataT = ();
     type SettingT = ();
 
+    const BASE_PATH: &'static str = "/scheme/ip/";
+
     fn new_scheme_data() -> Self::SchemeDataT {
         ()
     }

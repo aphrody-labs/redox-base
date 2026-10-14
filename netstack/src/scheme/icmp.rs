@@ -32,6 +32,8 @@ impl<'a> SchemeSocket for IcmpSocket<'a> {
     type DataT = IcmpData;
     type SettingT = ();
 
+    const BASE_PATH: &'static str = "/scheme/icmp/";
+
     fn new_scheme_data() -> Self::SchemeDataT {
         PortSet::new(1u16, 0xffffu16).expect("Wrong ICMP ident values")
     }
