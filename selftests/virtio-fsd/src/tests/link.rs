@@ -47,6 +47,7 @@ pub fn cases() -> Vec<TestCase> {
         func link_rename_onto_same_inode,
         func link_rename_over_one_link,
         func link_symlink_resolves_per_dir,
+        func link_second_name_does_not_retarget_dotdot,
         func link_churn,
         edge edge_link_eexist,
         edge edge_link_dir,
@@ -715,6 +716,48 @@ fn link_symlink_resolves_per_dir(ctx: &TestCtx) -> Outcome {
     }
     check_str!(check_ok!(fsutil::readlink(&in_a)), "t.txt");
     check_str!(check_ok!(fsutil::readlink(&in_b)), "t.txt");
+    Outcome::Pass
+}
+
+// Looking up the second name merges into the cached inode. That must not make `..`
+// climb through either name, and must not move either directory's own parent.
+fn link_second_name_does_not_retarget_dotdot(ctx: &TestCtx) -> Outcome {
+    let root = ctx.work("ln_merge_parent");
+    check_ok!(fsutil::make_dir(&root));
+    let a = root.join("a");
+    let b = root.join("b");
+    check_ok!(fsutil::make_dir(&a));
+    check_ok!(fsutil::make_dir(&b));
+    check_ok!(fsutil::write_all_path(&a.join("f"), b"same"));
+    check_ok!(fsutil::link(&a.join("f"), &b.join("f")));
+
+    check_bytes!(check_ok!(fsutil::read_to_vec(&b.join("f"))), b"same");
+    check_bytes!(check_ok!(fsutil::read_to_vec(&a.join("f"))), b"same");
+    check_eq!(
+        check_ok!(fsutil::stat(&a.join("f"))).st_ino,
+        check_ok!(fsutil::stat(&b.join("f"))).st_ino
+    );
+
+    let dir_a = check_ok!(fsutil::open_dir(&a));
+    let dir_b = check_ok!(fsutil::open_dir(&b));
+    for (dir, which) in [(&dir_a, "a"), (&dir_b, "b")] {
+        check_errno!(
+            fsutil::openat_dir(dir, "f/.."),
+            fsutil::ENOTDIR,
+            "{which}/f/.."
+        );
+        check_errno!(
+            fsutil::openat_ro(dir, "f/."),
+            fsutil::ENOTDIR,
+            "{which}/f/."
+        );
+        let up = check_ok!(fsutil::openat_dir(dir, ".."));
+        let p = check_ok!(fsutil::fpath(&up));
+        check!(
+            p.trim_end_matches('/').ends_with("ln_merge_parent"),
+            "{which}/.. is not the common parent: {p}"
+        );
+    }
     Outcome::Pass
 }
 

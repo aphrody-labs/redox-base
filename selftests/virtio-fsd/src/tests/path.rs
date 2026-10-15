@@ -1,4 +1,6 @@
-use crate::{Outcome, TestCase, TestCtx, cases, check, check_ok, check_out, fsutil};
+use crate::{
+    Outcome, TestCase, TestCtx, cases, check, check_bytes, check_errno, check_ok, check_out, fsutil,
+};
 
 pub fn cases() -> Vec<TestCase> {
     cases![
@@ -7,6 +9,7 @@ pub fn cases() -> Vec<TestCase> {
         func path_openat_dotdot,
         func path_openat_dotdot_to_sibling,
         func path_root_dotdot_stays_in_scheme,
+        func path_component_through_file_is_enotdir,
         func path_deep_chain_fpath,
     ]
 }
@@ -78,6 +81,29 @@ fn scheme_root_of(path: &str) -> Option<String> {
     let rest = path.trim_end_matches('/').strip_prefix("/scheme/")?;
     let name = rest.split('/').next()?;
     Some(format!("/scheme/{name}"))
+}
+
+fn path_component_through_file_is_enotdir(ctx: &TestCtx) -> Outcome {
+    let dir = ctx.work("path_file_comp");
+    check_ok!(fsutil::make_dir(&dir));
+    check_ok!(fsutil::write_all_path(&dir.join("f"), b"x"));
+    let parent = check_ok!(fsutil::open_dir(&dir));
+    // `f/..` must not open `dir`. `f/.` must not open `f`.
+    check_errno!(
+        fsutil::openat_dir(&parent, "f/.."),
+        fsutil::ENOTDIR,
+        "file/.."
+    );
+    check_errno!(fsutil::openat_ro(&parent, "f/."), fsutil::ENOTDIR, "file/.");
+    check_errno!(fsutil::openat_ro(&parent, "f/x"), fsutil::ENOTDIR, "file/x");
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dir.join("f"))), b"x");
+    let up = check_ok!(fsutil::openat_dir(&parent, ".."));
+    let p = check_ok!(fsutil::fpath(&up));
+    check!(
+        p.starts_with("/scheme/") && !p.contains("path_file_comp"),
+        "looking up f retargeted the directory: {p}"
+    );
+    Outcome::Pass
 }
 
 fn path_deep_chain_fpath(ctx: &TestCtx) -> Outcome {

@@ -13,9 +13,9 @@ use log::warn;
 use scheme_utils::HandleMap;
 use syscall::error::{ESTALE, Error, Result};
 use syscall::{
-    EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, EPERM, MODE_DIR, MODE_SYMLINK,
-    MODE_TYPE, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDONLY, O_RDWR,
-    O_TRUNC, O_WRONLY, TimeSpec,
+    EBADF, EEXIST, EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, EPERM, MODE_DIR, MODE_FILE,
+    MODE_SYMLINK, MODE_TYPE, O_ACCMODE, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK,
+    O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, TimeSpec,
 };
 
 use crate::fuse::{
@@ -29,7 +29,6 @@ use crate::linux_abi;
 // - UTIME_OMIT = "leave this stamp alone".
 // They are not nanoseconds (NOW is > 1e9), so they cannot go on the wire as atimensec/mtimensec.
 // FUSE uses FATTR_ATIME_NOW / FATTR_MTIME_NOW for NOW, and no bit at all for OMIT.
-// These are used by `Vfs::apply_timespec`.
 const UTIME_NOW: i32 = 0x3fffffff;
 const UTIME_OMIT: i32 = 0x3ffffffe;
 
@@ -46,6 +45,7 @@ const FORGET_QUEUE_MIN_CAP: usize = 1024;
 const LRU_EVICT_LOG_CAP: usize = 8192;
 pub const LRU_DEBUG_EVICTED_NAME: &str = "lru_evicted";
 
+#[derive(Debug)]
 pub struct WalkResult {
     pub nodeid: NodeId,
     pub node_mode: u16,
@@ -56,7 +56,6 @@ pub struct WalkResult {
 }
 
 struct Inode {
-    nodeid: NodeId,
     generation: u64,
     parent: NodeId,
     attr: fuse_attr,
@@ -64,7 +63,6 @@ struct Inode {
     nlookup: u64,
     forget_pending: bool,
     open_fd_count: u64,
-    child_count: u64,
     pin_count: u64,
     lru_timestamp: u64,
     /// Shared for reads, exclusive for writes. Held for the whole call so a
@@ -171,6 +169,8 @@ impl Handle {
 
 struct VfsState {
     inodes: BTreeMap<NodeId, Inode>,
+    /// Cached names per directory. A key is a cached inode with at least one name, so a
+    /// directory has children exactly when it has a key here.
     dcache: BTreeMap<NodeId, BTreeMap<String, Dentry>>,
     /// Reverse index: child nodeid -> (parent, name) for every live dentry.
     dentry_index: BTreeMap<NodeId, BTreeSet<(NodeId, String)>>,
@@ -179,6 +179,15 @@ struct VfsState {
     forget_queue: VecDeque<(NodeId, u64)>,
     /// Logical clock for LRU eviction. It ticks on every `touch`, not with wall time.
     lru_clock: u64,
+    /// `(lru_timestamp, nodeid)` of every evictable inode, oldest first, so picking a victim
+    /// never scans the cache.
+    ///
+    /// Invariant: it holds exactly the inodes for which `evictable` is true, keyed by their
+    /// current `lru_timestamp`. Hence every write to `lru_timestamp`, `pin_count` or
+    /// `open_fd_count` goes through `update_lru`, and so does every change to a directory's
+    /// entry in `dcache` (`insert_dentry`, `drop_dentry`).
+    lru_evictables: BTreeSet<(u64, NodeId)>,
+    lru_full_warned: bool,
     evicted_names: VecDeque<String>,
 }
 
@@ -203,33 +212,61 @@ impl<T: FuseTransporter> Drop for InodePin<'_, T> {
 
 impl VfsState {
     fn touch(&mut self, nodeid: NodeId) {
-        self.lru_clock = self.lru_clock.saturating_add(1);
-        if let Some(inode) = self.inodes.get_mut(&nodeid) {
-            inode.lru_timestamp = self.lru_clock;
-        }
-    }
-
-    fn pin(&mut self, nodeid: NodeId) -> Result<()> {
-        let inode = self.inodes.get_mut(&nodeid).ok_or(Error::new(ESTALE))?;
-        inode.pin_count = count_inc(inode.pin_count, "pin count", nodeid);
-        Ok(())
-    }
-
-    fn unpin(&mut self, nodeid: NodeId) {
-        let should_remove = {
-            let Some(inode) = self.inodes.get_mut(&nodeid) else {
-                return;
-            };
-            inode.pin_count = count_dec(inode.pin_count, "pin count", nodeid);
-            inode.forget_pending && inode.open_fd_count == 0 && inode.pin_count == 0
-        };
-        if should_remove {
-            self.remove_inode(nodeid);
-        }
+        self.lru_clock = self
+            .lru_clock
+            .checked_add(1)
+            .expect("virtio-fsd: LRU clock overflow");
+        let now = self.lru_clock;
+        self.update_lru(nodeid, |i| i.lru_timestamp = now);
     }
 
     fn idle(inode: &Inode) -> bool {
         inode.open_fd_count == 0 && inode.pin_count == 0
+    }
+
+    fn evictable(nodeid: NodeId, inode: &Inode, has_children: bool) -> bool {
+        nodeid != NodeId::ROOT && Self::idle(inode) && !has_children
+    }
+
+    /// Removes the inode from `lru_evictables` and applies `f` to it.
+    /// If the inode is still evictable after `f` is applied, it is re-inserted into `lru_evictables`.
+    ///
+    /// Returns `Some(R)` where `R` is the return value of `f` if `nodeid` is cached, or `None` if it is not cached.
+    fn update_lru<R>(&mut self, nodeid: NodeId, f: impl FnOnce(&mut Inode) -> R) -> Option<R> {
+        let inode = self.inodes.get_mut(&nodeid)?;
+        self.lru_evictables.remove(&(inode.lru_timestamp, nodeid));
+
+        let out = f(inode);
+
+        if Self::evictable(nodeid, inode, self.dcache.contains_key(&nodeid)) {
+            self.lru_evictables.insert((inode.lru_timestamp, nodeid));
+        }
+        Some(out)
+    }
+
+    fn pin(&mut self, nodeid: NodeId) -> Result<()> {
+        self.update_lru(nodeid, |i| {
+            i.pin_count = count_inc(i.pin_count, "pin count", nodeid);
+        })
+        .ok_or(Error::new(ESTALE))
+    }
+
+    fn unpin(&mut self, nodeid: NodeId) {
+        self.update_lru(nodeid, |i| {
+            i.pin_count = count_dec(i.pin_count, "pin count", nodeid);
+        });
+        self.drop_if_unused(nodeid);
+    }
+
+    // The only place that finalizes the removal of an unlinked inode.
+    fn drop_if_unused(&mut self, nodeid: NodeId) {
+        if self
+            .inodes
+            .get(&nodeid)
+            .is_some_and(|i| i.forget_pending && Self::idle(i))
+        {
+            self.remove_inode(nodeid);
+        }
     }
 
     fn insert_inode(&mut self, parent: NodeId, entry: &FuseEntryOut, attr_expiry: Instant) {
@@ -237,7 +274,6 @@ impl VfsState {
         self.inodes.insert(
             entry.nodeid,
             Inode {
-                nodeid: entry.nodeid,
                 generation: entry.generation,
                 parent,
                 attr: entry.attr,
@@ -245,12 +281,13 @@ impl VfsState {
                 nlookup: 1,
                 forget_pending: false,
                 open_fd_count: 0,
-                child_count: 0,
                 pin_count: 0,
                 lru_timestamp: 0,
                 io_lock: Rc::new(RwLock::new(())),
             },
         );
+
+        self.update_lru(entry.nodeid, |_| ());
     }
 
     fn unindex_dentry(&mut self, nodeid: NodeId, parent: NodeId, name: &str) {
@@ -263,8 +300,10 @@ impl VfsState {
         }
     }
 
-    /// Insert or replace a dentry. `child_count` tracks live dentries under `parent`.
     fn insert_dentry(&mut self, parent: NodeId, name: &str, nodeid: NodeId, entry_expiry: Instant) {
+        if !self.inodes.contains_key(&parent) {
+            return;
+        }
         let old = self.dcache.entry(parent).or_default().insert(
             name.to_owned(),
             Dentry {
@@ -272,14 +311,13 @@ impl VfsState {
                 entry_expiry,
             },
         );
+
+        // `parent` has children at this point, so it is no longer evictable.
+        self.update_lru(parent, |_| ());
         match old {
             Some(old) if old.nodeid == nodeid => return,
             Some(old) => self.unindex_dentry(old.nodeid, parent, name),
-            None => {
-                if let Some(p) = self.inodes.get_mut(&parent) {
-                    p.child_count = p.child_count.saturating_add(1);
-                }
-            }
+            None => {}
         }
         self.dentry_index
             .entry(nodeid)
@@ -294,44 +332,34 @@ impl VfsState {
             self.dcache.remove(&parent);
         }
         self.unindex_dentry(dentry.nodeid, parent, name);
-        if let Some(p) = self.inodes.get_mut(&parent) {
-            p.child_count = p.child_count.saturating_sub(1);
-        }
+
+        // `parent` may have lost its last child, which makes it evictable again.
+        self.update_lru(parent, |_| ());
         Some(dentry)
     }
 
     fn unmerge_entry(&mut self, parent: NodeId, name: &str, nodeid: NodeId) {
         self.drop_dentry(parent, name);
-        let remove = {
-            let Some(inode) = self.inodes.get_mut(&nodeid) else {
-                return;
-            };
-            inode.nlookup = count_dec(inode.nlookup, "nlookup", nodeid);
-            inode.nlookup == 0 && Self::idle(inode)
+        let Some(inode) = self.inodes.get_mut(&nodeid) else {
+            return;
         };
+
+        inode.nlookup = count_dec(inode.nlookup, "nlookup", nodeid);
+        inode.forget_pending |= inode.nlookup == 0;
         self.forget_queue.push_back((nodeid, 1));
-        if remove {
-            // `nlookup` is already 0, so this does not queue a second forget.
-            self.remove_inode(nodeid);
+        self.drop_if_unused(nodeid);
+    }
+
+    fn unlink_name(&mut self, parent: NodeId, name: &str, nodeid: NodeId) {
+        self.drop_dentry(parent, name);
+        if let Some(inode) = self.inodes.get_mut(&nodeid) {
+            inode.forget_pending = true;
+            inode.attr_expiry = Instant::now();
         }
+        self.drop_if_unused(nodeid);
     }
 
     fn merge_entry(&mut self, parent: NodeId, name: &str, entry: FuseEntryOut) -> Result<()> {
-        self.merge(parent, name, entry, true)
-    }
-
-    fn merge_link(&mut self, parent: NodeId, name: &str, entry: FuseEntryOut) -> Result<()> {
-        // A hard link does not change which directory `..` resolves to.
-        self.merge(parent, name, entry, false)
-    }
-
-    fn merge(
-        &mut self,
-        parent: NodeId,
-        name: &str,
-        entry: FuseEntryOut,
-        set_parent: bool,
-    ) -> Result<()> {
         let now = Instant::now();
         let attr_expiry = fuse_expiry(now, entry.attr_valid, entry.attr_valid_nsec);
         let entry_expiry = fuse_expiry(now, entry.entry_valid, entry.entry_valid_nsec);
@@ -349,7 +377,7 @@ impl VfsState {
                 inode.nlookup = count_inc(inode.nlookup, "nlookup", nodeid);
                 inode.attr = entry.attr;
                 inode.attr_expiry = attr_expiry;
-                if set_parent {
+                if inode.mode_type() == MODE_DIR {
                     inode.parent = parent;
                 }
                 false
@@ -369,12 +397,29 @@ impl VfsState {
     }
 
     fn increment_fd_count(&mut self, nodeid: NodeId) -> Result<()> {
-        let inode = self.inodes.get_mut(&nodeid).ok_or_else(|| {
+        self.update_lru(nodeid, |i| {
+            i.open_fd_count = count_inc(i.open_fd_count, "open fd count", nodeid);
+        })
+        .ok_or_else(|| {
             warn!("virtio-fsd: increment_fd_count: no inode for nodeid={nodeid}");
             Error::new(EBADF)
-        })?;
-        inode.open_fd_count = count_inc(inode.open_fd_count, "open fd count", nodeid);
-        Ok(())
+        })
+    }
+
+    fn decrement_fd_count(&mut self, nodeid: NodeId) {
+        let updated = self.update_lru(nodeid, |i| {
+            i.open_fd_count = count_dec(i.open_fd_count, "open fd count", nodeid);
+        });
+        if updated.is_none() {
+            warn!("virtio-fsd: decrement_fd_count: no inode for nodeid={nodeid}");
+            return;
+        }
+        self.drop_if_unused(nodeid);
+    }
+
+    fn insert_open_handle(&mut self, handle: Handle) -> Result<usize> {
+        self.increment_fd_count(handle.nodeid()?)?;
+        Ok(self.handles.insert(handle))
     }
 
     fn commit_symlink(
@@ -400,37 +445,6 @@ impl VfsState {
                 self.decrement_fd_count(nodeid);
                 Err(err)
             }
-        }
-    }
-
-    fn decrement_fd_count(&mut self, nodeid: NodeId) {
-        let should_remove = {
-            let Some(inode) = self.inodes.get_mut(&nodeid) else {
-                warn!("virtio-fsd: decrement_fd_count: no inode for nodeid={nodeid}");
-                return;
-            };
-            inode.open_fd_count = count_dec(inode.open_fd_count, "open fd count", nodeid);
-            inode.forget_pending && Self::idle(inode)
-        };
-        if should_remove {
-            self.remove_inode(nodeid);
-        }
-    }
-
-    fn forget_or_mark(&mut self, nodeid: NodeId) {
-        match self.inodes.get(&nodeid).map(Self::idle) {
-            Some(true) => {
-                self.remove_inode(nodeid);
-            }
-            Some(false) => {
-                if let Some(inode) = self.inodes.get_mut(&nodeid) {
-                    inode.forget_pending = true;
-                    // The inode outlives the name that was just removed, so its cached
-                    // attrs are stale. Make the next getattr refetch them.
-                    inode.attr_expiry = Instant::now();
-                }
-            }
-            None => {}
         }
     }
 
@@ -470,65 +484,68 @@ impl VfsState {
         mode
     }
 
-    fn pick_lru_victim(&self) -> Option<NodeId> {
-        self.inodes
-            .iter()
-            .filter(|(id, i)| {
-                **id != NodeId::ROOT
-                    && i.open_fd_count == 0
-                    && i.pin_count == 0
-                    && i.child_count == 0
-            })
-            .min_by_key(|(_, i)| i.lru_timestamp)
-            .map(|(id, _)| *id)
+    fn pop_lru_victim(&mut self) -> Option<NodeId> {
+        while let Some((ts, id)) = self.lru_evictables.pop_first() {
+            let has_children = self.dcache.contains_key(&id);
+            match self.inodes.get(&id) {
+                Some(i) if i.lru_timestamp == ts && Self::evictable(id, i, has_children) => {
+                    return Some(id);
+                }
+                _ => {
+                    warn!("virtio-fsd: dropping stale LRU entry for nodeid={id}");
+                    debug_assert!(false, "stale LRU entry for nodeid={id}");
+                }
+            }
+        }
+        None
     }
 
     fn populate_forgets(&mut self) {
         while self.inodes.len() >= INODES_MAX_LEN {
-            let Some(id) = self.pick_lru_victim() else {
-                warn!(
-                    "virtio-fsd: LRU full ({}/{}), nothing evictable",
-                    self.inodes.len(),
-                    INODES_MAX_LEN
-                );
-                break;
+            let Some(id) = self.pop_lru_victim() else {
+                if !self.lru_full_warned {
+                    self.lru_full_warned = true;
+                    warn!(
+                        "virtio-fsd: LRU full ({}/{}), nothing evictable",
+                        self.inodes.len(),
+                        INODES_MAX_LEN
+                    );
+                }
+                return;
             };
+
+            if let Some(name) = self.dcache_name(id) {
+                if self.evicted_names.len() >= LRU_EVICT_LOG_CAP {
+                    self.evicted_names.pop_front();
+                }
+                self.evicted_names.push_back(name);
+            }
             self.remove_inode(id);
         }
+        self.lru_full_warned = false;
     }
 
     fn remove_inode(&mut self, nodeid: NodeId) {
         if nodeid == NodeId::ROOT {
             return;
         }
-        if let Some(name) = self.dcache_name(nodeid) {
-            if self.evicted_names.len() >= LRU_EVICT_LOG_CAP {
-                self.evicted_names.pop_front();
-            }
-            self.evicted_names.push_back(name);
-        }
-
         let Some(inode) = self.inodes.remove(&nodeid) else {
             return;
         };
+
+        self.lru_evictables.remove(&(inode.lru_timestamp, nodeid));
         if inode.nlookup > 0 {
             self.forget_queue.push_back((nodeid, inode.nlookup));
         }
 
+        // Names pointing at this inode, removed from their directories.
         if let Some(names) = self.dentry_index.remove(&nodeid) {
             for (parent, name) in names {
-                if let Some(map) = self.dcache.get_mut(&parent) {
-                    map.remove(&name);
-                    if map.is_empty() {
-                        self.dcache.remove(&parent);
-                    }
-                }
-                if let Some(p) = self.inodes.get_mut(&parent) {
-                    p.child_count = p.child_count.saturating_sub(1);
-                }
+                self.drop_dentry(parent, &name);
             }
         }
 
+        // Names inside this inode, if it is a directory.
         if let Some(children) = self.dcache.remove(&nodeid) {
             for (name, d) in children {
                 self.unindex_dentry(d.nodeid, nodeid, &name);
@@ -550,19 +567,17 @@ impl VfsState {
     }
 
     fn parent_of(&mut self, nodeid: NodeId) -> Result<(NodeId, u16)> {
-        let inode = self.inodes.get(&nodeid).ok_or(Error::new(ESTALE))?;
-        let parent_id = inode.parent;
-        if parent_id == nodeid {
-            // we don't have the authority to look into the parent of root,
-            // hence when cwd is `/scheme/virtio-fs.<tag>`, `ls ..` is same as `ls .`.
-            self.touch(NodeId::ROOT);
-            return Ok((NodeId::ROOT, MODE_DIR));
-        }
-        let parent = self.inodes.get(&parent_id).ok_or(Error::new(ESTALE))?;
-        let out = (parent.nodeid, parent.mode_type());
+        let parent_id = self.inodes.get(&nodeid).ok_or(Error::new(ESTALE))?.parent;
+        let parent_mode_type = self
+            .inodes
+            .get(&parent_id)
+            .ok_or(Error::new(ESTALE))?
+            .mode_type();
+
         self.touch(nodeid);
         self.touch(parent_id);
-        Ok(out)
+
+        Ok((parent_id, parent_mode_type))
     }
 }
 
@@ -589,7 +604,6 @@ impl<T: FuseTransporter> Vfs<T> {
         inodes.insert(
             NodeId::ROOT,
             Inode {
-                nodeid: NodeId::ROOT,
                 // The root is never returned by a lookup, so this is never compared.
                 generation: 0,
                 parent: NodeId::ROOT,
@@ -602,7 +616,6 @@ impl<T: FuseTransporter> Vfs<T> {
                 nlookup: 0,
                 forget_pending: false,
                 open_fd_count: 0,
-                child_count: 0,
                 pin_count: 0,
                 lru_timestamp: 0,
                 io_lock: Rc::new(RwLock::new(())),
@@ -618,6 +631,8 @@ impl<T: FuseTransporter> Vfs<T> {
                 handles: HandleMap::new(),
                 forget_queue: VecDeque::with_capacity(FORGET_QUEUE_MIN_CAP),
                 lru_clock: 0,
+                lru_evictables: BTreeSet::new(),
+                lru_full_warned: false,
                 evicted_names: VecDeque::new(),
             }),
         }
@@ -794,16 +809,14 @@ impl<T: FuseTransporter> Vfs<T> {
             g.invalidate_attr(parent_nodeid);
             if let Err(err) = g.merge_entry(parent_nodeid, name, payload.entry) {
                 Err(err)
-            } else if let Err(err) = g.increment_fd_count(nodeid) {
-                g.unmerge_entry(parent_nodeid, name, nodeid);
-                Err(err)
             } else {
-                Ok(g.handles.insert(Handle::File {
+                g.insert_open_handle(Handle::File {
                     nodeid,
                     fh,
                     path: path.join("/"),
                     caller,
-                }))
+                })
+                .inspect_err(|_| g.unmerge_entry(parent_nodeid, name, nodeid))
             }
         };
         match insert {
@@ -847,31 +860,31 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let fh = payload.fh;
 
-        let fd = {
-            let mut g = self.state.borrow_mut();
-            if let Err(err) = g.increment_fd_count(nodeid) {
-                drop(g);
+        let handle = if is_dir {
+            Handle::Directory {
+                nodeid,
+                fh,
+                path: path.join("/"),
+                caller,
+            }
+        } else {
+            Handle::File {
+                nodeid,
+                fh,
+                path: path.join("/"),
+                caller,
+            }
+        };
+
+        let inserted = self.state.borrow_mut().insert_open_handle(handle);
+        let fd = match inserted {
+            Ok(fd) => fd,
+            Err(err) => {
                 if let Err(rel_err) = self.fuse.release(nodeid, fh, is_dir, caller).await {
                     warn!("virtio-fsd: FUSE_RELEASE: {rel_err}");
                 }
                 return Err(err);
             }
-            let handle = if is_dir {
-                Handle::Directory {
-                    nodeid,
-                    fh,
-                    path: path.join("/"),
-                    caller,
-                }
-            } else {
-                Handle::File {
-                    nodeid,
-                    fh,
-                    path: path.join("/"),
-                    caller,
-                }
-            };
-            g.handles.insert(handle)
         };
 
         if trunc && !atomic_trunc {
@@ -893,7 +906,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 return Ok(fuse_attr {
                     ino: 0,
                     size: g.eviction_log().len() as u64,
-                    mode: 0o100000,
+                    mode: u32::from(MODE_FILE) | 0o400,
                     ..fuse_attr::default()
                 });
             }
@@ -1186,10 +1199,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 Handle::Directory {
                     nodeid, fh, caller, ..
                 } => (*nodeid, *fh, true, *caller),
-                _ => {
-                    warn!("virtio-fsd: fsync is called on an invalid fd: {fd}");
-                    return Err(Error::new(EBADF));
-                }
+                _ => return Err(Error::new(EBADF)),
             }
         };
 
@@ -1230,7 +1240,7 @@ impl<T: FuseTransporter> Vfs<T> {
             match g.handles.get(fd)? {
                 Handle::File {
                     nodeid, fh, caller, ..
-                } => (*nodeid, Some(*fh), *caller),
+                } => (*nodeid, *fh, *caller),
                 Handle::Directory { .. } => return Err(Error::new(EISDIR)),
                 _ => return Err(Error::new(EBADF)),
             }
@@ -1241,10 +1251,8 @@ impl<T: FuseTransporter> Vfs<T> {
             ..Default::default()
         };
         fuse_in.valid = FATTR_SIZE;
-        if let Some(fh) = fh {
-            fuse_in.valid |= FATTR_FH;
-            fuse_in.fh = fh.into();
-        }
+        fuse_in.valid |= FATTR_FH;
+        fuse_in.fh = fh.into();
 
         self.setattr(nodeid, fuse_in, caller).await
     }
@@ -1433,7 +1441,7 @@ impl<T: FuseTransporter> Vfs<T> {
     ) -> Result<WalkResult> {
         let mut hops = 0u32;
         while walk.node_mode == MODE_SYMLINK {
-            hops = hops.saturating_add(1);
+            hops += 1;
             if hops > SYMLOOP_MAX {
                 return Err(Error::new(ELOOP));
             }
@@ -1450,22 +1458,13 @@ impl<T: FuseTransporter> Vfs<T> {
         open_flags: usize,
         caller: Caller,
     ) -> Result<WalkResult> {
-        let mut walk = WalkResult {
-            // Placeholder, always overwritten below.
-            nodeid: NodeId::ROOT,
-            node_mode: 0,
-            parent_nodeid: None,
-            rel_path: Vec::new(),
-            last_to_be_created: false,
-        };
-
         // Debug scheme handles have no FUSE path. Reject them before the absolute
         // path shortcut below, which never looks at `fd`.
         if self.is_debug(fd) {
             return Err(Error::new(EPERM));
         }
 
-        (walk.nodeid, walk.node_mode, walk.rel_path) = if path.starts_with('/') {
+        let (nodeid, node_mode, rel_path) = if path.starts_with('/') {
             (NodeId::ROOT, MODE_DIR, Vec::new())
         } else {
             let g = self.state.borrow();
@@ -1490,56 +1489,70 @@ impl<T: FuseTransporter> Vfs<T> {
             }?
         };
 
+        let mut walk = WalkResult {
+            nodeid,
+            node_mode,
+            parent_nodeid: None,
+            rel_path,
+            last_to_be_created: false,
+        };
+
         let mut _cur_pin = self.pin(walk.nodeid)?;
         let path_parts: Vec<&str> = path_components(path);
 
-        if !path.is_empty() && path != "/" {
-            for (i, name) in path_parts.iter().copied().enumerate() {
-                let is_last_element = i == path_parts.len() - 1;
+        if path.is_empty() || path == "/" {
+            return Ok(walk);
+        }
 
-                if name.is_empty() || name == "." {
-                    continue;
-                }
+        for (i, name) in path_parts.iter().copied().enumerate() {
+            let is_last_element = i == path_parts.len() - 1;
 
-                if name == ".." {
-                    (walk.nodeid, walk.node_mode) =
-                        self.state.borrow_mut().parent_of(walk.nodeid)?;
+            if walk.node_mode != MODE_DIR {
+                return Err(Error::new(ENOTDIR));
+            }
+
+            if name.is_empty() || name == "." {
+                continue;
+            }
+
+            if name == ".." {
+                (walk.nodeid, walk.node_mode) = self.state.borrow_mut().parent_of(walk.nodeid)?;
+                _cur_pin = self.pin(walk.nodeid)?;
+                walk.rel_path.pop();
+                continue;
+            }
+
+            walk.rel_path.push(name.to_owned());
+
+            let parent = walk.nodeid;
+            walk.parent_nodeid = Some(parent);
+            match self.lookup(parent, name, caller).await {
+                Ok((id, mode)) => {
+                    walk.nodeid = id;
+                    walk.node_mode = mode;
                     _cur_pin = self.pin(walk.nodeid)?;
-                    walk.rel_path.pop();
-                    continue;
                 }
-
-                walk.rel_path.push(name.to_owned());
-
-                let parent = walk.nodeid;
-                walk.parent_nodeid = Some(parent);
-                match self.lookup(parent, name, caller).await {
-                    Ok((id, mode)) => {
-                        walk.nodeid = id;
-                        walk.node_mode = mode;
-                        _cur_pin = self.pin(walk.nodeid)?;
+                Err(err) => {
+                    if is_last_element
+                        && err.errno == ENOENT
+                        && (open_flags & syscall::O_CREAT != 0)
+                    {
+                        walk.last_to_be_created = true;
+                        break;
                     }
-                    Err(err) => {
-                        if is_last_element
-                            && err.errno == ENOENT
-                            && (open_flags & syscall::O_CREAT != 0)
-                        {
-                            walk.last_to_be_created = true;
-                            break;
-                        }
-                        return Err(err);
-                    }
+                    return Err(err);
                 }
+            }
 
-                if !is_last_element && walk.node_mode == MODE_SYMLINK {
-                    walk = self.follow_chain(walk, caller).await?;
-                    _cur_pin = self.pin(walk.nodeid)?;
-                    if walk.node_mode != MODE_DIR {
-                        return Err(Error::new(ENOTDIR));
-                    }
+            if !is_last_element && walk.node_mode == MODE_SYMLINK {
+                walk = self.follow_chain(walk, caller).await?;
+                _cur_pin = self.pin(walk.nodeid)?;
+                if walk.node_mode != MODE_DIR {
+                    return Err(Error::new(ENOTDIR));
                 }
             }
         }
+
         Ok(walk)
     }
 
@@ -1568,34 +1581,40 @@ impl<T: FuseTransporter> Vfs<T> {
         let mut _cur_pin = self.pin(walk.nodeid)?;
         let path_parts: Vec<&str> = path_components(path);
 
-        if !path.is_empty() && path != "/" {
-            for name in path_parts.iter().copied() {
-                if name.is_empty() || name == "." {
-                    continue;
-                }
+        if path.is_empty() || path == "/" {
+            return Ok(walk);
+        }
 
-                if name == ".." {
-                    (walk.nodeid, walk.node_mode) =
-                        self.state.borrow_mut().parent_of(walk.nodeid)?;
+        for name in path_parts.iter().copied() {
+            if walk.node_mode != MODE_DIR {
+                return Err(Error::new(ENOTDIR));
+            }
+
+            if name.is_empty() || name == "." {
+                continue;
+            }
+
+            if name == ".." {
+                (walk.nodeid, walk.node_mode) = self.state.borrow_mut().parent_of(walk.nodeid)?;
+                _cur_pin = self.pin(walk.nodeid)?;
+                walk.rel_path.pop();
+                continue;
+            }
+
+            walk.rel_path.push(name.to_owned());
+
+            let parent = walk.nodeid;
+            walk.parent_nodeid = Some(parent);
+            match self.lookup(parent, name, caller).await {
+                Ok((id, mode)) => {
+                    walk.nodeid = id;
+                    walk.node_mode = mode;
                     _cur_pin = self.pin(walk.nodeid)?;
-                    walk.rel_path.pop();
-                    continue;
                 }
-
-                walk.rel_path.push(name.to_owned());
-
-                let parent = walk.nodeid;
-                walk.parent_nodeid = Some(parent);
-                match self.lookup(parent, name, caller).await {
-                    Ok((id, mode)) => {
-                        walk.nodeid = id;
-                        walk.node_mode = mode;
-                        _cur_pin = self.pin(walk.nodeid)?;
-                    }
-                    Err(err) => return Err(err),
-                }
+                Err(err) => return Err(err),
             }
         }
+
         Ok(walk)
     }
 
@@ -1641,14 +1660,13 @@ impl<T: FuseTransporter> Vfs<T> {
             .await
             .map_err(|e| e.into_syscall(opcode))?;
 
-        // Unpin first, so `forget_or_mark` can drop the inode right away and
+        // Unpin first, so `unlink_name` can drop the inode right away and
         // the FUSE_FORGET goes out with the flush below.
         drop(target_pin);
 
         {
             let mut g = self.state.borrow_mut();
-            g.forget_or_mark(walk.nodeid);
-            g.drop_dentry(parent, &name);
+            g.unlink_name(parent, &name, walk.nodeid);
             g.invalidate_attr(parent);
         }
 
@@ -1683,6 +1701,8 @@ impl<T: FuseTransporter> Vfs<T> {
             walk.nodeid
         };
 
+        let _old_parent_pin = self.pin(old_parent)?;
+
         let dest_walk = self.walk_path(fd, dest, O_CREAT, caller).await?;
         let new_name = dest_walk
             .rel_path
@@ -1690,6 +1710,7 @@ impl<T: FuseTransporter> Vfs<T> {
             .cloned()
             .ok_or(Error::new(EINVAL))?;
         let new_parent = dest_walk.parent_nodeid.ok_or(Error::new(EINVAL))?;
+        let _new_parent_pin = self.pin(new_parent)?;
         let dest_exists = !dest_walk.last_to_be_created;
         let dest_nodeid = dest_walk.nodeid;
 
@@ -1704,7 +1725,7 @@ impl<T: FuseTransporter> Vfs<T> {
         {
             let mut g = self.state.borrow_mut();
             if dest_exists && dest_nodeid != src_nodeid {
-                g.forget_or_mark(dest_nodeid);
+                g.unlink_name(new_parent, &new_name, dest_nodeid);
             }
 
             if let Some(inode) = g.inodes.get_mut(&src_nodeid) {
@@ -1715,7 +1736,6 @@ impl<T: FuseTransporter> Vfs<T> {
                 .drop_dentry(old_parent, &old_name)
                 .map(|d| d.entry_expiry)
                 .unwrap_or_else(Instant::now);
-            g.drop_dentry(new_parent, &new_name);
             g.insert_dentry(new_parent, &new_name, src_nodeid, expiry);
             g.invalidate_attr(old_parent);
             g.invalidate_attr(new_parent);
@@ -1774,6 +1794,8 @@ impl<T: FuseTransporter> Vfs<T> {
             return Err(Error::new(EEXIST));
         }
 
+        let _new_parent_pin = self.pin(new_parent)?;
+
         let name_cstring = cstring(new_name.as_str(), "link: new name")?;
 
         let entry = self
@@ -1784,7 +1806,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let merge_err = {
             let mut g = self.state.borrow_mut();
-            let err = g.merge_link(new_parent, &new_name, entry).err();
+            let err = g.merge_entry(new_parent, &new_name, entry).err();
             if err.is_none() {
                 g.invalidate_attr(new_parent);
             }
@@ -1834,13 +1856,13 @@ impl<T: FuseTransporter> Vfs<T> {
         path: Vec<String>,
         caller: Caller,
     ) -> Result<usize> {
-        let mut g = self.state.borrow_mut();
-        g.increment_fd_count(nodeid)?;
-        Ok(g.handles.insert(Handle::StatOnly {
-            nodeid,
-            path: path.join("/"),
-            caller,
-        }))
+        self.state
+            .borrow_mut()
+            .insert_open_handle(Handle::StatOnly {
+                nodeid,
+                path: path.join("/"),
+                caller,
+            })
     }
 
     pub fn insert_symlink(
@@ -1850,14 +1872,12 @@ impl<T: FuseTransporter> Vfs<T> {
         target: String,
         caller: Caller,
     ) -> Result<usize> {
-        let mut g = self.state.borrow_mut();
-        g.increment_fd_count(nodeid)?;
-        Ok(g.handles.insert(Handle::Symlink {
+        self.state.borrow_mut().insert_open_handle(Handle::Symlink {
             nodeid,
             path: path.join("/"),
             target,
             caller,
-        }))
+        })
     }
 
     pub fn pre_create_symlink(
@@ -1896,6 +1916,11 @@ fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
         .collect()
 }
 
+/// `flags` for `FUSE_OPEN` / `FUSE_CREATE`. Access mode plus the bits that
+/// only make sense at open (`O_CREAT`/`O_EXCL` on create, `O_TRUNC`,
+/// `O_DIRECTORY`). `O_APPEND` is left out: FUSE has no opcode to change
+/// flags later, so the host fd would keep appending even after `F_SETFL`
+/// cleared it. We emulate append ourselves on each write.
 fn fuse_open_flags(redox_flags: usize, is_dir: bool, for_create: bool) -> Result<u32> {
     let accmode = redox_flags & O_ACCMODE;
 
@@ -1929,6 +1954,10 @@ fn fuse_open_flags(redox_flags: usize, is_dir: bool, for_create: bool) -> Result
     Ok(linux_flags)
 }
 
+/// `flags` for `FUSE_READ` / `FUSE_WRITE`. These requests carry the current
+/// open-file flags, so access mode shows up again, along with `O_APPEND`
+/// and `O_NONBLOCK` which `F_SETFL` can change after open. The kernel keeps
+/// those bits and passes them here as `fcntl_flags`.
 fn fuse_io_flags(fcntl_flags: u32) -> u32 {
     let flags = fcntl_flags as usize;
     let mut linux = match flags & O_ACCMODE {

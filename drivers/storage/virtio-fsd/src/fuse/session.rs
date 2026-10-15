@@ -263,7 +263,10 @@ where
             0 => 32,
             n => n,
         };
-        pages.saturating_mul(PAGE_SIZE).max(PAGE_SIZE)
+        let len = pages.checked_mul(PAGE_SIZE).unwrap_or_else(|| {
+            panic!("virtio-fsd: {pages} pages * PAGE_SIZE overflows usize.");
+        });
+        len.max(PAGE_SIZE)
     }
 
     /// Builds a request for `fuse_in`. `extra_len` is the number of bytes sent after it as

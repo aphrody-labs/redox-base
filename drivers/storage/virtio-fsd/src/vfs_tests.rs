@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -11,8 +11,8 @@ use fuse_abi::linux::{
 use futures::executor::{LocalPool, block_on};
 use futures::task::LocalSpawnExt;
 use syscall::{
-    ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR,
-    O_TRUNC,
+    ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, MODE_SYMLINK, O_APPEND, O_CREAT, O_RDONLY,
+    O_RDWR, O_TRUNC,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -221,6 +221,145 @@ fn fill_then(tail: impl IntoIterator<Item = MockReply>) -> Vec<MockReply> {
     replies
 }
 
+fn assert_lru_consistent(vfs: &Vfs<Mock>) {
+    let s = vfs.state.borrow();
+    let expected: BTreeSet<_> = s
+        .inodes
+        .iter()
+        .filter(|(id, i)| VfsState::evictable(**id, i, s.dcache.contains_key(*id)))
+        .map(|(id, i)| (i.lru_timestamp, *id))
+        .collect();
+    assert_eq!(s.lru_evictables, expected);
+    for (dir, names) in &s.dcache {
+        assert!(s.inodes.contains_key(dir), "dcache key {dir} is not cached");
+        assert!(!names.is_empty(), "dcache keeps an empty map for {dir}");
+    }
+}
+
+fn children(vfs: &Vfs<Mock>, dir: NodeId) -> usize {
+    vfs.state
+        .borrow()
+        .dcache
+        .get(&dir)
+        .map_or(0, |names| names.len())
+}
+
+fn in_lru_evictables(vfs: &Vfs<Mock>, raw: u64) -> bool {
+    vfs.state
+        .borrow()
+        .lru_evictables
+        .iter()
+        .any(|(_, id)| *id == NodeId::new(raw))
+}
+
+#[test]
+fn lru_evictables_follows_open_fds_and_pins() {
+    let (vfs, _) = vfs_with([file(2, 1)]);
+    block_on(async {
+        lookup(&vfs, "f").await;
+        assert!(in_lru_evictables(&vfs, 2));
+        assert_lru_consistent(&vfs);
+
+        let id = NodeId::new(2);
+        vfs.state.borrow_mut().increment_fd_count(id).unwrap();
+        assert!(
+            !in_lru_evictables(&vfs, 2),
+            "open inode must not be evictable"
+        );
+        assert_lru_consistent(&vfs);
+
+        vfs.state.borrow_mut().pin(id).unwrap();
+        vfs.state.borrow_mut().decrement_fd_count(id);
+        assert!(
+            !in_lru_evictables(&vfs, 2),
+            "pinned inode must not be evictable"
+        );
+        assert_lru_consistent(&vfs);
+
+        vfs.state.borrow_mut().unpin(id);
+        assert!(in_lru_evictables(&vfs, 2), "idle again, so evictable again");
+        assert_lru_consistent(&vfs);
+
+        vfs.state.borrow_mut().increment_fd_count(id).unwrap();
+        vfs.state.borrow_mut().touch(id);
+        assert!(!in_lru_evictables(&vfs, 2));
+        assert_lru_consistent(&vfs);
+    });
+}
+
+#[test]
+fn lru_evictables_follows_children() {
+    let (vfs, _) = vfs_with([dir(2, 1), file(3, 1)]);
+    block_on(async {
+        lookup(&vfs, "d").await;
+        assert!(in_lru_evictables(&vfs, 2));
+        vfs.lookup(NodeId::new(2), "c", Caller::NONE).await.unwrap();
+        assert!(
+            !in_lru_evictables(&vfs, 2),
+            "a directory with a child is not evictable"
+        );
+        assert!(in_lru_evictables(&vfs, 3));
+        assert_lru_consistent(&vfs);
+
+        vfs.state.borrow_mut().remove_inode(NodeId::new(3));
+        assert!(in_lru_evictables(&vfs, 2));
+        assert_lru_consistent(&vfs);
+    });
+}
+
+#[test]
+fn cache_grows_past_limit_when_nothing_is_evictable() {
+    let (vfs, _) = vfs_with((2..=11).map(|i| file(i, 1)));
+    block_on(async {
+        // Root + f2..f8 fill the cache and every one of them stays open.
+        for i in 2..=8 {
+            lookup(&vfs, &format!("f{i}")).await;
+            vfs.state
+                .borrow_mut()
+                .increment_fd_count(NodeId::new(i))
+                .unwrap();
+        }
+        assert!(vfs.state.borrow().lru_evictables.is_empty());
+        assert!(!vfs.state.borrow().lru_full_warned);
+
+        lookup(&vfs, "f9").await;
+        assert!(vfs.state.borrow().lru_full_warned);
+        vfs.state
+            .borrow_mut()
+            .increment_fd_count(NodeId::new(9))
+            .unwrap();
+        lookup(&vfs, "f10").await;
+        assert_eq!(vfs.state.borrow().inodes.len(), 10);
+        assert!(has_inode(&vfs, 2), "open inodes must survive");
+        assert_lru_consistent(&vfs);
+
+        for i in 2..=9 {
+            vfs.state.borrow_mut().decrement_fd_count(NodeId::new(i));
+        }
+        lookup(&vfs, "f11").await;
+        assert_eq!(vfs.state.borrow().inodes.len(), 8);
+        assert!(!vfs.state.borrow().lru_full_warned);
+        assert_lru_consistent(&vfs);
+    });
+}
+
+#[test]
+fn touching_an_old_inode_protects_it_from_eviction() {
+    let (vfs, _) = vfs_with(fill_then([]));
+    block_on(async {
+        for i in 2..=8 {
+            lookup(&vfs, &format!("f{i}")).await;
+        }
+        // f2 is the oldest. Touching it makes f3 the oldest.
+        vfs.state.borrow_mut().touch(NodeId::new(2));
+        assert_lru_consistent(&vfs);
+        lookup(&vfs, "f9").await;
+        assert!(has_inode(&vfs, 2), "touched inode must survive");
+        assert!(!has_inode(&vfs, 3), "oldest untouched inode must go");
+        assert_lru_consistent(&vfs);
+    });
+}
+
 #[test]
 fn create_rolls_back_host_file_on_generation_mismatch() {
     let (vfs, mock) = vfs_with([
@@ -322,6 +461,105 @@ fn lookup_getattr_refresh_does_not_return_forgotten_nodeid() {
 }
 
 #[test]
+fn dotdot_of_a_directory_is_its_parent() {
+    let (vfs, mock) = vfs_with([dir(11, 1)]);
+    let root = vfs.scheme_root();
+    block_on(async {
+        lookup(&vfs, "d").await;
+        let up = vfs
+            .walk_path(root, "d/..", O_RDONLY, Caller::NONE)
+            .await
+            .unwrap();
+        assert_eq!(up.nodeid, NodeId::ROOT);
+        assert_eq!(up.node_mode, MODE_DIR);
+        let here = vfs
+            .walk_path(root, "d/.", O_RDONLY, Caller::NONE)
+            .await
+            .unwrap();
+        assert_eq!(here.nodeid, NodeId::new(11));
+    });
+    assert_eq!(mock.ops(), vec![u32::from(fuse_opcode::FUSE_LOOKUP)]);
+}
+
+#[test]
+fn component_through_a_file_is_enotdir() {
+    let (vfs, mock) = vfs_with([file(10, 1), dir(11, 1)]);
+    let root = vfs.scheme_root();
+    block_on(async {
+        lookup(&vfs, "f").await;
+        lookup(&vfs, "d").await;
+        for path in ["f/..", "f/.", "f/x"] {
+            let err = vfs
+                .walk_path(root, path, O_RDONLY, Caller::NONE)
+                .await
+                .unwrap_err();
+            assert_eq!(err.errno, ENOTDIR, "{path}");
+        }
+
+        let link = WalkResult {
+            nodeid: NodeId::new(99),
+            node_mode: MODE_SYMLINK,
+            parent_nodeid: Some(NodeId::ROOT),
+            rel_path: vec!["link".into()],
+            last_to_be_created: false,
+        };
+        let err = vfs.walk_link(link, "f/..", Caller::NONE).await.unwrap_err();
+        assert_eq!(err.errno, ENOTDIR);
+        let up = vfs
+            .walk_link(
+                WalkResult {
+                    nodeid: NodeId::new(99),
+                    node_mode: MODE_SYMLINK,
+                    parent_nodeid: Some(NodeId::ROOT),
+                    rel_path: vec!["link".into()],
+                    last_to_be_created: false,
+                },
+                "d/..",
+                Caller::NONE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(up.nodeid, NodeId::ROOT);
+    });
+    assert_eq!(mock.ops(), vec![u32::from(fuse_opcode::FUSE_LOOKUP); 2]);
+}
+
+#[test]
+fn lookup_of_a_second_name_does_not_retarget_parent() {
+    let (vfs, _) = vfs_with([file(10, 1), dir(11, 1), file(10, 1)]);
+    block_on(async {
+        let id = lookup(&vfs, "f").await;
+        assert_eq!(vfs.state.borrow().inodes[&id].parent, NodeId::ROOT);
+        lookup(&vfs, "d").await;
+        vfs.lookup(NodeId::new(11), "g", Caller::NONE)
+            .await
+            .unwrap();
+        assert_eq!(vfs.state.borrow().inodes[&id].parent, NodeId::ROOT);
+        assert_eq!(vfs.state.borrow().dcache[&NodeId::new(11)]["g"].nodeid, id);
+    });
+}
+
+#[test]
+fn directory_relookup_updates_parent() {
+    let (vfs, _) = vfs_with([dir(11, 1), dir(11, 1)]);
+    block_on(async {
+        let id = lookup(&vfs, "d").await;
+        {
+            let mut g = vfs.state.borrow_mut();
+            g.inodes.get_mut(&id).unwrap().parent = id;
+            g.dcache
+                .get_mut(&NodeId::ROOT)
+                .unwrap()
+                .get_mut("d")
+                .unwrap()
+                .entry_expiry = Instant::now() - Duration::from_secs(1);
+        }
+        lookup(&vfs, "d").await;
+        assert_eq!(vfs.state.borrow().inodes[&id].parent, NodeId::ROOT);
+    });
+}
+
+#[test]
 fn interleaved_lookup_cannot_evict_pinned_unlink_target() {
     let (vfs, mock) = vfs_with(fill_then([MockReply::Unit]));
     mock.yield_once.set(true);
@@ -403,7 +641,7 @@ fn link_rolls_back_on_generation_mismatch() {
 }
 
 #[test]
-fn rename_keeps_parent_child_count() {
+fn rename_moves_the_name() {
     let (vfs, mock) = vfs_with([
         file(10, 1),
         bytes(&open_out(1)),
@@ -424,12 +662,209 @@ fn rename_keeps_parent_child_count() {
             .unwrap();
         vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
     });
+    assert_eq!(children(&vfs, NodeId::ROOT), 1);
     let g = vfs.state.borrow();
-    assert_eq!(g.inodes[&NodeId::ROOT].child_count, 1);
     assert!(g.dcache[&NodeId::ROOT].get("a").is_none());
     assert_eq!(g.dcache[&NodeId::ROOT]["b"].nodeid, NodeId::new(10));
     drop(g);
+    assert_lru_consistent(&vfs);
     mock.assert_sent(fuse_opcode::FUSE_RENAME);
+}
+
+#[test]
+fn rename_over_existing_name_drops_the_target() {
+    let (vfs, mock) = vfs_with([
+        file(10, 1),
+        file(11, 1),
+        bytes(&open_out(1)),
+        MockReply::Unit, // FUSE_RENAME, with "b" resolved from the cache
+    ]);
+    block_on(async {
+        lookup(&vfs, "a").await;
+        lookup(&vfs, "b").await;
+        let fd = vfs
+            .open(
+                NodeId::new(10),
+                O_RDWR,
+                false,
+                vec!["a".into()],
+                Caller::NONE,
+            )
+            .await
+            .unwrap();
+        vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
+    });
+    assert!(!has_inode(&vfs, 11), "the unused target goes at once");
+    assert!(!forget_queued(&vfs, 11));
+    assert_eq!(children(&vfs, NodeId::ROOT), 1);
+    assert_eq!(
+        vfs.state.borrow().dcache[&NodeId::ROOT]["b"].nodeid,
+        NodeId::new(10)
+    );
+    assert_lru_consistent(&vfs);
+    assert_eq!(
+        mock.ops(),
+        [
+            u32::from(fuse_opcode::FUSE_LOOKUP),
+            u32::from(fuse_opcode::FUSE_LOOKUP),
+            u32::from(fuse_opcode::FUSE_OPEN),
+            u32::from(fuse_opcode::FUSE_RENAME),
+            u32::from(fuse_opcode::FUSE_FORGET),
+        ]
+    );
+}
+
+#[test]
+fn rename_over_stale_name_replaces_it() {
+    let mut stale = entry(11, 1, MODE_FILE as u32);
+    stale.entry_valid = 0;
+    let (vfs, _) = vfs_with([
+        file(10, 1),
+        bytes(&stale),
+        bytes(&open_out(1)),
+        MockReply::Host(ENOENT), // the host no longer has "b"
+        MockReply::Unit,         // FUSE_RENAME
+    ]);
+    block_on(async {
+        lookup(&vfs, "a").await;
+        lookup(&vfs, "b").await;
+        let fd = vfs
+            .open(
+                NodeId::new(10),
+                O_RDWR,
+                false,
+                vec!["a".into()],
+                Caller::NONE,
+            )
+            .await
+            .unwrap();
+        vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
+    });
+    let g = vfs.state.borrow();
+    assert_eq!(g.dcache[&NodeId::ROOT].len(), 1);
+    assert_eq!(g.dcache[&NodeId::ROOT]["b"].nodeid, NodeId::new(10));
+    assert!(
+        !g.dentry_index.contains_key(&NodeId::new(11)),
+        "the stale name must not stay indexed"
+    );
+    drop(g);
+    assert_lru_consistent(&vfs);
+}
+
+/// The destination directory is the only evictable inode when a concurrent lookup needs room, so
+/// only the rename's pin on it keeps it cached until the new name is inserted.
+#[test]
+fn rename_into_evicted_parent_does_not_orphan_dentries() {
+    let (vfs, mock) = vfs_with([
+        file(10, 1),
+        bytes(&open_out(1)),
+        dir(11, 1),
+        file(21, 1),
+        file(22, 1),
+        file(23, 1),
+        file(24, 1),
+        file(31, 1),
+        MockReply::Host(ENOENT), // "b" does not exist in "d"
+        file(32, 1),
+        MockReply::Unit, // FUSE_RENAME
+    ]);
+    let fd = block_on(async {
+        lookup(&vfs, "a").await;
+        let fd = vfs
+            .open(
+                NodeId::new(10),
+                O_RDWR,
+                false,
+                vec!["a".into()],
+                Caller::NONE,
+            )
+            .await
+            .unwrap();
+        lookup(&vfs, "d").await;
+        // Root, a, d and four open files fill all but one slot.
+        for name in ["f21", "f22", "f23", "f24"] {
+            let id = lookup(&vfs, name).await;
+            vfs.state.borrow_mut().increment_fd_count(id).unwrap();
+        }
+        assert!(in_lru_evictables(&vfs, 11));
+        fd
+    });
+    assert_eq!(vfs.state.borrow().lru_evictables.len(), 1);
+
+    mock.yield_once.set(true);
+    let vfs = Rc::new(vfs);
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    spawner
+        .spawn_local({
+            let vfs = Rc::clone(&vfs);
+            async move {
+                for name in ["g1", "g2"] {
+                    let _ = vfs.lookup(NodeId::ROOT, name, Caller::NONE).await;
+                }
+            }
+        })
+        .unwrap();
+    spawner
+        .spawn_local({
+            let vfs = Rc::clone(&vfs);
+            async move {
+                vfs.rename(fd, "/d/b", Caller::NONE).await.unwrap();
+            }
+        })
+        .unwrap();
+    pool.run();
+
+    assert!(
+        has_inode(&vfs, 11),
+        "the rename target directory was evicted"
+    );
+    // Proves the interleaving happened: inserting g2 needed room and g1 was the only victim.
+    assert_eq!(vfs.state.borrow().evicted_names, ["g1"]);
+    assert_eq!(children(&vfs, NodeId::new(11)), 1);
+    assert_eq!(
+        vfs.state.borrow().dcache[&NodeId::new(11)]["b"].nodeid,
+        NodeId::new(10)
+    );
+    assert_lru_consistent(&vfs);
+    mock.assert_sent(fuse_opcode::FUSE_RENAME);
+}
+
+#[test]
+fn unmerge_of_busy_inode_drops_it_on_close() {
+    let (vfs, _) = vfs_with([file(10, 1)]);
+    block_on(async {
+        let id = lookup(&vfs, "f").await;
+        let mut g = vfs.state.borrow_mut();
+        g.increment_fd_count(id).unwrap();
+        g.unmerge_entry(NodeId::ROOT, "f", id);
+        assert!(g.inodes.contains_key(&id), "an open inode must stay cached");
+        assert!(g.inodes[&id].forget_pending);
+        assert_eq!(
+            g.forget_queue.iter().copied().collect::<Vec<_>>(),
+            [(id, 1)]
+        );
+
+        g.decrement_fd_count(id);
+        assert!(!g.inodes.contains_key(&id), "the last close drops it");
+        assert_eq!(g.forget_queue.len(), 1, "the lookup is forgotten once");
+        drop(g);
+        assert_lru_consistent(&vfs);
+    });
+}
+
+#[test]
+fn unlink_is_not_logged_as_eviction() {
+    let (vfs, _) = vfs_with([file(10, 1), MockReply::Unit]);
+    block_on(async {
+        let id = lookup(&vfs, "f").await;
+        vfs.rm(file_walk(id, "f"), false, Caller::NONE)
+            .await
+            .unwrap();
+    });
+    assert!(!has_inode(&vfs, 10));
+    assert!(vfs.state.borrow().evicted_names.is_empty());
 }
 
 #[test]
@@ -471,15 +906,8 @@ fn symlink_rollback_drops_committed_dentry() {
     pool.run();
 
     assert!(!has_inode(&vfs, 30));
-    let g = vfs.state.borrow();
-    assert!(
-        g.dcache
-            .get(&NodeId::ROOT)
-            .and_then(|names| names.get("link"))
-            .is_none()
-    );
-    assert_eq!(g.inodes[&NodeId::ROOT].child_count, 0);
-    drop(g);
+    assert_eq!(children(&vfs, NodeId::ROOT), 0);
+    assert_lru_consistent(&vfs);
     mock.assert_sent(fuse_opcode::FUSE_UNLINK);
 }
 
@@ -664,10 +1092,8 @@ fn debug_root_only_serves_lru_evicted() {
         let err = vfs.open_debug(root, path, O_RDONLY).unwrap_err();
         assert_eq!(err.errno, ENOENT, "{path:?}");
     }
-    // A node is not a directory.
     let err = vfs.open_debug(fd, "lru_evicted", O_RDONLY).unwrap_err();
     assert_eq!(err.errno, ENOTDIR);
-    // The debug scheme never reaches the host.
     assert!(mock.ops().is_empty());
 }
 
@@ -683,7 +1109,6 @@ fn share_root_does_not_expose_debug_nodes() {
             .unwrap();
         assert_eq!(err.errno, ENOENT);
     }
-    // Both names went to the host as ordinary lookups.
     assert_eq!(mock.ops(), vec![u32::from(fuse_opcode::FUSE_LOOKUP); 2]);
 }
 

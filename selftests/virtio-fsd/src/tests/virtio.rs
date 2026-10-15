@@ -31,6 +31,7 @@ fn debug_nodes_stay_in_debug_scheme(ctx: &TestCtx) -> Outcome {
 
 // virtio-fsd INODES_MAX_LEN is 64k; this has to be past that to force FORGET.
 const FORGET_PRESSURE_FILES: usize = 64 * 1024 + 256;
+const FORGET_PROGRESS_STEP: usize = 4096;
 
 fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
     // The log lives in the driver's debug scheme, not in the share.
@@ -45,6 +46,9 @@ fn forget_lru_pressure(ctx: &TestCtx) -> Outcome {
         let mut f = check_ok!(fsutil::create_rw(&path), "create {i}");
         check_ok!(f.write_all(b"x"), "write {i}");
         drop(f);
+        if (i + 1) % FORGET_PROGRESS_STEP == 0 {
+            eprint!(".");
+        }
     }
     check_bytes!(check_ok!(fsutil::read_to_vec(&ctx.work("fg_0"))), b"x");
     check_bytes!(
