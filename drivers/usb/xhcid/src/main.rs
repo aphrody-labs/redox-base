@@ -27,16 +27,11 @@
 #[macro_use]
 extern crate bitflags;
 
-use std::fs::File;
 use std::sync::Arc;
 
 use common::MemoryType;
-use pcid_interface::irq_helpers::read_bsp_apic_id;
-#[cfg(target_arch = "x86_64")]
-use pcid_interface::irq_helpers::{
-    allocate_first_msi_interrupt_on_bsp, allocate_single_interrupt_vector_for_msi,
-};
-use pcid_interface::{PciFeature, PciFeatureInfo, PciFunctionHandle};
+use pcid_interface::irq_helpers::{self, pci_try_allocate_interrupt_vector, InterruptVector};
+use pcid_interface::PciFunctionHandle;
 use redox_scheme::scheme::register_sync_scheme;
 use redox_scheme::Socket;
 use scheme_utils::Blocking;
@@ -51,69 +46,26 @@ pub mod driver_interface;
 mod usb;
 mod xhci;
 
-#[cfg(target_arch = "x86_64")]
-fn get_int_method(pcid_handle: &mut PciFunctionHandle) -> (Option<File>, InterruptMethod) {
-    let pci_config = pcid_handle.config();
-
-    let all_pci_features = pcid_handle.fetch_all_features();
-    log::debug!("XHCI PCI FEATURES: {:?}", all_pci_features);
-
-    let has_msi = all_pci_features.iter().any(|feature| feature.is_msi());
-    let has_msix = all_pci_features.iter().any(|feature| feature.is_msix());
-
-    if has_msix {
-        let msix_info = match pcid_handle.feature_info(PciFeature::MsiX) {
-            PciFeatureInfo::Msi(_) => panic!(),
-            PciFeatureInfo::MsiX(s) => s,
-        };
-        let mut info = unsafe { msix_info.map_and_mask_all(pcid_handle) };
-
-        // Allocate one msi vector.
-
-        let method = {
-            // primary interrupter
-            let k = 0;
-
-            let table_entry_pointer = info.table_entry_pointer(k);
-
-            let destination_id = read_bsp_apic_id().expect("xhcid: failed to read BSP apic id");
-            let (msg_addr_and_data, interrupt_handle) =
-                allocate_single_interrupt_vector_for_msi(destination_id);
-            table_entry_pointer.write_addr_and_data(msg_addr_and_data);
-            table_entry_pointer.unmask();
-
-            (Some(interrupt_handle), InterruptMethod::Msi)
-        };
-
-        pcid_handle.enable_feature(PciFeature::MsiX);
-        log::debug!("Enabled MSI-X");
-
-        method
-    } else if has_msi {
-        let interrupt_handle = allocate_first_msi_interrupt_on_bsp(pcid_handle);
-        (Some(interrupt_handle), InterruptMethod::Msi)
-    } else if let Some(irq) = pci_config.func.legacy_interrupt_line {
-        log::debug!("Legacy IRQ {}", irq);
-
-        // legacy INTx# interrupt pins.
-        (Some(irq.irq_handle("xhcid")), InterruptMethod::Intx)
-    } else {
-        // no interrupts at all
-        (None, InterruptMethod::Polling)
+fn get_int_method(
+    pcid_handle: &mut PciFunctionHandle,
+) -> (Option<InterruptVector>, InterruptMethod) {
+    if true {
+        //TODO: Fix interrupts.
+        return (None, InterruptMethod::Polling);
     }
-}
 
-//TODO: MSI on non-x86_64?
-#[cfg(not(target_arch = "x86_64"))]
-fn get_int_method(pcid_handle: &mut PciFunctionHandle) -> (Option<File>, InterruptMethod) {
-    let pci_config = pcid_handle.config();
-
-    if let Some(irq) = pci_config.func.legacy_interrupt_line {
-        // legacy INTx# interrupt pins.
-        (Some(irq.irq_handle("xhcid")), InterruptMethod::Intx)
-    } else {
-        // no interrupts at all
-        (None, InterruptMethod::Polling)
+    match pci_try_allocate_interrupt_vector(pcid_handle, "xhcid") {
+        Some((interrupt_vector, interrupt_method)) => (
+            Some(interrupt_vector),
+            match interrupt_method {
+                irq_helpers::InterruptMethod::Intx => InterruptMethod::Intx,
+                irq_helpers::InterruptMethod::Msi => InterruptMethod::Msi,
+            },
+        ),
+        None => {
+            // no interrupts at all
+            (None, InterruptMethod::Polling)
+        }
     }
 }
 
@@ -142,8 +94,7 @@ fn daemon_with_context_size<const N: usize>(
         .as_ptr()
         .expose_provenance();
 
-    let (irq_file, interrupt_method) = (None, InterruptMethod::Polling); //get_int_method(&mut pcid_handle);
-                                                                         //TODO: Fix interrupts.
+    let (irq_file, interrupt_method) = get_int_method(&mut pcid_handle);
 
     log::info!("XHCI {}", pci_config.func.display());
 

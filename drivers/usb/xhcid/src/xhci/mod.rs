@@ -22,6 +22,7 @@ use common::io::Io;
 use common::timeout::Timeout;
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, trace, warn};
+use pcid_interface::irq_helpers::InterruptVector;
 use pcid_interface::PciFunctionHandle;
 use serde::Deserialize;
 use syscall::error::{Error, Result, EBADF, EBADMSG, EIO, ENOENT};
@@ -1518,7 +1519,7 @@ impl<const N: usize> Xhci<N> {
             .find(|speed| speed.psiv() == psiv)
     }
 }
-pub fn start_irq_reactor<const N: usize>(hci: &Arc<Xhci<N>>, irq_file: Option<File>) {
+pub fn start_irq_reactor<const N: usize>(hci: &Arc<Xhci<N>>, irq_file: Option<InterruptVector>) {
     let hci_clone = Arc::clone(&hci);
 
     debug!("About to start IRQ reactor");

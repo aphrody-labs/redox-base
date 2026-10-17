@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::future::Future;
 use std::io::prelude::*;
 use std::os::unix::io::AsRawFd;
@@ -10,6 +9,7 @@ use common::io::Io as _;
 use crossbeam_channel::{Receiver, Sender};
 use event::RawEventQueue;
 use log::{debug, error, info, trace, warn};
+use pcid_interface::irq_helpers::InterruptVector;
 
 use super::doorbell::Doorbell;
 use super::event::EventRing;
@@ -17,7 +17,6 @@ use super::ring::Ring;
 use super::trb::{Trb, TrbCompletionCode, TrbType};
 use super::{EndpNum, PortId, Xhci};
 use crate::xhci::device_enumerator::DeviceEnumerationRequest;
-use crate::xhci::port::PortFlags;
 
 /// Short-term states (as in, they are removed when the waker is consumed, but probably pushed back
 /// by the future unless it completed).
@@ -93,7 +92,7 @@ impl StateKind {
 
 pub struct IrqReactor<const N: usize> {
     hci: Arc<Xhci<N>>,
-    irq_file: Option<File>,
+    irq_file: Option<InterruptVector>,
     irq_receiver: Receiver<NewPendingTrb>,
     device_enumerator_sender: Sender<DeviceEnumerationRequest>,
     states: Vec<State>,
@@ -110,7 +109,7 @@ enum EventProcessResult {
 }
 
 impl<const N: usize> IrqReactor<N> {
-    pub fn new(hci: Arc<Xhci<N>>, irq_file: Option<File>) -> Self {
+    pub fn new(hci: Arc<Xhci<N>>, irq_file: Option<InterruptVector>) -> Self {
         let device_enumerator_sender = hci.device_enumerator_sender.clone();
         let irq_receiver = hci.irq_reactor_receiver.clone();
 
@@ -184,7 +183,7 @@ impl<const N: usize> IrqReactor<N> {
         let hci_clone = Arc::clone(&self.hci);
         let event_queue =
             RawEventQueue::new().expect("xhcid irq_reactor: failed to create IRQ event queue");
-        let irq_fd = self.irq_file.as_ref().unwrap().as_raw_fd();
+        let irq_fd = self.irq_file.as_ref().unwrap().irq_handle().as_raw_fd();
         event_queue
             .subscribe(irq_fd as usize, 0, event::EventFlags::READ)
             .unwrap();
@@ -209,6 +208,7 @@ impl<const N: usize> IrqReactor<N> {
                 .irq_file
                 .as_mut()
                 .unwrap()
+                .irq_handle()
                 .read(&mut buffer)
                 .expect("Failed to read from irq scheme");
 
@@ -222,7 +222,7 @@ impl<const N: usize> IrqReactor<N> {
 
             trace!("IRQ reactor received an IRQ");
 
-            let _ = self.irq_file.as_mut().unwrap().write(&buffer);
+            let _ = self.irq_file.as_mut().unwrap().irq_handle().write(&buffer);
 
             // TODO: More event rings, probably even with different IRQs.
 
