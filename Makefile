@@ -11,9 +11,6 @@ DESTDIR ?= ./sysroot
 SYSROOT ?= $(shell pwd)/target/$(TARGET)/sysroot
 TARGET_DIR = $(BUILD_DIR)/$(TARGET)/$(BUILD_TYPE)
 BUILD_FLAGS +=  --target-dir $(BUILD_DIR)
-FEATURES ?=
-export FEATURES
-FEATURE_FLAGS = $(if $(FEATURES),--features $(FEATURES),)
 
 INITFS_BINS = ipcd init logd ramfs randd udsd zerod \
 	acpid fbbootlogd hwd inputd lived \
@@ -104,7 +101,7 @@ base:
 	@mkdir -pv "$(BUILD_DIR)"
 # Build daemons and drivers
 	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
-		$(CARGO) build $(BUILD_FLAGS) $(FEATURE_FLAGS) \
+		$(CARGO) build $(BUILD_FLAGS) \
 		--manifest-path "$(SRC_DIR)/Cargo.toml" \
 		$(BASE_CARGO_ARGS) $(DRIVERS_CARGO_ARGS)
 # Build initfs daemons and drivers
@@ -123,7 +120,7 @@ base:
 selftests:
 	@mkdir -pv "$(BUILD_DIR)"
 	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
-		$(CARGO) build $(BUILD_FLAGS) $(FEATURE_FLAGS) \
+		$(CARGO) build $(BUILD_FLAGS) \
 		--manifest-path "$(SRC_DIR)/Cargo.toml" \
 		$(TEST_CARGO_ARGS)
 

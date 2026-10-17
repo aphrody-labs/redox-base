@@ -11,8 +11,8 @@ use fuse_abi::linux::{
 use futures::executor::{LocalPool, block_on};
 use futures::task::LocalSpawnExt;
 use syscall::{
-    ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, MODE_SYMLINK, O_APPEND, O_CREAT, O_RDONLY,
-    O_RDWR, O_TRUNC,
+    ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, MODE_SYMLINK, O_APPEND, O_CREAT, O_EXCL,
+    O_RDONLY, O_RDWR, O_TRUNC,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -378,7 +378,6 @@ fn create_rolls_back_host_file_on_generation_mismatch() {
                 "f",
                 O_CREAT | O_RDWR,
                 MODE_FILE as u32,
-                vec!["f".into()],
                 Caller::NONE,
             )
             .await
@@ -393,6 +392,35 @@ fn create_rolls_back_host_file_on_generation_mismatch() {
         forget_queued(&vfs, 10),
         "generation mismatch must queue FUSE_FORGET"
     );
+}
+
+#[test]
+fn create_releases_host_fh_without_a_scheme_handle() {
+    let (vfs, mock) = vfs_with([create_reply(20, 1, 7), MockReply::Unit]);
+
+    block_on(async {
+        let (nodeid, mode) = vfs
+            .create(
+                NodeId::ROOT,
+                "f",
+                O_CREAT | O_RDWR,
+                MODE_FILE as u32,
+                Caller::NONE,
+            )
+            .await
+            .expect("create");
+        assert_eq!(nodeid, NodeId::new(20));
+        assert_eq!(mode, MODE_FILE);
+        assert!(has_inode(&vfs, 20));
+        assert_eq!(
+            vfs.state.borrow().inodes[&NodeId::new(20)].open_fd_count,
+            0,
+            "create must not publish a scheme fd"
+        );
+    });
+
+    mock.assert_sent(fuse_opcode::FUSE_CREATE);
+    mock.assert_sent(fuse_opcode::FUSE_RELEASE);
 }
 
 #[test]
@@ -899,7 +927,7 @@ fn symlink_rollback_drops_committed_dentry() {
         .spawn_local({
             let vfs = Rc::clone(&vfs);
             async move {
-                vfs.close(fd, Caller::NONE).await;
+                vfs.close(fd).await;
             }
         })
         .unwrap();
@@ -1049,7 +1077,7 @@ fn close_flush_carries_the_opener() {
     let uid = uid_on_open_handle(
         MockReply::Unit,
         fuse_opcode::FUSE_FLUSH,
-        async |vfs, fd, other| vfs.close(fd, other).await,
+        async |vfs, fd, _| vfs.close(fd).await,
     );
     assert_eq!(uid, OPENER.uid);
 }
@@ -1059,7 +1087,7 @@ fn close_release_carries_the_opener() {
     let uid = uid_on_open_handle(
         MockReply::Unit,
         fuse_opcode::FUSE_RELEASE,
-        async |vfs, fd, other| vfs.close(fd, other).await,
+        async |vfs, fd, _| vfs.close(fd).await,
     );
     assert_eq!(uid, OPENER.uid);
 }
@@ -1070,6 +1098,18 @@ fn append_is_per_write_not_open() {
     assert_eq!(open & linux_abi::O_APPEND, 0);
     let io = fuse_io_flags((O_RDWR | O_APPEND) as u32);
     assert_ne!(io & linux_abi::O_APPEND, 0);
+}
+
+#[test]
+fn fuse_open_omits_creat_excl() {
+    let flags = O_RDWR | O_CREAT | O_EXCL;
+    let open = fuse_open_flags(flags, false, false).unwrap();
+    assert_eq!(open & (linux_abi::O_CREAT | linux_abi::O_EXCL), 0);
+    let create = fuse_open_flags(flags, false, true).unwrap();
+    assert_eq!(
+        create & (linux_abi::O_CREAT | linux_abi::O_EXCL),
+        linux_abi::O_CREAT | linux_abi::O_EXCL
+    );
 }
 
 fn read_debug_log(vfs: &Vfs<Mock>, fd: usize) -> String {

@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Must match the share_tag passed to virtio-fsd-selftest below.
-SHARE_TAG=virtiofs
+SHARE_TAG=virtiofs-tests
 
 VIRTIOFSD_URL="${VIRTIOFSD_URL:-https://gitlab.com/virtio-fs/virtiofsd/-/jobs/artifacts/main/raw/target/x86_64-unknown-linux-musl/release/virtiofsd?job=publish}"
 

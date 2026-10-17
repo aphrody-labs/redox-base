@@ -189,7 +189,7 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
 
         pool.run();
         for id in closes {
-            futures::executor::block_on(self.vfs.close(id, Caller::NONE));
+            futures::executor::block_on(self.vfs.close(id));
         }
         Ok(())
     }
@@ -280,7 +280,8 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
             let perm = flags as u32 & u32::from(MODE_PERM);
             if is_dir {
                 let accmode = flags & syscall::O_ACCMODE;
-                if accmode == syscall::O_WRONLY || accmode == syscall::O_RDWR {
+                // Write access is rejected by the I/O open below. O_STAT skips that open.
+                if !o_stat && (accmode == syscall::O_WRONLY || accmode == syscall::O_RDWR) {
                     return Err(Error::new(EISDIR));
                 }
                 (walk.nodeid, walk.node_mode) = self
@@ -288,21 +289,16 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
                     .mkdir(walk.nodeid, &name, perm | u32::from(MODE_DIR), caller)
                     .await?;
             } else {
-                let fd = self
+                (walk.nodeid, walk.node_mode) = self
                     .vfs
                     .create(
                         walk.nodeid,
                         &name,
                         flags,
                         perm | u32::from(MODE_FILE),
-                        walk.rel_path,
                         caller,
                     )
                     .await?;
-                return Ok(OpenResult::ThisScheme {
-                    number: fd,
-                    flags: NewFdFlags::POSITIONED,
-                });
             }
         }
 

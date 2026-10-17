@@ -17,6 +17,8 @@ pub fn cases() -> Vec<TestCase> {
         func create_new_file,
         func create_and_reopen,
         func create_excl_new,
+        func create_o_stat,
+        func create_o_stat_existing,
         func open_o_stat_file,
         func open_o_stat_dir,
         func openat_relative_file,
@@ -73,6 +75,57 @@ fn create_excl_new(ctx: &TestCtx) -> Outcome {
     drop(f);
     let got = check_ok!(fsutil::read_to_vec(&path));
     check_eq!(got.as_slice(), b"exclusive");
+    Outcome::Pass
+}
+
+fn create_o_stat(ctx: &TestCtx) -> Outcome {
+    // O_STAT|O_CREAT creates the file, then returns a stat fd. O_RDWR must not
+    // stick: that would be the FUSE_CREATE open.
+    let path = ctx.work("create_ostat.txt");
+    let name = fsutil::base_name(&path).to_owned();
+    let mut st = check_ok!(fsutil::open_flags(
+        &path,
+        fsutil::O_STAT | flag::O_RDWR | flag::O_CREAT | flag::O_EXCL,
+        0o640,
+    ));
+    let p = check_ok!(fsutil::fpath(&st));
+    check!(
+        p.contains(&name),
+        "O_STAT fpath was parent, not new file: {p}"
+    );
+    check_errno!(st.write_all(b"x"), fsutil::EBADF, "write O_STAT|O_CREAT");
+    drop(st);
+    check_eq!(check_ok!(fsutil::type_of(&path)), fsutil::MODE_FILE);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&path)), b"");
+    check_errno!(
+        fsutil::open_flags(
+            &path,
+            fsutil::O_STAT | flag::O_RDWR | flag::O_CREAT | flag::O_EXCL,
+            0o640,
+        ),
+        fsutil::EEXIST,
+        "O_STAT|O_CREAT|O_EXCL existing"
+    );
+    Outcome::Pass
+}
+
+fn create_o_stat_existing(ctx: &TestCtx) -> Outcome {
+    // The name exists, so O_CREAT does not create. O_TRUNC must not apply to the stat fd.
+    let path = ctx.work("create_ostat_exist.txt");
+    check_ok!(fsutil::write_all_path(&path, b"keep"));
+    let mut st = check_ok!(fsutil::open_flags(
+        &path,
+        fsutil::O_STAT | flag::O_RDWR | flag::O_CREAT | flag::O_TRUNC,
+        0o644,
+    ));
+    check_errno!(
+        st.write_all(b"x"),
+        fsutil::EBADF,
+        "write existing O_STAT|O_CREAT"
+    );
+    check_eq!(check_ok!(fsutil::fstat(&st)).st_size as u64, 4);
+    drop(st);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&path)), b"keep");
     Outcome::Pass
 }
 

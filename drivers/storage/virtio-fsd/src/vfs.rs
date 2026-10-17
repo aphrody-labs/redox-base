@@ -778,9 +778,8 @@ impl<T: FuseTransporter> Vfs<T> {
         name: &str,
         flags: usize,
         mode: u32,
-        path: Vec<String>,
         caller: Caller,
-    ) -> Result<usize> {
+    ) -> Result<(NodeId, u16)> {
         if name.is_empty() {
             return Err(Error::new(ENOENT));
         }
@@ -804,35 +803,29 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let nodeid = payload.entry.nodeid;
         let fh = payload.open.fh;
-        let insert = {
+        let mode = payload.entry.attr.mode as u16 & MODE_TYPE;
+
+        let merge_err = {
             let mut g = self.state.borrow_mut();
             g.invalidate_attr(parent_nodeid);
-            if let Err(err) = g.merge_entry(parent_nodeid, name, payload.entry) {
-                Err(err)
-            } else {
-                g.insert_open_handle(Handle::File {
-                    nodeid,
-                    fh,
-                    path: path.join("/"),
-                    caller,
-                })
-                .inspect_err(|_| g.unmerge_entry(parent_nodeid, name, nodeid))
-            }
+            g.merge_entry(parent_nodeid, name, payload.entry).err()
         };
-        match insert {
-            Ok(fd) => {
-                self.flush_forgets(caller).await;
-                Ok(fd)
-            }
-            Err(err) => {
-                if let Err(rel_err) = self.fuse.release(nodeid, fh, false, caller).await {
-                    warn!("virtio-fsd: FUSE_RELEASE: {rel_err}");
-                }
-                self.rollback_entry(parent_nodeid, name_cstring, false, caller)
-                    .await;
-                Err(err)
-            }
+
+        // FUSE_CREATE also opens. The scheme decides the fd after this returns,
+        // so drop the host fh here. A later `open` or `insert_stat_only` publishes it.
+        if let Err(rel_err) = self.fuse.release(nodeid, fh, false, caller).await {
+            warn!("virtio-fsd: FUSE_RELEASE: {rel_err}");
         }
+
+        if let Some(err) = merge_err {
+            self.rollback_entry(parent_nodeid, name_cstring, false, caller)
+                .await;
+            return Err(err);
+        }
+
+        let _published = self.pin(nodeid)?;
+        self.flush_forgets(caller).await;
+        Ok((nodeid, mode))
     }
 
     pub async fn open(
@@ -889,7 +882,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         if trunc && !atomic_trunc {
             if let Err(err) = self.ftruncate(fd, 0).await {
-                self.close(fd, caller).await;
+                self.close(fd).await;
                 return Err(err);
             }
         } else if trunc {
@@ -1335,7 +1328,7 @@ impl<T: FuseTransporter> Vfs<T> {
         self.setattr(nodeid, fuse_in, caller).await
     }
 
-    pub async fn close(&self, fd: usize, caller: Caller) {
+    pub async fn close(&self, fd: usize) {
         let handle = self.state.borrow_mut().handles.remove(fd);
         match handle {
             Some(handle) => match handle {
@@ -1375,13 +1368,13 @@ impl<T: FuseTransporter> Vfs<T> {
             }
         };
 
-        self.flush_forgets(caller).await;
+        self.flush_forgets(Caller::NONE).await;
     }
 
     pub async fn shutdown(&self) {
         let ids: Vec<usize> = self.state.borrow().handles.keys().copied().collect();
         for id in ids {
-            self.close(id, Caller::NONE).await;
+            self.close(id).await;
         }
 
         {
@@ -1916,11 +1909,9 @@ fn path_components<'a, T: From<&'a str>>(path: &'a str) -> Vec<T> {
         .collect()
 }
 
-/// `flags` for `FUSE_OPEN` / `FUSE_CREATE`. Access mode plus the bits that
-/// only make sense at open (`O_CREAT`/`O_EXCL` on create, `O_TRUNC`,
-/// `O_DIRECTORY`). `O_APPEND` is left out: FUSE has no opcode to change
-/// flags later, so the host fd would keep appending even after `F_SETFL`
-/// cleared it. We emulate append ourselves on each write.
+/// `flags` for `FUSE_OPEN` / `FUSE_CREATE`. `O_APPEND` is left out: FUSE has
+/// no opcode to change flags later, so the host fd would keep appending even
+/// after `F_SETFL` cleared it. We emulate append ourselves on each write.
 fn fuse_open_flags(redox_flags: usize, is_dir: bool, for_create: bool) -> Result<u32> {
     let accmode = redox_flags & O_ACCMODE;
 
@@ -1938,14 +1929,17 @@ fn fuse_open_flags(redox_flags: usize, is_dir: bool, for_create: bool) -> Result
     };
 
     if !is_dir {
-        if for_create && redox_flags & O_CREAT != 0 {
+        if redox_flags & O_CREAT != 0 {
             linux_flags |= linux_abi::O_CREAT;
         }
-        if for_create && redox_flags & O_EXCL != 0 {
+        if redox_flags & O_EXCL != 0 {
             linux_flags |= linux_abi::O_EXCL;
         }
         if redox_flags & O_TRUNC != 0 {
             linux_flags |= linux_abi::O_TRUNC;
+        }
+        if !for_create {
+            linux_flags &= !(linux_abi::O_CREAT | linux_abi::O_EXCL);
         }
     } else if redox_flags & O_DIRECTORY != 0 {
         linux_flags |= linux_abi::O_DIRECTORY;

@@ -14,6 +14,7 @@ pub fn cases() -> Vec<TestCase> {
         func mkdir_via_openat,
         func mkdir_existing_without_excl,
         func mkdir_o_stat_create,
+        func mkdir_o_stat_write,
         func mkdir_mode,
         edge edge_mkdir_errnos,
         edge edge_mkdir_empty_name,
@@ -97,6 +98,21 @@ fn mkdir_o_stat_create(ctx: &TestCtx) -> Outcome {
     drop(st);
     let got = check_ok!(fsutil::read_to_vec(&path.join("inside.txt")));
     check_eq!(got.as_slice(), b"via-ostat-dir");
+    Outcome::Pass
+}
+
+fn mkdir_o_stat_write(ctx: &TestCtx) -> Outcome {
+    // Write access mode applies to the I/O open. O_STAT does not take that open,
+    // so the directory is still created and the fd is stat-only.
+    let path = ctx.work("mkdir_ostat_rdwr");
+    let mut st = check_ok!(fsutil::open_flags(
+        &path,
+        fsutil::O_STAT | flag::O_RDWR | flag::O_CREAT | flag::O_DIRECTORY | flag::O_EXCL,
+        0o755,
+    ));
+    check_errno!(st.write_all(b"x"), fsutil::EBADF, "write O_STAT mkdir");
+    drop(st);
+    check_ok!(fsutil::open_dir(&path));
     Outcome::Pass
 }
 
