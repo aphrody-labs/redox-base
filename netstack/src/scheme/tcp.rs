@@ -21,6 +21,8 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
     type DataT = Option<IpListenEndpoint>;
     type SettingT = ();
 
+    const BASE_PATH: &'static str = "/scheme/tcp/";
+
     fn new_scheme_data() -> Self::SchemeDataT {
         PortSet::new(49_152u16, 65_535u16).expect("Wrong TCP port numbers")
     }
@@ -340,8 +342,8 @@ impl<'a> SchemeSocket for TcpSocket<'a> {
                 return Err(SyscallError::new(syscall::EINVAL));
             }
             let address = match self.remote_endpoint() {
-                Some(endpoint) => format!("/scheme/tcp/{}:{}", endpoint.addr, endpoint.port),
-                None => String::from("/scheme/tcp/0.0.0.0:0"),
+                Some(endpoint) => format!("{}{}:{}", Self::BASE_PATH, endpoint.addr, endpoint.port),
+                None => format!("{}0.0.0.0:0", Self::BASE_PATH),
             };
 
             how[..usize_length].copy_from_slice(&address.len().to_le_bytes());

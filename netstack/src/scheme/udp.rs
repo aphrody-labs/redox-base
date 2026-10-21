@@ -24,6 +24,8 @@ impl<'a> SchemeSocket for UdpSocket<'a> {
     type DataT = IpListenEndpoint;
     type SettingT = ();
 
+    const BASE_PATH: &'static str = "/scheme/udp/";
+
     fn new_scheme_data() -> Self::SchemeDataT {
         PortSet::new(49_152u16, 65_535u16).expect("Wrong UDP port numbers")
     }
@@ -347,8 +349,10 @@ impl<'a> SchemeSocket for UdpSocket<'a> {
             //Address Handling
             let address_formatted = if prepared_name_len > 0 {
                 format!(
-                    "/scheme/udp/{}:{}",
-                    address.endpoint.addr, address.endpoint.port
+                    "{}{}:{}",
+                    Self::BASE_PATH,
+                    address.endpoint.addr,
+                    address.endpoint.port
                 )
             } else {
                 String::from("")
