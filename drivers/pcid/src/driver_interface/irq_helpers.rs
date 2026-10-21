@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// Read the local APIC ID of the bootstrap processor.
-pub fn read_bsp_apic_id() -> io::Result<usize> {
+fn read_bsp_apic_id() -> io::Result<usize> {
     let mut buffer = [0u8; 8];
 
     let mut file = File::open("/scheme/irq/bsp")?;
@@ -46,7 +46,8 @@ pub fn read_bsp_apic_id() -> io::Result<usize> {
 // TODO: Perhaps read the MADT instead?
 /// Obtains an interator over all of the visible CPU ids, for use in IRQ allocation and MSI
 /// capability structs or MSI-X tables.
-pub fn cpu_ids() -> io::Result<impl Iterator<Item = io::Result<usize>> + 'static> {
+#[expect(unused)]
+fn cpu_ids() -> io::Result<impl Iterator<Item = io::Result<usize>> + 'static> {
     Ok(
         fs::read_dir("/scheme/irq")?.filter_map(|entry| -> Option<io::Result<_>> {
             match entry {
@@ -85,7 +86,7 @@ pub fn cpu_ids() -> io::Result<impl Iterator<Item = io::Result<usize>> + 'static
 /// individually allocated vectors that might be spread out, even on multiple CPUs. Thus, multiple
 /// invocations with alignment 1 and count 1 are totally acceptable, although allocating in bulk
 /// minimizes the initialization overhead.
-pub fn allocate_aligned_interrupt_vectors(
+fn allocate_aligned_interrupt_vectors(
     cpu_id: usize,
     alignment: NonZeroU8,
     count: u8,
@@ -173,30 +174,22 @@ pub fn allocate_interrupt_vectors(cpu_id: usize, count: u8) -> io::Result<Option
     allocate_aligned_interrupt_vectors(cpu_id, NonZeroU8::new(1).unwrap(), count)
 }
 
-/// Allocate a single interrupt vector, returning both the vector number (starting from 32 up to
-/// 254), and its IRQ handle which is then reserved. Returns Ok(None) if allocation fails due to
-/// no available IRQs.
-pub fn allocate_single_interrupt_vector(cpu_id: usize) -> io::Result<Option<(u8, File)>> {
-    let (base, mut files) = match allocate_interrupt_vectors(cpu_id, 1) {
-        Ok(Some((base, files))) => (base, files),
-        Ok(None) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    assert_eq!(files.len(), 1);
-    Ok(Some((base, files.pop().unwrap())))
-}
-
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn allocate_single_interrupt_vector_for_msi(cpu_id: usize) -> (MsiAddrAndData, File) {
+fn allocate_single_interrupt_vector_for_msi(cpu_id: usize) -> (MsiAddrAndData, File) {
     // FIXME for cpu_id >255 we need to use the IOMMU to use IRQ remapping
     let lapic_id = u8::try_from(cpu_id).expect("CPU id couldn't fit inside u8");
     let rh = false;
     let dm = false;
     let addr = x86_msix::message_address(lapic_id, rh, dm);
 
-    let (vector, interrupt_handle) = allocate_single_interrupt_vector(cpu_id)
-        .expect("failed to allocate interrupt vector")
-        .expect("no interrupt vectors left");
+    let (vector, mut files) = match allocate_interrupt_vectors(cpu_id, 1) {
+        Ok(Some((base, files))) => (base, files),
+        Ok(None) => panic!("no interrupt vectors left"),
+        Err(err) => panic!("failed to allocate interrupt vector: {err}"),
+    };
+    assert_eq!(files.len(), 1);
+    let interrupt_handle = files.pop().unwrap();
+
     let msg_data = x86_msix::message_data_edge_triggered(x86_msix::DeliveryMode::Fixed, vector);
 
     (
@@ -209,7 +202,7 @@ pub fn allocate_single_interrupt_vector_for_msi(cpu_id: usize) -> (MsiAddrAndDat
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn allocate_first_msi_interrupt_on_bsp(pcid_handle: &mut PciFunctionHandle) -> File {
+fn allocate_first_msi_interrupt_on_bsp(pcid_handle: &mut PciFunctionHandle) -> File {
     // TODO: Allow allocation of up to 32 vectors.
 
     let destination_id = read_bsp_apic_id().expect("failed to read BSP apic id");
@@ -331,6 +324,8 @@ enum InterruptVectorKind {
     Msi,
     MsiX { table_entry: *mut MsixTableEntry },
 }
+unsafe impl Send for InterruptVectorKind {}
+unsafe impl Sync for InterruptVectorKind {}
 
 impl InterruptVector {
     pub fn irq_handle(&self) -> &File {
@@ -352,55 +347,86 @@ impl InterruptVector {
     }
 }
 
+pub enum InterruptMethod {
+    /// Legacy PCI INTx# interrupt pin.
+    Intx,
+
+    /// (Extended) Message signaled interrupts.
+    Msi,
+}
+
 /// Get the most optimal supported interrupt mechanism: either (in the order of preference):
 /// MSI-X, MSI, and INTx# pin.
 ///
 /// For more than one MSI-X vector, use [`Msix::enable`] and call [`Msix::alloc`] per vector.
 // FIXME move MSI-X IRQ allocation to pcid
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn pci_allocate_interrupt_vector(
     pcid_handle: &mut PciFunctionHandle,
     driver: &str,
 ) -> InterruptVector {
+    if let Some((interrupt_vector, _)) = pci_try_allocate_interrupt_vector(pcid_handle, driver) {
+        interrupt_vector
+    } else {
+        panic!("{driver}: no interrupts supported at all")
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn pci_try_allocate_interrupt_vector(
+    pcid_handle: &mut PciFunctionHandle,
+    driver: &str,
+) -> Option<(InterruptVector, InterruptMethod)> {
     let features = pcid_handle.fetch_all_features();
 
     let has_msi = features.iter().any(|feature| feature.is_msi());
     let has_msix = features.iter().any(|feature| feature.is_msix());
 
     if has_msix {
-        Msix::enable(pcid_handle, driver).alloc()
+        Some((
+            Msix::enable(pcid_handle, driver).alloc(),
+            InterruptMethod::Msi,
+        ))
     } else if has_msi {
-        InterruptVector {
-            irq_handle: allocate_first_msi_interrupt_on_bsp(pcid_handle),
-            vector: 0,
-            kind: InterruptVectorKind::Msi,
-        }
+        Some((
+            InterruptVector {
+                irq_handle: allocate_first_msi_interrupt_on_bsp(pcid_handle),
+                vector: 0,
+                kind: InterruptVectorKind::Msi,
+            },
+            InterruptMethod::Msi,
+        ))
     } else if let Some(irq) = pcid_handle.config().func.legacy_interrupt_line {
         // INTx# pin based interrupts.
-        InterruptVector {
-            irq_handle: irq.irq_handle(driver),
-            vector: 0,
-            kind: InterruptVectorKind::Legacy,
-        }
+        Some((
+            InterruptVector {
+                irq_handle: irq.irq_handle(driver),
+                vector: 0,
+                kind: InterruptVectorKind::Legacy,
+            },
+            InterruptMethod::Intx,
+        ))
     } else {
-        panic!("{driver}: no interrupts supported at all")
+        None
     }
 }
 
 // FIXME support MSI on non-x86 systems
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-pub fn pci_allocate_interrupt_vector(
+pub fn pci_try_allocate_interrupt_vector(
     pcid_handle: &mut PciFunctionHandle,
     driver: &str,
-) -> InterruptVector {
+) -> Option<(InterruptVector, InterruptMethod)> {
     if let Some(irq) = pcid_handle.config().func.legacy_interrupt_line {
         // INTx# pin based interrupts.
-        InterruptVector {
-            irq_handle: irq.irq_handle(driver),
-            vector: 0,
-            kind: InterruptVectorKind::Legacy,
-        }
+        Some((
+            InterruptVector {
+                irq_handle: irq.irq_handle(driver),
+                vector: 0,
+                kind: InterruptVectorKind::Legacy,
+            },
+            InterruptMethod::Intx,
+        ))
     } else {
-        panic!("{driver}: no interrupts supported at all")
+        None
     }
 }

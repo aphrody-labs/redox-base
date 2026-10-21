@@ -110,6 +110,8 @@ pub struct MappedMsixRegs {
     pub virt_table_base: NonNull<MsixTableEntry>,
     pub info: MsixInfo,
 }
+unsafe impl Send for MappedMsixRegs {}
+unsafe impl Sync for MappedMsixRegs {}
 impl MappedMsixRegs {
     pub unsafe fn table_entry_pointer_unchecked(&mut self, k: usize) -> &mut MsixTableEntry {
         &mut *self.virt_table_base.as_ptr().add(k)
