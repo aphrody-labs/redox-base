@@ -119,7 +119,6 @@ base:
 # package is the opt-in build for a live system.
 selftests:
 	@mkdir -pv "$(BUILD_DIR)"
-	CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_PANIC=abort \
 		$(CARGO) build $(BUILD_FLAGS) \
 		--manifest-path "$(SRC_DIR)/Cargo.toml" \
 		$(TEST_CARGO_ARGS)
