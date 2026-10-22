@@ -682,7 +682,7 @@ impl super::scheme::Socket for Socket {
             let (remote_id, remote_rc) = Socket::get_connected_peer(scheme, id)?;
             let mut socket = remote_rc.borrow_mut();
             let connection = socket.require_connected_connection(msg_flags)?;
-            let (pid, uid, gid) = get_uid_gid_from_pid(scheme.proc_creds_capability, ctx.pid)?;
+            let (pid, uid, gid) = get_uid_gid_from_pid(&scheme.proc_creds_capability, ctx.pid)?;
 
             let packet = DataPacket::from_stream(
                 msg_stream,

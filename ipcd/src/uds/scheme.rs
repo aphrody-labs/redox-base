@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use libredox::protocol::SocketCall;
+use libredox::Fd;
 use rand::rngs::SmallRng;
 use redox_scheme::scheme::SchemeSync;
 use redox_scheme::{
@@ -153,7 +154,7 @@ pub struct UdsScheme<'sock, S: Socket> {
     pub(super) socket_tokens: BTreeMap<u64, Rc<RefCell<S>>>,
     pub(super) socket: &'sock SchemeSocket,
     pub(super) scheme_name: String,
-    pub(super) proc_creds_capability: usize,
+    pub(super) proc_creds_capability: Fd,
     pub(super) rng: SmallRng,
 }
 
@@ -166,7 +167,7 @@ impl<'sock, S: Socket> UdsScheme<'sock, S> {
             socket,
             scheme_name,
             proc_creds_capability: {
-                libredox::call::open(
+                libredox::Fd::open(
                     "/scheme/proc/proc-creds-capability",
                     libredox::flag::O_RDONLY,
                     0,
