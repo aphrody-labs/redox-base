@@ -6,7 +6,7 @@ use event::{EventFlags, RawEventQueue};
 use indexmap::IndexMap;
 use libredox::protocol::FsCall;
 use libredox::{flag, Fd};
-use redox_path::RedoxPath;
+use redox_path::{RedoxPath, RedoxReference};
 use redox_rings::op::{
     FsOpCqe, FsOpKind, FsOpSqe, RingCallVerb, RingSetupFlags, RingSetupParams, RING_MAX_CQ_ENTRIES,
     RING_MAX_SQ_ENTRIES,
@@ -17,8 +17,8 @@ use redox_scheme::{CallerCtx, OpenResult, SendFdRequest, Socket};
 use scheme_utils::{FpathWriter, HandleMap};
 use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{
-    EACCES, EBADF, EBADFD, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY,
-    EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE,
+    EACCES, EBADF, EBADFD, EBUSY, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOSYS, ENOTDIR,
+    ENOTEMPTY, EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE,
 };
 use syscall::flag::{
     StdFsCallKind, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_STAT, O_TRUNC,
@@ -190,7 +190,8 @@ impl<'a> Scheme<'a> {
     /// Remove a directory entry, where the entry can be both a file or a directory. Used by `unlinkat`.
     fn remove_dentry(&mut self, path: &str, uid: u32, gid: u32, directory: bool) -> Result<()> {
         let (parent_dir_inode, name_to_delete) =
-            self.filesystem.resolve_except_last(path, uid, gid)?;
+            self.filesystem
+                .resolve_except_last(Filesystem::ROOT_INODE, path, uid, gid)?;
         let name_to_delete = name_to_delete.ok_or(Error::new(EINVAL))?; // can't remove root
 
         let removed_inode = {
@@ -267,7 +268,9 @@ impl<'a> Scheme<'a> {
     }
 
     fn open_existing(&mut self, path: &str, flags: usize, uid: u32, gid: u32) -> Result<Inode> {
-        let inode = self.filesystem.resolve(path, uid, gid)?;
+        let inode = self
+            .filesystem
+            .resolve(Filesystem::ROOT_INODE, path, uid, gid)?;
         let file = self
             .filesystem
             .files
@@ -322,21 +325,45 @@ impl<'a> Scheme<'a> {
         return Ok(len);
     }
 
+    fn fchown_inner(&mut self, fd: usize, uid: u32, gid: u32, caller_uid: u32) -> Result<()> {
+        let inode = self.handles.get(fd)?.as_inode()?;
+        let file = self
+            .filesystem
+            .files
+            .get_mut(&inode)
+            .ok_or(Error::new(EBADFD))?;
+
+        if caller_uid != 0 && (caller_uid != file.uid || uid != file.uid || gid != file.gid) {
+            return Err(Error::new(EPERM));
+        }
+
+        file.uid = uid;
+        file.gid = gid;
+
+        Ok(())
+    }
+
     /// Validates new link, used by `flink` and `frename`.
     /// Returns (old_parent_inode, new_parent_inode, target_inode_opt, new_name)
     fn validate_new_link(
         &self,
         inode: usize,
+        dir_inode: usize,
         new_path_str: &str,
         uid: u32,
         gid: u32,
     ) -> Result<(usize, usize, Option<usize>, String)> {
-        if inode == Filesystem::ROOT_INODE {
-            return Err(Error::new(EINVAL));
-        }
+        let path = RedoxReference::new(new_path_str).ok_or(Error::new(EINVAL))?;
+
+        let start_inode = if path.is_relative() {
+            dir_inode
+        } else {
+            Filesystem::ROOT_INODE
+        };
+
         let (new_parent_inode, Some(new_name)) =
             self.filesystem
-                .resolve_except_last(new_path_str, uid, gid)?
+                .resolve_except_last(start_inode, new_path_str, uid, gid)?
         else {
             return Err(Error::new(EINVAL));
         };
@@ -373,6 +400,312 @@ impl<'a> Scheme<'a> {
         ))
     }
 
+    fn flink_internal(
+        &mut self,
+        inode: usize,
+        dir_inode: usize,
+        path: &str,
+        _flags: u32, // TODO: Support flags
+        uid: u32,
+        gid: u32,
+    ) -> Result<usize> {
+        let (_, new_parent_inode, target_inode_opt, new_name) =
+            self.validate_new_link(inode, dir_inode, path, uid, gid)?;
+
+        if target_inode_opt.is_some() {
+            return Err(Error::new(EEXIST));
+        }
+
+        if {
+            let file = self.filesystem.files.get(&inode).ok_or(Error::new(EIO))?;
+            file.mode & MODE_TYPE == MODE_DIR
+        } {
+            // Prevent hard link directories
+            return Err(Error::new(EPERM));
+        }
+
+        {
+            let file = self
+                .filesystem
+                .files
+                .get_mut(&inode)
+                .ok_or(Error::new(EIO))?;
+            file.nlink = file.nlink.checked_add(1).ok_or(Error::new(EOVERFLOW))?;
+            file.ctime = filesystem::current_time();
+        }
+
+        {
+            let new_parent = self
+                .filesystem
+                .files
+                .get_mut(&new_parent_inode)
+                .ok_or(Error::new(EIO))?;
+
+            let FileData::Directory(ref mut dentries) = new_parent.data else {
+                return Err(Error::new(EIO));
+            };
+
+            dentries.insert(new_name, Inode(inode));
+
+            let cur_time = filesystem::current_time();
+            new_parent.mtime = cur_time;
+            new_parent.ctime = cur_time;
+        }
+
+        Ok(0)
+    }
+
+    fn frename_internal(
+        &mut self,
+        old_dir_inode: usize,
+        old_path_str: &str,
+        new_dir_inode: usize,
+        new_path_str: &str,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<usize> {
+        let old_path = RedoxReference::new(old_path_str).ok_or(Error::new(EINVAL))?;
+        let new_path = RedoxReference::new(new_path_str).ok_or(Error::new(EINVAL))?;
+
+        let old_start_inode = if old_path.is_relative() {
+            old_dir_inode
+        } else {
+            Filesystem::ROOT_INODE
+        };
+
+        let new_start_inode = if new_path.is_relative() {
+            new_dir_inode
+        } else {
+            Filesystem::ROOT_INODE
+        };
+
+        let (old_parent_inode, old_name) =
+            self.filesystem
+                .resolve_except_last(old_start_inode, old_path_str, uid, gid)?;
+        let old_name = old_name.ok_or(Error::new(EBUSY))?;
+
+        let inode = {
+            let old_parent = self
+                .filesystem
+                .files
+                .get(&old_parent_inode)
+                .ok_or(Error::new(EIO))?;
+
+            check_permissions(O_WRONLY, current_perm(old_parent, uid, gid))?;
+
+            let FileData::Directory(ref dentries) = old_parent.data else {
+                return Err(Error::new(ENOTDIR));
+            };
+
+            let entry_inode = dentries
+                .get(old_name.as_ref())
+                .copied()
+                .ok_or(Error::new(ENOENT))?
+                .0;
+
+            let file = self
+                .filesystem
+                .files
+                .get(&entry_inode)
+                .ok_or(Error::new(EIO))?;
+
+            Self::check_sticky_bit(old_parent, file, uid)?;
+            entry_inode
+        };
+
+        let (new_parent_inode, new_name) =
+            self.filesystem
+                .resolve_except_last(new_start_inode, new_path_str, uid, gid)?;
+        let new_name = new_name.ok_or(Error::new(EINVAL))?;
+
+        let target_inode_opt = {
+            let new_parent = self
+                .filesystem
+                .files
+                .get(&new_parent_inode)
+                .ok_or(Error::new(EIO))?;
+
+            check_permissions(O_WRONLY, current_perm(new_parent, uid, gid))?;
+
+            let FileData::Directory(ref dentries) = new_parent.data else {
+                return Err(Error::new(ENOTDIR));
+            };
+
+            dentries.get(new_name.as_ref()).copied().map(|i| i.0)
+        };
+
+        if flags & libredox::flag::RENAME_NOREPLACE != 0 && target_inode_opt.is_some() {
+            return Err(Error::new(EEXIST));
+        }
+
+        let is_dir = {
+            let file = self.filesystem.files.get(&inode).ok_or(Error::new(EIO))?;
+            file.mode & MODE_TYPE == MODE_DIR
+        };
+
+        if let Some(target_inode) = target_inode_opt {
+            if target_inode == inode {
+                return Ok(0); //  no-op
+            }
+
+            let target_file = self
+                .filesystem
+                .files
+                .get(&target_inode)
+                .ok_or(Error::new(EIO))?;
+            let target_is_dir = target_file.mode & MODE_TYPE == MODE_DIR;
+
+            if is_dir && !target_is_dir {
+                return Err(Error::new(ENOTDIR));
+            }
+            if !is_dir && target_is_dir {
+                return Err(Error::new(EISDIR));
+            }
+            if target_is_dir {
+                let FileData::Directory(ref dentries) = target_file.data else {
+                    return Err(Error::new(EIO));
+                };
+                if !dentries.is_empty() {
+                    return Err(Error::new(ENOTEMPTY));
+                }
+            }
+        }
+
+        if is_dir {
+            let mut curr = new_parent_inode;
+            while curr != Filesystem::ROOT_INODE {
+                if curr == inode {
+                    // Prevent moving this to subdir of itself
+                    return Err(Error::new(EINVAL));
+                }
+                curr = self
+                    .filesystem
+                    .files
+                    .get(&curr)
+                    .ok_or(Error::new(EIO))?
+                    .parent
+                    .0;
+            }
+        }
+
+        {
+            let old_parent = self
+                .filesystem
+                .files
+                .get_mut(&old_parent_inode)
+                .ok_or(Error::new(EIO))?;
+            let FileData::Directory(ref mut dentries) = old_parent.data else {
+                return Err(Error::new(EIO));
+            };
+            dentries
+                .shift_remove(old_name.as_ref())
+                .ok_or(Error::new(ENOENT))?;
+        }
+
+        {
+            let new_parent = self
+                .filesystem
+                .files
+                .get_mut(&new_parent_inode)
+                .ok_or(Error::new(EIO))?;
+            let FileData::Directory(ref mut dentries) = new_parent.data else {
+                return Err(Error::new(EIO));
+            };
+            dentries.insert(new_name.to_string(), Inode(inode));
+        }
+
+        {
+            let file = self
+                .filesystem
+                .files
+                .get_mut(&inode)
+                .ok_or(Error::new(EIO))?;
+            file.parent = Inode(new_parent_inode);
+            file.ctime = filesystem::current_time();
+        }
+
+        let cur_time = filesystem::current_time();
+        if old_parent_inode == new_parent_inode {
+            let parent = self
+                .filesystem
+                .files
+                .get_mut(&old_parent_inode)
+                .ok_or(Error::new(EIO))?;
+            parent.mtime = cur_time;
+            parent.ctime = cur_time;
+        } else {
+            {
+                let old_parent = self
+                    .filesystem
+                    .files
+                    .get_mut(&old_parent_inode)
+                    .ok_or(Error::new(EIO))?;
+                old_parent.mtime = cur_time;
+                old_parent.ctime = cur_time;
+                if is_dir {
+                    old_parent.nlink -= 1;
+                }
+            }
+            {
+                let new_parent = self
+                    .filesystem
+                    .files
+                    .get_mut(&new_parent_inode)
+                    .ok_or(Error::new(EIO))?;
+                new_parent.mtime = cur_time;
+                new_parent.ctime = cur_time;
+                if is_dir {
+                    new_parent.nlink += 1;
+                }
+            }
+        }
+
+        if let Some(target_inode) = target_inode_opt {
+            if target_inode != inode {
+                // TODO: call remove_dentry instead?
+                let is_target_dir = {
+                    let target_file = self
+                        .filesystem
+                        .files
+                        .get_mut(&target_inode)
+                        .ok_or(Error::new(EIO))?;
+                    if target_file.mode & MODE_TYPE == MODE_DIR {
+                        target_file.nlink -= 2; // '.' and the parent entry
+                        true
+                    } else {
+                        target_file.nlink -= 1;
+                        false
+                    }
+                };
+
+                if is_target_dir {
+                    let new_parent = self
+                        .filesystem
+                        .files
+                        .get_mut(&new_parent_inode)
+                        .ok_or(Error::new(EIO))?;
+                    new_parent.nlink -= 1; // for '..' backlink
+                }
+
+                let remove = {
+                    let target_file = self
+                        .filesystem
+                        .files
+                        .get(&target_inode)
+                        .ok_or(Error::new(EIO))?;
+                    target_file.nlink == 0 && target_file.open_handles == 0
+                };
+
+                if remove {
+                    self.filesystem.files.remove(&target_inode);
+                }
+            }
+        }
+
+        Ok(0)
+    }
+
     fn check_sticky_bit(
         parent: &crate::filesystem::File,
         child: &crate::filesystem::File,
@@ -404,7 +737,10 @@ impl SchemeSync for Scheme<'_> {
             return Err(Error::new(EACCES));
         }
 
-        let exists = self.filesystem.resolve(path, 0, 0).is_ok();
+        let exists = self
+            .filesystem
+            .resolve(Filesystem::ROOT_INODE, path, 0, 0)
+            .is_ok();
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 && exists {
             return Err(Error::new(EEXIST));
         }
@@ -416,9 +752,12 @@ impl SchemeSync for Scheme<'_> {
                 return Err(Error::new(EINVAL));
             }
 
-            let (parent_dir_inode, new_name) = self
-                .filesystem
-                .resolve_except_last(path, ctx.uid, ctx.gid)?;
+            let (parent_dir_inode, new_name) = self.filesystem.resolve_except_last(
+                Filesystem::ROOT_INODE,
+                path,
+                ctx.uid,
+                ctx.gid,
+            )?;
             let new_name = new_name.ok_or(Error::new(EINVAL))?; // cannot mkdir /
 
             {
@@ -709,13 +1048,14 @@ impl SchemeSync for Scheme<'_> {
     }
 
     fn unlinkat(&mut self, dirfd: usize, path: &str, flags: usize, ctx: &CallerCtx) -> Result<()> {
+        let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
         if self.handles.get(dirfd)?.as_inode()? != Filesystem::ROOT_INODE {
             return Err(Error::new(EACCES));
         }
         self.remove_dentry(
             path,
-            ctx.uid,
-            ctx.gid,
+            uid,
+            gid,
             flags & syscall::AT_REMOVEDIR == syscall::AT_REMOVEDIR,
         )
     }
@@ -796,7 +1136,7 @@ impl SchemeSync for Scheme<'_> {
         }
         Ok(buf)
     }
-    fn fchmod(&mut self, fd: usize, mode: u16, _ctx: &CallerCtx) -> Result<()> {
+    fn fchmod(&mut self, fd: usize, mode: u16, ctx: &CallerCtx) -> Result<()> {
         let inode = self.handles.get(fd)?.as_inode()?;
         let file = self
             .filesystem
@@ -804,14 +1144,13 @@ impl SchemeSync for Scheme<'_> {
             .get_mut(&inode)
             .ok_or(Error::new(EBADFD))?;
 
+        let (_pid, uid, _gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
+
         let cur_type = file.mode & MODE_TYPE;
 
-        /*
-        // TODO: validate ctx
-        if ctx.uid != 0 && ctx.uid != file.uid {
+        if uid != 0 && uid != file.uid {
             return Err(Error::new(EPERM));
         }
-        */
 
         /*
         if mode & MODE_TYPE != 0 {
@@ -823,20 +1162,8 @@ impl SchemeSync for Scheme<'_> {
 
         Ok(())
     }
-    fn fchown(&mut self, fd: usize, uid: u32, gid: u32, _ctx: &CallerCtx) -> Result<()> {
-        let inode = self.handles.get(fd)?.as_inode()?;
-        let file = self
-            .filesystem
-            .files
-            .get_mut(&inode)
-            .ok_or(Error::new(EBADFD))?;
-
-        // TODO: validate ctx
-
-        file.uid = uid;
-        file.gid = gid;
-
-        Ok(())
+    fn fchown(&mut self, fd: usize, uid: u32, gid: u32, ctx: &CallerCtx) -> Result<()> {
+        self.fchown_inner(fd, uid, gid, ctx.uid)
     }
     fn fcntl(
         &mut self,
@@ -899,249 +1226,75 @@ impl SchemeSync for Scheme<'_> {
     }
     fn flink(&mut self, fd: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
         let inode = self.handles.get(fd)?.as_inode()?;
-        let uid = ctx.uid;
-        let gid = ctx.gid;
-
-        let (_, new_parent_inode, target_inode_opt, new_name) =
-            self.validate_new_link(inode, path, uid, gid)?;
-
-        if target_inode_opt.is_some() {
-            return Err(Error::new(EEXIST));
-        }
-
-        if {
-            let file = self.filesystem.files.get(&inode).ok_or(Error::new(EIO))?;
-            file.mode & MODE_TYPE == MODE_DIR
-        } {
-            // Prevent hard link directories
-            return Err(Error::new(EPERM));
-        }
-
-        {
-            let file = self
-                .filesystem
-                .files
-                .get_mut(&inode)
-                .ok_or(Error::new(EIO))?;
-            file.nlink = file.nlink.checked_add(1).ok_or(Error::new(EOVERFLOW))?;
-            file.ctime = filesystem::current_time();
-        }
-
-        {
-            let new_parent = self
-                .filesystem
-                .files
-                .get_mut(&new_parent_inode)
-                .ok_or(Error::new(EIO))?;
-
-            let FileData::Directory(ref mut dentries) = new_parent.data else {
-                return Err(Error::new(EIO));
-            };
-
-            dentries.insert(new_name, Inode(inode));
-
-            let cur_time = filesystem::current_time();
-            new_parent.mtime = cur_time;
-            new_parent.ctime = cur_time;
-        }
-
-        Ok(0)
+        self.flink_internal(inode, Filesystem::ROOT_INODE, path, 0, ctx.uid, ctx.gid)
     }
-
+    fn flinkat(
+        &mut self,
+        id: usize,
+        dirid: usize,
+        path: &str,
+        flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let inode = self.handles.get(id)?.as_inode()?;
+        let dir_inode = self.handles.get(dirid)?.as_inode()?;
+        let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
+        self.flink_internal(inode, dir_inode, path, flags, uid, gid)
+    }
     fn frename(&mut self, fd: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
         let inode = self.handles.get(fd)?.as_inode()?;
-        let uid = ctx.uid;
-        let gid = ctx.gid;
+        let file = self
+            .filesystem
+            .files
+            .get(&inode)
+            .ok_or(Error::new(EBADFD))?;
+        let parent_inode = file.parent.0;
 
-        let (old_parent_inode, new_parent_inode, target_inode_opt, new_name) =
-            self.validate_new_link(inode, path, uid, gid)?;
-
-        {
-            let old_parent = self
-                .filesystem
-                .files
-                .get(&old_parent_inode)
-                .ok_or(Error::new(EIO))?;
-
-            let file = self.filesystem.files.get(&inode).ok_or(Error::new(EIO))?;
-
-            check_permissions(O_WRONLY, current_perm(old_parent, uid, gid))?;
-
-            Self::check_sticky_bit(old_parent, file, uid)?;
-        }
-
-        let is_dir = {
-            let file = self.filesystem.files.get(&inode).ok_or(Error::new(EIO))?;
-            file.mode & MODE_TYPE == MODE_DIR
+        let parent_file = self
+            .filesystem
+            .files
+            .get(&parent_inode)
+            .ok_or(Error::new(EBADFD))?;
+        let FileData::Directory(ref dir) = parent_file.data else {
+            return Err(Error::new(EBADFD));
         };
+        let (old_name, _) = dir
+            .iter()
+            .find(|(_name, i)| i.0 == inode)
+            .ok_or(Error::new(ENOENT))?;
+        let old_name = old_name.clone();
 
-        if let Some(target_inode) = target_inode_opt {
-            if target_inode == inode {
-                return Ok(0); //  no-op
-            }
-
-            let target_file = self
-                .filesystem
-                .files
-                .get(&target_inode)
-                .ok_or(Error::new(EIO))?;
-            let target_is_dir = target_file.mode & MODE_TYPE == MODE_DIR;
-
-            if is_dir && !target_is_dir {
-                return Err(Error::new(ENOTDIR));
-            }
-            if !is_dir && target_is_dir {
-                return Err(Error::new(EISDIR));
-            }
-            if target_is_dir {
-                let FileData::Directory(ref dentries) = target_file.data else {
-                    return Err(Error::new(EIO));
-                };
-                if !dentries.is_empty() {
-                    return Err(Error::new(ENOTEMPTY));
-                }
-            }
-        }
-
-        if is_dir {
-            let mut curr = new_parent_inode;
-            while curr != Filesystem::ROOT_INODE {
-                if curr == inode {
-                    // Prevent moving this to subdir of itself
-                    return Err(Error::new(EINVAL));
-                }
-                curr = self
-                    .filesystem
-                    .files
-                    .get(&curr)
-                    .ok_or(Error::new(EIO))?
-                    .parent
-                    .0;
-            }
-        }
-
-        {
-            let old_parent = self
-                .filesystem
-                .files
-                .get_mut(&old_parent_inode)
-                .ok_or(Error::new(EIO))?;
-            let FileData::Directory(ref mut dentries) = old_parent.data else {
-                return Err(Error::new(EIO));
-            };
-
-            let mut found = None;
-            for (k, v) in dentries.iter() {
-                if v.0 == inode {
-                    found = Some(k.clone());
-                    break;
-                }
-            }
-            let name = found.ok_or(Error::new(ENOENT))?;
-            dentries.shift_remove(&name);
-        }
-
-        {
-            let new_parent = self
-                .filesystem
-                .files
-                .get_mut(&new_parent_inode)
-                .ok_or(Error::new(EIO))?;
-            let FileData::Directory(ref mut dentries) = new_parent.data else {
-                return Err(Error::new(EIO));
-            };
-            dentries.insert(new_name, Inode(inode));
-        }
-
-        {
-            let file = self
-                .filesystem
-                .files
-                .get_mut(&inode)
-                .ok_or(Error::new(EIO))?;
-            file.parent = Inode(new_parent_inode);
-            file.ctime = filesystem::current_time();
-        }
-
-        let cur_time = filesystem::current_time();
-        if old_parent_inode == new_parent_inode {
-            let parent = self
-                .filesystem
-                .files
-                .get_mut(&old_parent_inode)
-                .ok_or(Error::new(EIO))?;
-            parent.mtime = cur_time;
-            parent.ctime = cur_time;
-        } else {
-            {
-                let old_parent = self
-                    .filesystem
-                    .files
-                    .get_mut(&old_parent_inode)
-                    .ok_or(Error::new(EIO))?;
-                old_parent.mtime = cur_time;
-                old_parent.ctime = cur_time;
-                if is_dir {
-                    old_parent.nlink -= 1;
-                }
-            }
-            {
-                let new_parent = self
-                    .filesystem
-                    .files
-                    .get_mut(&new_parent_inode)
-                    .ok_or(Error::new(EIO))?;
-                new_parent.mtime = cur_time;
-                new_parent.ctime = cur_time;
-                if is_dir {
-                    new_parent.nlink += 1;
-                }
-            }
-        }
-
-        if let Some(target_inode) = target_inode_opt {
-            if target_inode != inode {
-                // TODO: call remove_dentry instead?
-                let is_target_dir = {
-                    let target_file = self
-                        .filesystem
-                        .files
-                        .get_mut(&target_inode)
-                        .ok_or(Error::new(EIO))?;
-                    if target_file.mode & MODE_TYPE == MODE_DIR {
-                        target_file.nlink -= 2; // '.' and the parent entry
-                        true
-                    } else {
-                        target_file.nlink -= 1;
-                        false
-                    }
-                };
-
-                if is_target_dir {
-                    let new_parent = self
-                        .filesystem
-                        .files
-                        .get_mut(&new_parent_inode)
-                        .ok_or(Error::new(EIO))?;
-                    new_parent.nlink -= 1; // for '..' backlink
-                }
-
-                let remove = {
-                    let target_file = self
-                        .filesystem
-                        .files
-                        .get(&target_inode)
-                        .ok_or(Error::new(EIO))?;
-                    target_file.nlink == 0 && target_file.open_handles == 0
-                };
-
-                if remove {
-                    self.filesystem.files.remove(&target_inode);
-                }
-            }
-        }
-
-        Ok(0)
+        self.frename_internal(
+            parent_inode,
+            &old_name,
+            Filesystem::ROOT_INODE,
+            path,
+            0,
+            ctx.uid,
+            ctx.gid,
+        )
+    }
+    fn frenameat(
+        &mut self,
+        old_dir: usize,
+        old_path: &str,
+        new_dir: usize,
+        new_path: &str,
+        flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let old_dir_inode = self.handles.get(old_dir)?.as_inode()?;
+        let new_dir_inode = self.handles.get(new_dir)?.as_inode()?;
+        let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
+        self.frename_internal(
+            old_dir_inode,
+            old_path,
+            new_dir_inode,
+            new_path,
+            flags,
+            uid,
+            gid,
+        )
     }
     fn fstat(&mut self, fd: usize, stat: &mut Stat, _ctx: &CallerCtx) -> Result<()> {
         let inode = self.handles.get(fd)?.as_inode()?;
@@ -1362,9 +1515,12 @@ impl SchemeSync for Scheme<'_> {
             return Err(Error::new(EINVAL));
         }
 
-        let (parent_dir_inode, new_name) =
-            self.filesystem
-                .resolve_except_last(path.as_ref(), ctx.uid, ctx.gid)?;
+        let (parent_dir_inode, new_name) = self.filesystem.resolve_except_last(
+            Filesystem::ROOT_INODE,
+            path.as_ref(),
+            ctx.uid,
+            ctx.gid,
+        )?;
         let new_name = new_name.ok_or(Error::new(EINVAL))?; // cannot mkdir /
 
         let current_time = filesystem::current_time();
@@ -1411,40 +1567,16 @@ impl SchemeSync for Scheme<'_> {
         &mut self,
         id: usize,
         kind: StdFsCallKind,
-        _payload: &mut [u8],
+        payload: &mut [u8],
         metadata: StdFsCallMeta,
         ctx: &CallerCtx,
     ) -> Result<usize> {
         match kind {
             StdFsCallKind::Fchown => {
-                let (new_uid, new_gid) = (metadata.arg1 as u32, metadata.arg1 >> 32 as u32);
-                let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
-                if uid != 0 && (uid != ctx.uid || gid != ctx.gid) {
-                    return Err(Error::new(EPERM));
-                }
-                self.fchown(id, new_uid, new_gid as u32, ctx).map(|_| 0)
+                let (new_uid, new_gid) = (metadata.arg1 as u32, (metadata.arg1 >> 32) as u32);
+                let (_pid, uid, _gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
+                self.fchown_inner(id, new_uid, new_gid, uid).map(|_| 0)
             }
-            /* TODO: Support Unlinkat using std_fs_call
-            Unlinkat => {
-                let path = unsafe { str::from_utf8_unchecked(payload) };
-                let flags = metadata.arg1;                {
-                    if !matches!(
-                        self.handles.get(&id).ok_or(Error::new(EBADF))?,
-                        Handle::SchemeRoot
-                    ) {
-                        return Err(Error::new(EACCES));
-                    }
-                }
-                let (_pid, uid, gid) = get_uid_gid_from_pid(&self.proc_creds_capability, ctx.pid)?;
-                self.remove_dentry(
-                    path,
-                    uid,
-                    gid,
-                    *flags as usize & syscall::AT_REMOVEDIR == syscall::AT_REMOVEDIR,
-                )
-                .map(|_| 0)
-            }
-            */
             _ => Err(Error::new(EOPNOTSUPP)),
         }
     }

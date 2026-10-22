@@ -147,12 +147,15 @@ impl Filesystem {
         self.last_inode_number = next;
         Ok(next)
     }
-    fn resolve_generic(&self, parts: RedoxReference<'_>, uid: u32, gid: u32) -> Result<usize> {
-        let mut current_file = self
-            .files
-            .get(&Self::ROOT_INODE)
-            .ok_or(Error::new(ENOENT))?;
-        let mut current_inode = Self::ROOT_INODE;
+    fn resolve_generic(
+        &self,
+        start: usize,
+        parts: RedoxReference<'_>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<usize> {
+        let mut current_file = self.files.get(&start).ok_or(Error::new(ENOENT))?;
+        let mut current_inode = start;
 
         if parts.as_ref().is_empty() {
             return Ok(current_inode);
@@ -180,6 +183,7 @@ impl Filesystem {
     }
     pub fn resolve_except_last<'a>(
         &self,
+        start: usize,
         path: &'a str,
         uid: u32,
         gid: u32,
@@ -190,14 +194,14 @@ impl Filesystem {
 
         let (dir, name) = path.dirname_split();
         Ok((
-            self.resolve_generic(dir, uid, gid)?,
+            self.resolve_generic(start, dir, uid, gid)?,
             name.map(|s| s.into_owned()),
         ))
     }
-    pub fn resolve(&self, path: &str, uid: u32, gid: u32) -> Result<usize> {
+    pub fn resolve(&self, start: usize, path: &str, uid: u32, gid: u32) -> Result<usize> {
         let path = RedoxReference::new(path).ok_or(Error::new(EINVAL))?;
 
-        self.resolve_generic(path.canonical(), uid, gid)
+        self.resolve_generic(start, path.canonical(), uid, gid)
     }
 }
 

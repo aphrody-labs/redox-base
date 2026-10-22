@@ -7,6 +7,7 @@ use std::convert::TryInto;
 use std::rc::Rc;
 
 use libc::{AF_UNIX, SO_DOMAIN, SO_PASSCRED};
+use libredox::Fd;
 use rand::Rng;
 use redox_scheme::{CallerCtx, OpenResult, RecvFdRequest, SendFdRequest};
 use syscall::error::*;
@@ -145,7 +146,7 @@ impl Socket {
     }
 
     fn sendmsg_inner(
-        cap_fd: usize,
+        cap_fd: &Fd,
         socket: &mut Socket,
         name: Option<String>,
         msg_stream: &[u8],
@@ -389,7 +390,7 @@ impl super::scheme::Socket for Socket {
         let (remote_id, remote_rc) = Self::get_connected_peer(scheme, id)?;
 
         let bytes_written = Self::sendmsg_inner(
-            scheme.proc_creds_capability,
+            &scheme.proc_creds_capability,
             &mut remote_rc.borrow_mut(),
             name,
             msg_stream,
