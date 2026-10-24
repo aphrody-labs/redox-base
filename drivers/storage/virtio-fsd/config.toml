@@ -1,6 +1,15 @@
+# QEMU presents virtio-fs as mass storage, class 0x01 (subclass 0x80).
 [[drivers]]
 name = "virtio-fs"
 class = 0x01
+vendor = 0x1AF4
+device = 0x105A
+command = ["virtio-fsd"]
+
+# Cloud Hypervisor's non-transitional virtio-fs is class 0xFF. The device id is the same.
+[[drivers]]
+name = "virtio-fs"
+class = 0xFF
 vendor = 0x1AF4
 device = 0x105A
 command = ["virtio-fsd"]
