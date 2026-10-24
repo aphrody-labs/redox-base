@@ -2923,6 +2923,7 @@ dependencies = [
  "libredox",
  "log",
  "pcid",
+ "plain",
  "redox-path",
  "redox-scheme",
  "redox_event",
@@ -2940,6 +2941,7 @@ dependencies = [
  "clap",
  "libc",
  "libredox",
+ "redox_syscall 0.9.5",
 ]
 
 [[package]]

@@ -15,8 +15,13 @@ pub fn cases() -> Vec<TestCase> {
         func rename_open_keeps_io,
         func rename_attr_follows,
         func rename_cross_dir,
+        func rename_at_same_dir,
+        func rename_at_cross_dir,
+        func rename_at_overwrite,
         edge edge_rename_errnos,
         edge edge_rename_exdev,
+        edge edge_rename_at_noreplace,
+        edge edge_rename_at,
     ]
 }
 
@@ -295,4 +300,154 @@ fn edge_rename_exdev(ctx: &TestCtx) -> Outcome {
             .map(|e| e.to_string())
             .unwrap_or_else(|| "none tried".into())
     ))
+}
+
+fn rename_at_same_dir(ctx: &TestCtx) -> Outcome {
+    let src_name = fsutil::base_name(&ctx.work("at_rn_src.txt")).to_owned();
+    let dst_name = fsutil::base_name(&ctx.work("at_rn_dst.txt")).to_owned();
+    let src = ctx.root().join(&src_name);
+    check_ok!(fsutil::write_all_path(&src, b"moved"));
+    let dir = check_ok!(fsutil::open_dir(ctx.root()));
+    check_ok!(fsutil::frenameat(&dir, &src_name, &dir, &dst_name, 0));
+
+    let dst = ctx.root().join(&dst_name);
+    check!(fsutil::gone(&src), "old name still opens");
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"moved");
+    check!(
+        check_ok!(fsutil::listed(ctx.root(), &dst_name)),
+        "new name missing from readdir"
+    );
+    Outcome::Pass
+}
+
+fn rename_at_cross_dir(ctx: &TestCtx) -> Outcome {
+    let a = ctx.work("at_rn_a");
+    let b = ctx.work("at_rn_b");
+    check_ok!(fsutil::make_dir(&a));
+    check_ok!(fsutil::make_dir(&b));
+    check_ok!(fsutil::write_all_path(&a.join("moved.txt"), b"x"));
+    let dir_a = check_ok!(fsutil::open_dir(&a));
+    let dir_b = check_ok!(fsutil::open_dir(&b));
+    check_ok!(fsutil::frenameat(
+        &dir_a,
+        "moved.txt",
+        &dir_b,
+        "moved.txt",
+        0
+    ));
+    check!(
+        !check_ok!(fsutil::listed(&a, "moved.txt")),
+        "still in source"
+    );
+    check!(
+        check_ok!(fsutil::listed(&b, "moved.txt")),
+        "missing in dest"
+    );
+    check_bytes!(check_ok!(fsutil::read_to_vec(&b.join("moved.txt"))), b"x");
+    Outcome::Pass
+}
+
+fn rename_at_overwrite(ctx: &TestCtx) -> Outcome {
+    let src_name = fsutil::base_name(&ctx.work("at_rn_ow_src.txt")).to_owned();
+    let dst_name = fsutil::base_name(&ctx.work("at_rn_ow_dst.txt")).to_owned();
+    let src = ctx.root().join(&src_name);
+    let dst = ctx.root().join(&dst_name);
+    check_ok!(fsutil::write_all_path(&src, b"winner"));
+    check_ok!(fsutil::write_all_path(&dst, b"loser"));
+    let dir = check_ok!(fsutil::open_dir(ctx.root()));
+    check_ok!(fsutil::frenameat(&dir, &src_name, &dir, &dst_name, 0));
+    check!(fsutil::gone(&src), "old name still opens");
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"winner");
+    Outcome::Pass
+}
+
+fn edge_rename_at_noreplace(ctx: &TestCtx) -> Outcome {
+    let src_name = fsutil::base_name(&ctx.work("at_rn_nr_src.txt")).to_owned();
+    let dst_name = fsutil::base_name(&ctx.work("at_rn_nr_dst.txt")).to_owned();
+    let fresh_name = fsutil::base_name(&ctx.work("at_rn_nr_fresh.txt")).to_owned();
+    let src = ctx.root().join(&src_name);
+    let dst = ctx.root().join(&dst_name);
+    check_ok!(fsutil::write_all_path(&src, b"keep"));
+    check_ok!(fsutil::write_all_path(&dst, b"stay"));
+    let dir = check_ok!(fsutil::open_dir(ctx.root()));
+    check_errno!(
+        fsutil::frenameat(&dir, &src_name, &dir, &dst_name, fsutil::RENAME_NOREPLACE),
+        fsutil::EEXIST,
+        "noreplace onto existing"
+    );
+    check_bytes!(check_ok!(fsutil::read_to_vec(&src)), b"keep");
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"stay");
+
+    check_ok!(fsutil::frenameat(
+        &dir,
+        &src_name,
+        &dir,
+        &fresh_name,
+        fsutil::RENAME_NOREPLACE
+    ));
+    check!(fsutil::gone(&src), "old name still opens");
+    check_bytes!(
+        check_ok!(fsutil::read_to_vec(&ctx.root().join(&fresh_name))),
+        b"keep"
+    );
+    Outcome::Pass
+}
+
+fn edge_rename_at(ctx: &TestCtx) -> Outcome {
+    let sub_path = ctx.work("at_rn_edge");
+    check_ok!(fsutil::make_dir(&sub_path));
+    check_ok!(fsutil::write_all_path(&sub_path.join("old.txt"), b"abs"));
+    let sub = check_ok!(fsutil::open_dir(&sub_path));
+
+    check_errno!(
+        fsutil::frenameat(&sub, "", &sub, "x.txt", 0),
+        fsutil::EINVAL,
+        "empty old name"
+    );
+    check_errno!(
+        fsutil::frenameat(&sub, "old.txt", &sub, "", 0),
+        fsutil::EINVAL,
+        "empty new name"
+    );
+    check!(
+        check_ok!(fsutil::listed(&sub_path, "old.txt")),
+        "empty rename removed the source"
+    );
+
+    let lru = check_ok!(fsutil::open_ro(&ctx.cfg.debug_root.join("lru_evicted")));
+    check_errno!(
+        fsutil::frenameat(&lru, "lru_evicted", &lru, "other", 0),
+        fsutil::EPERM,
+        "debug handle"
+    );
+    check_ok!(fsutil::open_ro(&ctx.cfg.debug_root.join("lru_evicted")));
+
+    let dst_name = fsutil::base_name(&ctx.work("at_rn_abs.txt")).to_owned();
+    let abs_path = ctx.root().join(&dst_name);
+    let abs = check_ok!(fsutil::path_to_str(&abs_path)).to_owned();
+    check_ok!(fsutil::frenameat(&sub, "old.txt", &sub, &abs, 0));
+    check!(
+        !check_ok!(fsutil::listed(&sub_path, "old.txt")),
+        "old name still in the directory"
+    );
+    check!(
+        !check_ok!(fsutil::listed(&sub_path, &dst_name)),
+        "absolute rename landed in the directory fd"
+    );
+    check_bytes!(
+        check_ok!(fsutil::read_to_vec(&ctx.root().join(&dst_name))),
+        b"abs"
+    );
+
+    check_ok!(fsutil::write_all_path(&sub_path.join("stay.txt"), b"stay"));
+    check_errno!(
+        fsutil::frenameat(&sub, "stay.txt", &sub, "/scheme/not-virtio-fs/x", 0),
+        fsutil::EXDEV,
+        "other scheme"
+    );
+    check_bytes!(
+        check_ok!(fsutil::read_to_vec(&sub_path.join("stay.txt"))),
+        b"stay"
+    );
+    Outcome::Pass
 }

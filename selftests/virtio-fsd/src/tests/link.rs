@@ -41,6 +41,8 @@ pub fn cases() -> Vec<TestCase> {
         func link_open_both,
         func link_dest_through_symlink_parent,
         func link_via_linkat,
+        func link_at_same_dir,
+        func link_at_other_dir,
         func link_cross_dir_unlink_src,
         func link_unlink_one_open_fd,
         func link_rename_cross_dir,
@@ -61,6 +63,7 @@ pub fn cases() -> Vec<TestCase> {
         edge edge_link_eexist_keeps_src,
         edge edge_link_name_max,
         edge edge_link_missing_intermediate,
+        edge edge_link_at,
     ]
 }
 
@@ -831,5 +834,87 @@ fn edge_link_missing_intermediate(ctx: &TestCtx) -> Outcome {
         fsutil::ENOENT,
         "missing intermediate"
     );
+    Outcome::Pass
+}
+
+fn link_at_same_dir(ctx: &TestCtx) -> Outcome {
+    let src = ctx.work("at_ln_src.txt");
+    check_ok!(fsutil::write_all_path(&src, b"shared"));
+    let dst_name = fsutil::base_name(&ctx.work("at_ln_dst.txt")).to_owned();
+    let src_fd = check_ok!(fsutil::open_ro(&src));
+    let dir = check_ok!(fsutil::open_dir(ctx.root()));
+    check_ok!(fsutil::flinkat(&src_fd, &dir, &dst_name));
+
+    let dst = ctx.root().join(&dst_name);
+    check_eq!(
+        check_ok!(fsutil::stat(&src)).st_ino,
+        check_ok!(fsutil::stat(&dst)).st_ino
+    );
+    check_eq!(check_ok!(fsutil::stat(&dst)).st_nlink as u64, 2);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"shared");
+    Outcome::Pass
+}
+
+fn link_at_other_dir(ctx: &TestCtx) -> Outcome {
+    let dir_path = ctx.work("at_ln_dir");
+    check_ok!(fsutil::make_dir(&dir_path));
+    let src = ctx.work("at_ln_into.txt");
+    check_ok!(fsutil::write_all_path(&src, b"cross"));
+    let src_fd = check_ok!(fsutil::open_ro(&src));
+    let dir = check_ok!(fsutil::open_dir(&dir_path));
+    check_ok!(fsutil::flinkat(&src_fd, &dir, "inside.txt"));
+
+    let dst = dir_path.join("inside.txt");
+    check_eq!(
+        check_ok!(fsutil::stat(&src)).st_ino,
+        check_ok!(fsutil::stat(&dst)).st_ino
+    );
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"cross");
+    check!(!fsutil::gone(&src), "src disappeared");
+    Outcome::Pass
+}
+
+fn edge_link_at(ctx: &TestCtx) -> Outcome {
+    let sub_path = ctx.work("at_ln_edge");
+    check_ok!(fsutil::make_dir(&sub_path));
+    let src = ctx.work("at_ln_edge_src.txt");
+    check_ok!(fsutil::write_all_path(&src, b"edge"));
+    let src_fd = check_ok!(fsutil::open_ro(&src));
+    let sub = check_ok!(fsutil::open_dir(&sub_path));
+
+    check_errno!(
+        fsutil::flinkat(&src_fd, &sub, ""),
+        fsutil::EINVAL,
+        "empty relative name"
+    );
+
+    let lru = check_ok!(fsutil::open_ro(&ctx.cfg.debug_root.join("lru_evicted")));
+    check_errno!(
+        fsutil::flinkat(&lru, &lru, "at_ln_debug"),
+        fsutil::EPERM,
+        "debug handle"
+    );
+
+    let dst_name = fsutil::base_name(&ctx.work("at_ln_abs.txt")).to_owned();
+    let abs_path = ctx.root().join(&dst_name);
+    let abs = check_ok!(fsutil::path_to_str(&abs_path)).to_owned();
+    check_ok!(fsutil::flinkat(&src_fd, &sub, &abs));
+    let dst = ctx.root().join(&dst_name);
+    check_bytes!(check_ok!(fsutil::read_to_vec(&dst)), b"edge");
+    check!(
+        !check_ok!(fsutil::listed(&sub_path, &dst_name)),
+        "absolute link landed in the directory fd"
+    );
+    check_eq!(
+        check_ok!(fsutil::stat(&src)).st_ino,
+        check_ok!(fsutil::stat(&dst)).st_ino
+    );
+
+    check_errno!(
+        fsutil::flinkat(&src_fd, &sub, "/scheme/not-virtio-fs/x"),
+        fsutil::EXDEV,
+        "other scheme"
+    );
+    check!(!fsutil::gone(&src), "src removed after EXDEV");
     Outcome::Pass
 }

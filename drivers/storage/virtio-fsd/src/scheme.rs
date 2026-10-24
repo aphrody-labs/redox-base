@@ -1,11 +1,17 @@
 use std::cell::RefCell;
 use std::io;
+use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt;
+use libredox::call::get_proc_credentials;
+use libredox::flag::RENAME_NOREPLACE;
+use libredox::protocol::ProcMeta;
+use libredox::{Fd, flag};
 use log::warn;
+use plain::Plain;
 use redox_scheme::scheme::{Op, SchemeAsync, SchemeState};
 use redox_scheme::{
     CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
@@ -31,6 +37,7 @@ pub struct VirtioFsScheme<T: FuseTransporter> {
     scheme_name: Rc<str>,
     debug_scheme_name: Rc<str>,
     lock_state: Rc<RefCell<SchemeState>>,
+    proc_creds: Rc<Fd>,
 }
 
 impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
@@ -41,6 +48,7 @@ impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
             scheme_name: Rc::clone(&self.scheme_name),
             debug_scheme_name: Rc::clone(&self.debug_scheme_name),
             lock_state: Rc::clone(&self.lock_state),
+            proc_creds: Rc::clone(&self.proc_creds),
         }
     }
 }
@@ -58,6 +66,10 @@ impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
             scheme_name: Rc::from(scheme_name),
             debug_scheme_name: Rc::from(debug_scheme_name),
             lock_state: Rc::new(RefCell::new(SchemeState::new())),
+            proc_creds: Rc::new(
+                Fd::open("/scheme/proc/proc-creds-capability", flag::O_RDONLY, 0)
+                    .expect("virtio-fsd: failed to open proc-creds capability"),
+            ),
         }
     }
 
@@ -344,10 +356,10 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         flags: usize,
         ctx: &CallerCtx,
     ) -> Result<()> {
-        let caller = caller(ctx);
+        let caller = self.effective_caller(ctx.pid)?;
+        let path = self.absolute_at(fd, path)?;
         // relibc canonicalizes first, unlinkat never receives "." or ".."
-
-        let walk = self.vfs.walk_path(fd, path, 0, caller).await?;
+        let walk = self.vfs.walk_path(fd, &path, 0, caller).await?;
         if walk.last_to_be_created {
             return Err(Error::new(ENOENT));
         }
@@ -437,6 +449,22 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         Ok(0)
     }
 
+    async fn flinkat(
+        &mut self,
+        id: usize,
+        dirid: usize,
+        path: &str,
+        _flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let caller = self.effective_caller(ctx.pid)?;
+        let dest = self.absolute_at(dirid, path)?;
+
+        self.vfs.link(id, &dest, caller).await?;
+
+        Ok(0)
+    }
+
     async fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
         let path = self.vfs.get_path(id)?;
         let scheme_name = if self.vfs.is_debug(id) {
@@ -454,6 +482,40 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
     async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
         let dest = get_dest(self.scheme_name.as_ref(), path)?;
         self.vfs.rename(id, &dest, caller(ctx)).await?;
+        Ok(0)
+    }
+
+    async fn frenameat(
+        &mut self,
+        old_dir: usize,
+        old_path: &str,
+        new_dir: usize,
+        new_path: &str,
+        flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let caller = self.effective_caller(ctx.pid)?;
+        let old_abs = self.absolute_at(old_dir, old_path)?;
+        let new_abs = self.absolute_at(new_dir, new_path)?;
+
+        if flags & RENAME_NOREPLACE as u32 != 0 {
+            match self.vfs.walk_path(new_dir, &new_abs, 0, caller).await {
+                Ok(_) => return Err(Error::new(EEXIST)),
+                Err(err) if err.errno == ENOENT => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        let old = self.vfs.walk_path(old_dir, &old_abs, 0, caller).await?;
+        let fd = self
+            .vfs
+            .insert_stat_only(old.nodeid, old.rel_path, caller)?;
+
+        let renamed = self.vfs.rename(fd, &new_abs, caller).await;
+
+        self.vfs.close(fd).await;
+        renamed?;
+
         Ok(0)
     }
 
@@ -589,6 +651,52 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
 
     async fn on_recvfd(&mut self, _recvfd_request: &RecvFdRequest) -> Result<OpenResult> {
         Err(Error::new(EOPNOTSUPP))
+    }
+}
+
+impl<T: FuseTransporter> VirtioFsScheme<T> {
+    fn effective_caller(&self, pid: usize) -> Result<Caller> {
+        let mut buf = [0u8; size_of::<ProcMeta>()];
+
+        get_proc_credentials(self.proc_creds.raw(), pid, &mut buf)
+            .map_err(|err| Error::new(err.errno()))?;
+
+        let proc_meta: &ProcMeta = Plain::from_bytes(&buf).map_err(|err| {
+            warn!("virtio-fsd: Plain failed to parse ProcMeta: {err:?}");
+            Error::new(EINVAL)
+        })?;
+
+        Ok(Caller {
+            uid: proc_meta.euid,
+            gid: proc_meta.egid,
+            pid: pid as u32,
+        })
+    }
+
+    fn absolute_at(&self, dirfd: usize, path: &str) -> Result<String> {
+        let path = if path.starts_with('/') {
+            get_dest(self.scheme_name.as_ref(), path)
+        } else {
+            Ok(path.to_owned())
+        }?;
+
+        if path.starts_with('/') {
+            return Ok(path);
+        }
+        if path.is_empty() {
+            return Err(Error::new(EINVAL));
+        }
+
+        if self.vfs.is_debug(dirfd) {
+            return Err(Error::new(EPERM));
+        }
+
+        let dir = self.vfs.get_path(dirfd)?;
+        if dir.is_empty() {
+            Ok(format!("/{path}"))
+        } else {
+            Ok(format!("/{dir}/{path}"))
+        }
     }
 }
 

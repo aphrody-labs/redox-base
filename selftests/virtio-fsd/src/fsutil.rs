@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 use libredox::error::Error as RedoxError;
 use libredox::{Fd, flag};
+use syscall::{StdFsCallKind, StdFsCallMeta};
 
 pub const O_STAT: i32 = 0x2000_0000u32 as i32;
 pub const O_SYMLINK: i32 = 0x4000_0000u32 as i32;
@@ -65,6 +66,23 @@ pub const UTIME_NOW: i64 = 0x3fffffff;
 pub const UTIME_OMIT: i64 = 0x3ffffffe;
 
 pub const AT_REMOVEDIR: i32 = libc::AT_REMOVEDIR;
+
+// relibc `RENAME_NOREPLACE` (0x01). `frenameat` tests this bit.
+pub const RENAME_NOREPLACE: u32 = 1;
+
+fn std_fs_at(
+    first: &File,
+    second: &File,
+    mut payload: Vec<u8>,
+    kind: StdFsCallKind,
+    arg1: u64,
+) -> io::Result<()> {
+    let fds = [first.as_raw_fd() as usize, second.as_raw_fd() as usize];
+    let meta = StdFsCallMeta::new(kind, arg1, 0);
+    syscall::std_fs_call(&fds[..], &mut payload, &meta)
+        .map(|_| ())
+        .map_err(|err| io::Error::from_raw_os_error(err.errno))
+}
 
 pub fn open_flags(path: &Path, flags: i32, mode: u16) -> io::Result<File> {
     let s = path_to_str(path)?;
@@ -278,6 +296,39 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     let o = cstring(path_to_str(old)?)?;
     let n = cstring(path_to_str(new)?)?;
     libc_zero(unsafe { libc::rename(o.as_ptr(), n.as_ptr()) })
+}
+
+pub fn flinkat(source: &File, dir: &File, path: &str) -> io::Result<()> {
+    std_fs_at(
+        source,
+        dir,
+        path.as_bytes().to_vec(),
+        StdFsCallKind::Flinkat,
+        0,
+    )
+}
+
+pub fn frenameat(
+    old_dir: &File,
+    old_path: &str,
+    new_dir: &File,
+    new_path: &str,
+    flags: u32,
+) -> io::Result<()> {
+    if old_path.contains('\0') || new_path.contains('\0') {
+        return Err(io::Error::from_raw_os_error(EINVAL));
+    }
+    let mut payload = Vec::with_capacity(old_path.len() + 1 + new_path.len());
+    payload.extend_from_slice(old_path.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(new_path.as_bytes());
+    std_fs_at(
+        old_dir,
+        new_dir,
+        payload,
+        StdFsCallKind::Frenameat,
+        u64::from(flags),
+    )
 }
 
 pub fn remove_tree(path: &Path) -> io::Result<()> {

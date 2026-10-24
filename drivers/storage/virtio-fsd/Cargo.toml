@@ -24,3 +24,4 @@ libredox.workspace = true
 redox-scheme = { workspace = true, features = ["std"] }
 redox_event.workspace = true
 redox_syscall.workspace = true
+plain.workspace = true
