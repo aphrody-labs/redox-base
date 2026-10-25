@@ -48,10 +48,15 @@ fn daemon(
 
     // Double check that we have the right device.
     //
-    // 0x1000 - virtio-net
+    // 0x1000 - transitional virtio-net (QEMU)
+    // 0x1041 - non-transitional virtio-net (Cloud Hypervisor, QEMU modern-only)
     let pci_config = pcid_handle.config();
+    let device_id = pci_config.func.full_device_id.device_id;
 
-    assert_eq!(pci_config.func.full_device_id.device_id, 0x1000);
+    assert!(
+        device_id == 0x1000 || device_id == 0x1041,
+        "virtio-netd: unexpected device id {device_id:#06x}"
+    );
     log::info!("virtio-net: initiating startup sequence :^)");
 
     let device = virtio_core::probe_device(&mut pcid_handle)?;

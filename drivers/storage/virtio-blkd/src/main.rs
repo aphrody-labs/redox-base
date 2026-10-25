@@ -116,10 +116,15 @@ fn daemon(daemon: daemon::Daemon, mut pcid_handle: PciFunctionHandle) -> anyhow:
 
     // Double check that we have the right device.
     //
-    // 0x1001 - virtio-blk
+    // 0x1001 - transitional virtio-blk (QEMU)
+    // 0x1042 - non-transitional virtio-blk (Cloud Hypervisor, QEMU modern-only)
     let pci_config = pcid_handle.config();
+    let device_id = pci_config.func.full_device_id.device_id;
 
-    assert_eq!(pci_config.func.full_device_id.device_id, 0x1001);
+    assert!(
+        device_id == 0x1001 || device_id == 0x1042,
+        "virtio-blkd: unexpected device id {device_id:#06x}"
+    );
     log::info!("virtio-blk: initiating startup sequence :^)");
 
     let device = virtio_core::probe_device(&mut pcid_handle)?;

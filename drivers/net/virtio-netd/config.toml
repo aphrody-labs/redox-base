@@ -1,6 +1,15 @@
+# QEMU transitional virtio-net.
 [[drivers]]
 name = "virtio-net"
 class = 0x02
 vendor = 0x1AF4
 device = 0x1000
+command = ["virtio-netd"]
+
+# Cloud Hypervisor, and QEMU with legacy disabled: 0x1040 + virtio device type 1.
+[[drivers]]
+name = "virtio-net"
+class = 0x02
+vendor = 0x1AF4
+device = 0x1041
 command = ["virtio-netd"]

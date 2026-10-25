@@ -21,12 +21,31 @@ class = 1
 subclass = 8
 command = ["/scheme/initfs/lib/drivers/nvmed"]
 
+# QEMU transitional virtio-blk (class 01.00).
 [[drivers]]
 name = "virtio-blk"
 class = 1
 subclass = 0
 vendor = 0x1AF4
 device = 0x1001
+command = ["/scheme/initfs/lib/drivers/virtio-blkd"]
+
+# QEMU with legacy disabled: same class and subclass, device 0x1040 + virtio type 2.
+[[drivers]]
+name = "virtio-blk"
+class = 1
+subclass = 0
+vendor = 0x1AF4
+device = 0x1042
+command = ["/scheme/initfs/lib/drivers/virtio-blkd"]
+
+# Cloud Hypervisor non-transitional virtio-blk is class 01.80, device 0x1042.
+[[drivers]]
+name = "virtio-blk"
+class = 1
+subclass = 0x80
+vendor = 0x1AF4
+device = 0x1042
 command = ["/scheme/initfs/lib/drivers/virtio-blkd"]
 
 [[drivers]]
