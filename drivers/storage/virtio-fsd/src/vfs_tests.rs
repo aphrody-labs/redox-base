@@ -204,14 +204,28 @@ async fn lookup(vfs: &Vfs<Mock>, name: &str) -> NodeId {
         .0
 }
 
+fn open_fds(vfs: &Vfs<Mock>, nodeid: NodeId) -> u64 {
+    vfs.state.borrow().inodes[&nodeid].open_fd_count
+}
+
 fn file_entry<'a>(vfs: &'a Vfs<Mock>, nodeid: NodeId, name: &str) -> Entry<'a, Mock> {
+    Entry {
+        nodeid: Some(nodeid),
+        node_pin: vfs.pin(nodeid).ok(),
+        ..new_entry(vfs, name)
+    }
+}
+
+/// A name in the root that does not exist yet, built without a lookup, so the cache can
+/// hold a stale inode for it.
+fn new_entry<'a>(vfs: &'a Vfs<Mock>, name: &str) -> Entry<'a, Mock> {
     Entry {
         parent: NodeId::ROOT,
         name: name.into(),
-        nodeid: Some(nodeid),
+        nodeid: None,
         path: name.into(),
         _parent_pin: vfs.pin(NodeId::ROOT).unwrap(),
-        node_pin: vfs.pin(nodeid).ok(),
+        node_pin: None,
     }
 }
 
@@ -381,8 +395,7 @@ fn create_rolls_back_host_file_on_generation_mismatch() {
         assert!(has_inode(&vfs, 10));
         let err = vfs
             .create(
-                NodeId::ROOT,
-                "f",
+                new_entry(&vfs, "f"),
                 O_CREAT | O_RDWR,
                 MODE_FILE as u32,
                 Caller::NONE,
@@ -408,8 +421,7 @@ fn create_releases_host_fh_without_a_scheme_handle() {
     block_on(async {
         let (nodeid, mode) = vfs
             .create(
-                NodeId::ROOT,
-                "f",
+                new_entry(&vfs, "f"),
                 O_CREAT | O_RDWR,
                 MODE_FILE as u32,
                 Caller::NONE,
@@ -553,10 +565,11 @@ fn entry_at_resolves_from_the_dir_handle_node() {
 
 #[test]
 fn entry_at_rejects_names_that_are_not_entries() {
-    let (vfs, mock) = vfs_with([]);
+    let (vfs, mock) = vfs_with([dir(11, 1)]);
     let root = vfs.scheme_root();
     block_on(async {
-        for path in ["", "/", ".", "..", "d/..", "d/."] {
+        lookup(&vfs, "d").await;
+        for path in ["", "/", ".", "..", "d/..", "d/.", "d/../."] {
             let err = vfs
                 .entry_at(root, path, Caller::NONE)
                 .await
@@ -565,7 +578,8 @@ fn entry_at_rejects_names_that_are_not_entries() {
             assert_eq!(err.errno, EINVAL, "{path:?}");
         }
     });
-    assert!(mock.ops().is_empty());
+    // Only the lookup of "d" above; the rest resolve from the cache.
+    assert_eq!(mock.ops(), vec![u32::from(fuse_opcode::FUSE_LOOKUP)]);
 }
 
 #[test]
@@ -688,7 +702,7 @@ fn mkdir_uses_rollback_helper_on_merge_failure() {
     block_on(async {
         lookup(&vfs, "d").await;
         let err = vfs
-            .mkdir(NodeId::ROOT, "d", MODE_DIR as u32, Caller::NONE)
+            .mkdir(new_entry(&vfs, "d"), MODE_DIR as u32, Caller::NONE)
             .await
             .expect_err("mkdir generation mismatch");
         assert_eq!(err.errno, ESTALE);
@@ -960,12 +974,7 @@ fn symlink_rollback_drops_committed_dentry() {
     let (vfs, mock) = vfs_with([file(30, 1), MockReply::Unit]);
     mock.yield_once.set(true);
     let fd = vfs
-        .pre_create_symlink(
-            NodeId::ROOT,
-            "link".into(),
-            vec!["link".into()],
-            Caller::NONE,
-        )
+        .pre_create_symlink(new_entry(&vfs, "link"), Caller::NONE)
         .unwrap();
     let vfs = Rc::new(vfs);
 
@@ -995,8 +1004,92 @@ fn symlink_rollback_drops_committed_dentry() {
 
     assert!(!has_inode(&vfs, 30));
     assert_eq!(children(&vfs, NodeId::ROOT), 0);
+    assert_eq!(
+        open_fds(&vfs, NodeId::ROOT),
+        0,
+        "close releases the parent once; the failed commit must not release it again"
+    );
     assert_lru_consistent(&vfs);
     mock.assert_sent(fuse_opcode::FUSE_UNLINK);
+}
+
+/// Creating a symlink takes two calls. The parent must stay cached in between.
+#[test]
+fn symlink_pre_create_holds_the_parent_until_the_write() {
+    let (vfs, _) = vfs_with([dir(11, 1), MockReply::Host(ENOENT), file(30, 1)]);
+    let root = vfs.scheme_root();
+    block_on(async {
+        lookup(&vfs, "d").await;
+        let entry = vfs.entry_at(root, "d/link", Caller::NONE).await.unwrap();
+        let fd = vfs.pre_create_symlink(entry, Caller::NONE).unwrap();
+        assert_eq!(open_fds(&vfs, NodeId::new(11)), 1);
+        assert!(
+            !in_lru_evictables(&vfs, 11),
+            "pending link's parent was evictable"
+        );
+
+        vfs.write(fd, b"target", 0, O_RDWR as u32).await.unwrap();
+        assert_eq!(
+            open_fds(&vfs, NodeId::new(11)),
+            0,
+            "commit releases the parent"
+        );
+        assert_eq!(
+            open_fds(&vfs, NodeId::new(30)),
+            1,
+            "the handle holds the link"
+        );
+
+        vfs.close(fd).await;
+        assert_eq!(open_fds(&vfs, NodeId::new(30)), 0);
+    });
+    assert_lru_consistent(&vfs);
+}
+
+#[test]
+fn symlink_pre_create_close_releases_the_parent() {
+    let (vfs, mock) = vfs_with([dir(11, 1), MockReply::Host(ENOENT)]);
+    let root = vfs.scheme_root();
+    block_on(async {
+        lookup(&vfs, "d").await;
+        let entry = vfs.entry_at(root, "d/link", Caller::NONE).await.unwrap();
+        let fd = vfs.pre_create_symlink(entry, Caller::NONE).unwrap();
+        vfs.close(fd).await;
+    });
+    assert_eq!(open_fds(&vfs, NodeId::new(11)), 0);
+    assert!(in_lru_evictables(&vfs, 11));
+    assert_lru_consistent(&vfs);
+    assert!(!mock.ops().contains(&u32::from(fuse_opcode::FUSE_SYMLINK)));
+}
+
+#[test]
+fn creating_an_existing_name_is_eexist() {
+    let (vfs, mock) = vfs_with([file(10, 1), dir(11, 1)]);
+    block_on(async {
+        let f = lookup(&vfs, "f").await;
+        let d = lookup(&vfs, "d").await;
+        let err = vfs
+            .create(
+                file_entry(&vfs, f, "f"),
+                O_CREAT | O_RDWR,
+                MODE_FILE as u32,
+                Caller::NONE,
+            )
+            .await
+            .expect_err("create over an existing name");
+        assert_eq!(err.errno, EEXIST);
+        let err = vfs
+            .mkdir(file_entry(&vfs, d, "d"), MODE_DIR as u32, Caller::NONE)
+            .await
+            .expect_err("mkdir over an existing name");
+        assert_eq!(err.errno, EEXIST);
+        let err = vfs
+            .pre_create_symlink(file_entry(&vfs, f, "f"), Caller::NONE)
+            .expect_err("symlink over an existing name");
+        assert_eq!(err.errno, EEXIST);
+    });
+    assert_eq!(mock.ops().len(), 2, "only the two lookups reach the host");
+    assert_eq!(open_fds(&vfs, NodeId::ROOT), 0);
 }
 
 #[test]

@@ -50,7 +50,8 @@ pub const LRU_DEBUG_EVICTED_NAME: &str = "lru_evicted";
 pub struct WalkResult {
     pub nodeid: NodeId,
     pub node_mode: u16,
-    /// The directory `nodeid` was looked up in. `None` until the walk has done a lookup.
+    /// The directory `nodeid` was looked up in. `None` unless the last step was a lookup,
+    /// so a walk ending in `.` or `..` does not pass for a name in a directory.
     parent_nodeid: Option<NodeId>,
     pub rel_path: Vec<String>,
     pub last_to_be_created: bool,
@@ -440,6 +441,7 @@ impl VfsState {
     fn commit_symlink(
         &mut self,
         fd: usize,
+        parent: NodeId,
         nodeid: NodeId,
         path: String,
         target: String,
@@ -454,6 +456,7 @@ impl VfsState {
                     target,
                     caller,
                 };
+                self.decrement_fd_count(parent);
                 Ok(())
             }
             Err(err) => {
@@ -749,16 +752,15 @@ impl<T: FuseTransporter> Vfs<T> {
 
     pub async fn mkdir(
         &self,
-        parent: NodeId,
-        name: &str,
+        entry: Entry<'_, T>,
         mode: u32,
         caller: Caller,
     ) -> Result<(NodeId, u16)> {
-        if name.is_empty() {
-            return Err(Error::new(ENOENT));
+        if entry.nodeid.is_some() {
+            return Err(Error::new(EEXIST));
         }
-
-        let _parent_pin = self.pin(parent)?;
+        let parent = entry.parent;
+        let name = entry.name.as_str();
 
         let name_cstring = cstring(name, "mkdir: dir name")?;
 
@@ -789,17 +791,17 @@ impl<T: FuseTransporter> Vfs<T> {
 
     pub async fn create(
         &self,
-        parent_nodeid: NodeId,
-        name: &str,
+        entry: Entry<'_, T>,
         flags: usize,
         mode: u32,
         caller: Caller,
     ) -> Result<(NodeId, u16)> {
-        if name.is_empty() {
-            return Err(Error::new(ENOENT));
+        if entry.nodeid.is_some() {
+            return Err(Error::new(EEXIST));
         }
+        let parent_nodeid = entry.parent;
+        let name = entry.name.as_str();
 
-        let _parent_pin = self.pin(parent_nodeid)?;
         let fuse_flags = fuse_open_flags(flags, false, true)?;
 
         let name_cstring = cstring(name, "create: file name")?;
@@ -1179,7 +1181,7 @@ impl<T: FuseTransporter> Vfs<T> {
                         Err(err)
                     } else {
                         g.invalidate_attr(parent_nodeid);
-                        g.commit_symlink(fd, nodeid, path, target, caller)
+                        g.commit_symlink(fd, parent_nodeid, nodeid, path, target, caller)
                             .inspect_err(|_| {
                                 g.unmerge_entry(parent_nodeid, &name, nodeid);
                             })
@@ -1376,7 +1378,9 @@ impl<T: FuseTransporter> Vfs<T> {
                     self.state.borrow_mut().decrement_fd_count(nodeid);
                 }
                 Handle::SchemeRoot | Handle::DebugRoot | Handle::LruLog => {}
-                Handle::SymlinkPreCreate { .. } => {}
+                Handle::SymlinkPreCreate { parent_nodeid, .. } => {
+                    self.state.borrow_mut().decrement_fd_count(parent_nodeid);
+                }
             },
             None => {
                 warn!("virtio-fsd: close: fd '{fd}' was not found in handles");
@@ -1520,6 +1524,7 @@ impl<T: FuseTransporter> Vfs<T> {
             }
 
             if name.is_empty() || name == "." {
+                walk.parent_nodeid = None;
                 continue;
             }
 
@@ -1527,6 +1532,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 (walk.nodeid, walk.node_mode) = self.state.borrow_mut().parent_of(walk.nodeid)?;
                 _cur_pin = self.pin(walk.nodeid)?;
                 walk.rel_path.pop();
+                walk.parent_nodeid = None;
                 continue;
             }
 
@@ -1599,6 +1605,7 @@ impl<T: FuseTransporter> Vfs<T> {
             }
 
             if name.is_empty() || name == "." {
+                walk.parent_nodeid = None;
                 continue;
             }
 
@@ -1606,6 +1613,7 @@ impl<T: FuseTransporter> Vfs<T> {
                 (walk.nodeid, walk.node_mode) = self.state.borrow_mut().parent_of(walk.nodeid)?;
                 _cur_pin = self.pin(walk.nodeid)?;
                 walk.rel_path.pop();
+                walk.parent_nodeid = None;
                 continue;
             }
 
@@ -1651,13 +1659,13 @@ impl<T: FuseTransporter> Vfs<T> {
     /// Resolves `path` against `dirfd` to a name in a directory. A symlink in the last
     /// component is not followed, and the name does not have to exist.
     pub async fn entry_at(&self, dirfd: usize, path: &str, caller: Caller) -> Result<Entry<'_, T>> {
-        // `.` and `..` reach a directory through another name, they are not one of their own.
-        match path_components::<&str>(path).last() {
-            None | Some(&".") | Some(&"..") => return Err(Error::new(EINVAL)),
-            Some(_) => {}
-        }
-
         let walk = self.walk_path(dirfd, path, O_CREAT, caller).await?;
+        self.entry_of_walk(&walk)
+    }
+
+    /// The name `walk` ended on. `EINVAL` if it did not end on one: an empty path, `/`,
+    /// or a last component of `.` or `..`, which reach a directory through another name.
+    pub fn entry_of_walk(&self, walk: &WalkResult) -> Result<Entry<'_, T>> {
         let parent = walk.parent_nodeid.ok_or(Error::new(EINVAL))?;
         let name = walk.rel_path.last().cloned().ok_or(Error::new(EINVAL))?;
         let nodeid = (!walk.last_to_be_created).then_some(walk.nodeid);
@@ -1934,23 +1942,22 @@ impl<T: FuseTransporter> Vfs<T> {
         })
     }
 
-    pub fn pre_create_symlink(
-        &self,
-        parent_nodeid: NodeId,
-        name: String,
-        path: Vec<String>,
-        caller: Caller,
-    ) -> Result<usize> {
-        Ok(self
-            .state
-            .borrow_mut()
-            .handles
-            .insert(Handle::SymlinkPreCreate {
-                parent_nodeid,
-                name,
-                path: path.join("/"),
-                caller,
-            }))
+    /// The link is created by the write of its target. Until then the handle holds the
+    /// parent like an open fd, so it cannot be evicted between the two calls.
+    pub fn pre_create_symlink(&self, entry: Entry<'_, T>, caller: Caller) -> Result<usize> {
+        if entry.nodeid.is_some() {
+            return Err(Error::new(EEXIST));
+        }
+
+        let mut g = self.state.borrow_mut();
+        g.increment_fd_count(entry.parent)?;
+
+        Ok(g.handles.insert(Handle::SymlinkPreCreate {
+            parent_nodeid: entry.parent,
+            name: entry.name,
+            path: entry.path,
+            caller,
+        }))
     }
 }
 

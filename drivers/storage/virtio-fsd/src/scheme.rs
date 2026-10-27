@@ -237,13 +237,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         }
 
         let mut walk = self.vfs.walk_path(fd, path, flags, caller).await?;
-
-        let to_be_created = if walk.last_to_be_created {
-            let dir = flags & syscall::O_DIRECTORY != 0;
-            Some((walk.rel_path.last().unwrap().clone(), dir))
-        } else {
-            None
-        };
+        let to_be_created = walk.last_to_be_created;
 
         let o_stat = flags & syscall::O_STAT != 0;
         let o_symlink = flags & syscall::O_SYMLINK != 0;
@@ -255,7 +249,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
 
         // ln -s does not send O_EXCL. If the name already exists, fail here
         // rather than opening the link and erroring on the later write.
-        if o_symlink && flags & syscall::O_CREAT != 0 && to_be_created.is_none() {
+        if o_symlink && flags & syscall::O_CREAT != 0 && !to_be_created {
             return Err(Error::new(EEXIST));
         }
 
@@ -268,20 +262,18 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
             walk = self.vfs.follow_chain(walk, caller).await?;
         }
 
-        if o_symlink && to_be_created.is_none() && walk.node_mode != MODE_SYMLINK {
+        if o_symlink && !to_be_created && walk.node_mode != MODE_SYMLINK {
             return Err(Error::new(EINVAL));
         }
 
-        if to_be_created.is_none() && flags & syscall::O_CREAT != 0 && flags & syscall::O_EXCL != 0
-        {
+        if !to_be_created && flags & syscall::O_CREAT != 0 && flags & syscall::O_EXCL != 0 {
             return Err(Error::new(EEXIST));
         }
 
-        if let Some((name, is_dir)) = to_be_created {
+        if to_be_created {
+            let entry = self.vfs.entry_of_walk(&walk)?;
             if o_symlink {
-                let fd = self
-                    .vfs
-                    .pre_create_symlink(walk.nodeid, name, walk.rel_path, caller)?;
+                let fd = self.vfs.pre_create_symlink(entry, caller)?;
                 return Ok(OpenResult::ThisScheme {
                     number: fd,
                     flags: NewFdFlags::POSITIONED,
@@ -289,7 +281,7 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
             }
 
             let perm = flags as u32 & u32::from(MODE_PERM);
-            if is_dir {
+            if flags & syscall::O_DIRECTORY != 0 {
                 let accmode = flags & syscall::O_ACCMODE;
                 // Write access is rejected by the I/O open below. O_STAT skips that open.
                 if !o_stat && (accmode == syscall::O_WRONLY || accmode == syscall::O_RDWR) {
@@ -297,18 +289,12 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
                 }
                 (walk.nodeid, walk.node_mode) = self
                     .vfs
-                    .mkdir(walk.nodeid, &name, perm | u32::from(MODE_DIR), caller)
+                    .mkdir(entry, perm | u32::from(MODE_DIR), caller)
                     .await?;
             } else {
                 (walk.nodeid, walk.node_mode) = self
                     .vfs
-                    .create(
-                        walk.nodeid,
-                        &name,
-                        flags,
-                        perm | u32::from(MODE_FILE),
-                        caller,
-                    )
+                    .create(entry, flags, perm | u32::from(MODE_FILE), caller)
                     .await?;
             }
         }
