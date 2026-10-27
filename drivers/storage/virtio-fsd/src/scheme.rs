@@ -7,7 +7,6 @@ use std::sync::Arc;
 use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt;
 use libredox::call::get_proc_credentials;
-use libredox::flag::RENAME_NOREPLACE;
 use libredox::protocol::ProcMeta;
 use libredox::{Fd, flag};
 use log::warn;
@@ -21,9 +20,9 @@ use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
 use syscall::error::{EOPNOTSUPP, Error, Result};
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, ENOENT, EPERM, EWOULDBLOCK, EXDEV,
-    EventFlags, F_GETFL, F_SETFL, MODE_DIR, MODE_FILE, MODE_PERM, MODE_SYMLINK, MapFlags,
-    MunmapFlags, Stat, StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
+    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, EPERM, EWOULDBLOCK, EXDEV, EventFlags,
+    F_GETFL, F_SETFL, MODE_DIR, MODE_FILE, MODE_PERM, MODE_SYMLINK, MapFlags, MunmapFlags, Stat,
+    StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
 };
 
 use crate::fuse::{Caller, FuseTransporter};
@@ -357,15 +356,11 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         ctx: &CallerCtx,
     ) -> Result<()> {
         let caller = self.effective_caller(ctx.pid)?;
-        let path = self.absolute_at(fd, path)?;
-        // relibc canonicalizes first, unlinkat never receives "." or ".."
-        let walk = self.vfs.walk_path(fd, &path, 0, caller).await?;
-        if walk.last_to_be_created {
-            return Err(Error::new(ENOENT));
-        }
+        let path = self.at_path(path)?;
+        let entry = self.vfs.entry_at(fd, &path, caller).await?;
 
         let is_dir = flags & syscall::AT_REMOVEDIR == syscall::AT_REMOVEDIR;
-        Ok(self.vfs.rm(walk, is_dir, caller).await?)
+        self.vfs.rm(entry, is_dir, caller).await
     }
 
     // Ordinary dup/dup2 is done in the kernel and we never see it. This is only
@@ -444,8 +439,14 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
     }
 
     async fn flink(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        let dest = get_dest(self.scheme_name.as_ref(), path)?;
-        self.vfs.link(id, &dest, caller(ctx)).await?;
+        let caller = caller(ctx);
+
+        let dest_str = get_dest(self.scheme_name.as_ref(), path)?;
+        // `dest` is absolute, so `id` is only checked for being a debug handle.
+        let dest = self.vfs.entry_at(id, &dest_str, caller).await?;
+
+        self.vfs.link(id, dest, caller).await?;
+
         Ok(0)
     }
 
@@ -458,9 +459,10 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         ctx: &CallerCtx,
     ) -> Result<usize> {
         let caller = self.effective_caller(ctx.pid)?;
-        let dest = self.absolute_at(dirid, path)?;
+        let path = self.at_path(path)?;
+        let dest = self.vfs.entry_at(dirid, &path, caller).await?;
 
-        self.vfs.link(id, &dest, caller).await?;
+        self.vfs.link(id, dest, caller).await?;
 
         Ok(0)
     }
@@ -480,8 +482,15 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
     }
 
     async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
-        let dest = get_dest(self.scheme_name.as_ref(), path)?;
-        self.vfs.rename(id, &dest, caller(ctx)).await?;
+        let caller = caller(ctx);
+
+        let src = self.vfs.entry_of_fd(id, caller).await?;
+
+        let dest_str = get_dest(self.scheme_name.as_ref(), path)?;
+        let dest = self.vfs.entry_at(id, &dest_str, caller).await?;
+
+        self.vfs.rename(src, dest, 0, caller).await?;
+
         Ok(0)
     }
 
@@ -495,26 +504,13 @@ impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
         ctx: &CallerCtx,
     ) -> Result<usize> {
         let caller = self.effective_caller(ctx.pid)?;
-        let old_abs = self.absolute_at(old_dir, old_path)?;
-        let new_abs = self.absolute_at(new_dir, new_path)?;
 
-        if flags & RENAME_NOREPLACE as u32 != 0 {
-            match self.vfs.walk_path(new_dir, &new_abs, 0, caller).await {
-                Ok(_) => return Err(Error::new(EEXIST)),
-                Err(err) if err.errno == ENOENT => {}
-                Err(err) => return Err(err),
-            }
-        }
+        let old_path = self.at_path(old_path)?;
+        let new_path = self.at_path(new_path)?;
 
-        let old = self.vfs.walk_path(old_dir, &old_abs, 0, caller).await?;
-        let fd = self
-            .vfs
-            .insert_stat_only(old.nodeid, old.rel_path, caller)?;
-
-        let renamed = self.vfs.rename(fd, &new_abs, caller).await;
-
-        self.vfs.close(fd).await;
-        renamed?;
+        let src = self.vfs.entry_at(old_dir, &old_path, caller).await?;
+        let dest = self.vfs.entry_at(new_dir, &new_path, caller).await?;
+        self.vfs.rename(src, dest, flags, caller).await?;
 
         Ok(0)
     }
@@ -673,29 +669,13 @@ impl<T: FuseTransporter> VirtioFsScheme<T> {
         })
     }
 
-    fn absolute_at(&self, dirfd: usize, path: &str) -> Result<String> {
-        let path = if path.starts_with('/') {
+    fn at_path(&self, path: &str) -> Result<String> {
+        if path.starts_with('/') {
             get_dest(self.scheme_name.as_ref(), path)
+        } else if path.is_empty() {
+            Err(Error::new(EINVAL))
         } else {
             Ok(path.to_owned())
-        }?;
-
-        if path.starts_with('/') {
-            return Ok(path);
-        }
-        if path.is_empty() {
-            return Err(Error::new(EINVAL));
-        }
-
-        if self.vfs.is_debug(dirfd) {
-            return Err(Error::new(EPERM));
-        }
-
-        let dir = self.vfs.get_path(dirfd)?;
-        if dir.is_empty() {
-            Ok(format!("/{path}"))
-        } else {
-            Ok(format!("/{dir}/{path}"))
         }
     }
 }

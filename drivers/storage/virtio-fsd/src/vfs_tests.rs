@@ -11,8 +11,8 @@ use fuse_abi::linux::{
 use futures::executor::{LocalPool, block_on};
 use futures::task::LocalSpawnExt;
 use syscall::{
-    ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, MODE_SYMLINK, O_APPEND, O_CREAT, O_EXCL,
-    O_RDONLY, O_RDWR, O_TRUNC,
+    EINVAL, ENOENT, ENOTDIR, EPERM, ESTALE, MODE_DIR, MODE_FILE, MODE_SYMLINK, O_APPEND, O_CREAT,
+    O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -204,14 +204,21 @@ async fn lookup(vfs: &Vfs<Mock>, name: &str) -> NodeId {
         .0
 }
 
-fn file_walk(nodeid: NodeId, name: &str) -> WalkResult {
-    WalkResult {
-        nodeid,
-        node_mode: MODE_FILE,
-        parent_nodeid: Some(NodeId::ROOT),
-        rel_path: vec![name.into()],
-        last_to_be_created: false,
+fn file_entry<'a>(vfs: &'a Vfs<Mock>, nodeid: NodeId, name: &str) -> Entry<'a, Mock> {
+    Entry {
+        parent: NodeId::ROOT,
+        name: name.into(),
+        nodeid: Some(nodeid),
+        path: name.into(),
+        _parent_pin: vfs.pin(NodeId::ROOT).unwrap(),
+        node_pin: vfs.pin(nodeid).ok(),
     }
+}
+
+async fn rename_fd(vfs: &Vfs<Mock>, fd: usize, dest: &str) -> Result<()> {
+    let src = vfs.entry_of_fd(fd, Caller::NONE).await?;
+    let dest = vfs.entry_at(fd, dest, Caller::NONE).await?;
+    vfs.rename(src, dest, 0, Caller::NONE).await
 }
 
 // Root + 7 files fills `INODES_MAX_LEN` (8 in tests).
@@ -436,9 +443,13 @@ fn rm_sends_unlink_after_inode_eviction() {
             "victim should have been LRU-evicted, cache len={}",
             vfs.state.borrow().inodes.len()
         );
-        vfs.rm(file_walk(NodeId::new(2), "victim"), false, Caller::NONE)
-            .await
-            .expect("rm must not fail with ENOENT after eviction");
+        vfs.rm(
+            file_entry(&vfs, NodeId::new(2), "victim"),
+            false,
+            Caller::NONE,
+        )
+        .await
+        .expect("rm must not fail with ENOENT after eviction");
     });
     mock.assert_sent(fuse_opcode::FUSE_UNLINK);
 }
@@ -449,7 +460,7 @@ fn rm_forgets_the_removed_inode_before_returning() {
 
     block_on(async {
         let id = lookup(&vfs, "f").await;
-        vfs.rm(file_walk(id, "f"), false, Caller::NONE)
+        vfs.rm(file_entry(&vfs, id, "f"), false, Caller::NONE)
             .await
             .unwrap();
     });
@@ -507,6 +518,54 @@ fn dotdot_of_a_directory_is_its_parent() {
         assert_eq!(here.nodeid, NodeId::new(11));
     });
     assert_eq!(mock.ops(), vec![u32::from(fuse_opcode::FUSE_LOOKUP)]);
+}
+
+#[test]
+fn entry_at_resolves_from_the_dir_handle_node() {
+    let (vfs, mock) = vfs_with([dir(11, 1), bytes(&open_out(1)), MockReply::Host(ENOENT)]);
+    block_on(async {
+        lookup(&vfs, "d").await;
+        let fd = vfs
+            .open(
+                NodeId::new(11),
+                O_RDONLY,
+                true,
+                vec!["moved".into(), "away".into()],
+                Caller::NONE,
+            )
+            .await
+            .unwrap();
+        let entry = vfs.entry_at(fd, "x", Caller::NONE).await.unwrap();
+        assert_eq!(entry.parent, NodeId::new(11));
+        assert_eq!(entry.name, "x");
+        assert_eq!(entry.nodeid, None);
+        assert_eq!(entry.path, "moved/away/x");
+    });
+    assert_eq!(
+        mock.ops(),
+        vec![
+            u32::from(fuse_opcode::FUSE_LOOKUP),
+            u32::from(fuse_opcode::FUSE_OPENDIR),
+            u32::from(fuse_opcode::FUSE_LOOKUP),
+        ]
+    );
+}
+
+#[test]
+fn entry_at_rejects_names_that_are_not_entries() {
+    let (vfs, mock) = vfs_with([]);
+    let root = vfs.scheme_root();
+    block_on(async {
+        for path in ["", "/", ".", "..", "d/..", "d/."] {
+            let err = vfs
+                .entry_at(root, path, Caller::NONE)
+                .await
+                .map(|_| ())
+                .expect_err(path);
+            assert_eq!(err.errno, EINVAL, "{path:?}");
+        }
+    });
+    assert!(mock.ops().is_empty());
 }
 
 #[test]
@@ -600,7 +659,7 @@ fn interleaved_lookup_cannot_evict_pinned_unlink_target() {
             let vfs = Rc::clone(&vfs);
             async move {
                 let id = lookup(&vfs, "victim").await;
-                vfs.rm(file_walk(id, "victim"), false, Caller::NONE)
+                vfs.rm(file_entry(&vfs, id, "victim"), false, Caller::NONE)
                     .await
                     .unwrap();
             }
@@ -659,8 +718,9 @@ fn link_rolls_back_on_generation_mismatch() {
             )
             .await
             .unwrap();
+        let dest = vfs.entry_at(fd, "/dst", Caller::NONE).await.unwrap();
         let err = vfs
-            .link(fd, "/dst", Caller::NONE)
+            .link(fd, dest, Caller::NONE)
             .await
             .expect_err("link generation mismatch");
         assert_eq!(err.errno, ESTALE);
@@ -688,7 +748,7 @@ fn rename_moves_the_name() {
             )
             .await
             .unwrap();
-        vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
+        rename_fd(&vfs, fd, "/b").await.unwrap();
     });
     assert_eq!(children(&vfs, NodeId::ROOT), 1);
     let g = vfs.state.borrow();
@@ -720,7 +780,7 @@ fn rename_over_existing_name_drops_the_target() {
             )
             .await
             .unwrap();
-        vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
+        rename_fd(&vfs, fd, "/b").await.unwrap();
     });
     assert!(!has_inode(&vfs, 11), "the unused target goes at once");
     assert!(!forget_queued(&vfs, 11));
@@ -766,7 +826,7 @@ fn rename_over_stale_name_replaces_it() {
             )
             .await
             .unwrap();
-        vfs.rename(fd, "/b", Caller::NONE).await.unwrap();
+        rename_fd(&vfs, fd, "/b").await.unwrap();
     });
     let g = vfs.state.borrow();
     assert_eq!(g.dcache[&NodeId::ROOT].len(), 1);
@@ -838,7 +898,7 @@ fn rename_into_evicted_parent_does_not_orphan_dentries() {
         .spawn_local({
             let vfs = Rc::clone(&vfs);
             async move {
-                vfs.rename(fd, "/d/b", Caller::NONE).await.unwrap();
+                rename_fd(&vfs, fd, "/d/b").await.unwrap();
             }
         })
         .unwrap();
@@ -887,7 +947,7 @@ fn unlink_is_not_logged_as_eviction() {
     let (vfs, _) = vfs_with([file(10, 1), MockReply::Unit]);
     block_on(async {
         let id = lookup(&vfs, "f").await;
-        vfs.rm(file_walk(id, "f"), false, Caller::NONE)
+        vfs.rm(file_entry(&vfs, id, "f"), false, Caller::NONE)
             .await
             .unwrap();
     });

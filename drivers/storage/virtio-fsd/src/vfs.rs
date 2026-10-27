@@ -9,6 +9,7 @@ use fuse_abi::linux::{
     FATTR_ATIME, FATTR_ATIME_NOW, FATTR_FH, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW,
     FATTR_SIZE, FATTR_UID, FUSE_ATOMIC_O_TRUNC, fuse_setattr_in,
 };
+use libredox::flag::RENAME_NOREPLACE;
 use log::warn;
 use scheme_utils::HandleMap;
 use syscall::error::{ESTALE, Error, Result};
@@ -53,6 +54,20 @@ pub struct WalkResult {
     parent_nodeid: Option<NodeId>,
     pub rel_path: Vec<String>,
     pub last_to_be_created: bool,
+}
+
+/// A name in a directory, resolved for an operation on the name itself (unlink, link,
+/// rename). Pins the parent, and the target if it exists, until dropped, so a second
+/// resolve can await without them being evicted.
+pub struct Entry<'a, T: FuseTransporter> {
+    parent: NodeId,
+    name: String,
+    /// `None` if the name does not exist.
+    nodeid: Option<NodeId>,
+    /// From the share root, for rewriting the paths of open handles after a rename.
+    path: String,
+    _parent_pin: InodePin<'a, T>,
+    node_pin: Option<InodePin<'a, T>>,
 }
 
 struct Inode {
@@ -1633,16 +1648,75 @@ impl<T: FuseTransporter> Vfs<T> {
             .map_err(|e| e.into_syscall("FUSE_READDIR"))
     }
 
-    pub async fn rm(&self, mut walk: WalkResult, is_dir: bool, caller: Caller) -> Result<()> {
-        let name = walk.rel_path.pop().unwrap_or_default();
-
-        if name.is_empty() {
-            return Err(Error::new(EINVAL));
+    /// Resolves `path` against `dirfd` to a name in a directory. A symlink in the last
+    /// component is not followed, and the name does not have to exist.
+    pub async fn entry_at(&self, dirfd: usize, path: &str, caller: Caller) -> Result<Entry<'_, T>> {
+        // `.` and `..` reach a directory through another name, they are not one of their own.
+        match path_components::<&str>(path).last() {
+            None | Some(&".") | Some(&"..") => return Err(Error::new(EINVAL)),
+            Some(_) => {}
         }
-        let parent = walk.parent_nodeid.ok_or(Error::new(EINVAL))?;
 
-        let target_pin = self.pin(walk.nodeid).ok();
-        let _parent_pin = self.pin(parent).ok();
+        let walk = self.walk_path(dirfd, path, O_CREAT, caller).await?;
+        let parent = walk.parent_nodeid.ok_or(Error::new(EINVAL))?;
+        let name = walk.rel_path.last().cloned().ok_or(Error::new(EINVAL))?;
+        let nodeid = (!walk.last_to_be_created).then_some(walk.nodeid);
+
+        Ok(Entry {
+            parent,
+            name,
+            nodeid,
+            path: walk.rel_path.join("/"),
+            _parent_pin: self.pin(parent)?,
+            node_pin: nodeid.and_then(|id| self.pin(id).ok()),
+        })
+    }
+
+    /// The name `fd` was opened by. Best effort: an fd names an inode, so this goes by the
+    /// handle's path, which can be stale and, for a hard link, is only one of its names.
+    pub async fn entry_of_fd(&self, fd: usize, caller: Caller) -> Result<Entry<'_, T>> {
+        let (nodeid, path) = {
+            let g = self.state.borrow();
+            match g.handles.get(fd)? {
+                Handle::File { nodeid, path, .. }
+                | Handle::Directory { nodeid, path, .. }
+                | Handle::StatOnly { nodeid, path, .. }
+                | Handle::Symlink { nodeid, path, .. } => (*nodeid, path.clone()),
+                _ => return Err(Error::new(EBADF)),
+            }
+        };
+
+        let node_pin = self.pin(nodeid).ok();
+
+        let mut parts: Vec<String> = path_components(&path);
+        let name = parts.pop().ok_or(Error::new(EINVAL))?;
+        let parent = if parts.is_empty() {
+            NodeId::ROOT
+        } else {
+            let parent_path = format!("/{}", parts.join("/"));
+            self.walk_path(fd, &parent_path, 0, caller).await?.nodeid
+        };
+
+        Ok(Entry {
+            parent,
+            name,
+            nodeid: Some(nodeid),
+            path,
+            _parent_pin: self.pin(parent)?,
+            node_pin,
+        })
+    }
+
+    pub async fn rm(&self, entry: Entry<'_, T>, is_dir: bool, caller: Caller) -> Result<()> {
+        let Entry {
+            parent,
+            name,
+            nodeid,
+            _parent_pin,
+            node_pin: target_pin,
+            ..
+        } = entry;
+        let nodeid = nodeid.ok_or(Error::new(ENOENT))?;
 
         let name_cstring = cstring(&name, "rm: file name")?;
 
@@ -1659,7 +1733,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         {
             let mut g = self.state.borrow_mut();
-            g.unlink_name(parent, &name, walk.nodeid);
+            g.unlink_name(parent, &name, nodeid);
             g.invalidate_attr(parent);
         }
 
@@ -1667,45 +1741,35 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(())
     }
 
-    pub async fn rename(&self, fd: usize, dest: &str, caller: Caller) -> Result<()> {
-        let (src_nodeid, src_path) = {
-            let g = self.state.borrow();
-            match g.handles.get(fd)? {
-                Handle::File { nodeid, path, .. }
-                | Handle::Directory { nodeid, path, .. }
-                | Handle::StatOnly { nodeid, path, .. }
-                | Handle::Symlink { nodeid, path, .. } => (*nodeid, path.clone()),
-                _ => return Err(Error::new(EBADF)),
-            }
-        };
+    pub async fn rename(
+        &self,
+        src: Entry<'_, T>,
+        dest: Entry<'_, T>,
+        flags: u32,
+        caller: Caller,
+    ) -> Result<()> {
+        let Entry {
+            parent: old_parent,
+            name: old_name,
+            nodeid: src_nodeid,
+            path: src_path,
+            _parent_pin: _old_parent_pin,
+            node_pin: _src_pin,
+        } = src;
+        let Entry {
+            parent: new_parent,
+            name: new_name,
+            nodeid: dest_nodeid,
+            path: new_path,
+            _parent_pin: _new_parent_pin,
+            node_pin: dest_pin,
+        } = dest;
 
-        let _src_pin = self.pin(src_nodeid).ok();
-
-        let mut src_parts: Vec<String> = path_components(&src_path);
-        let old_name = src_parts.pop().ok_or(Error::new(EINVAL))?;
-        let old_parent = if src_parts.is_empty() {
-            NodeId::ROOT
-        } else {
-            let parent_path = format!("/{}", src_parts.join("/"));
-            let walk = self.walk_path(fd, &parent_path, 0, caller).await?;
-            if walk.last_to_be_created {
-                return Err(Error::new(ENOENT));
-            }
-            walk.nodeid
-        };
-
-        let _old_parent_pin = self.pin(old_parent)?;
-
-        let dest_walk = self.walk_path(fd, dest, O_CREAT, caller).await?;
-        let new_name = dest_walk
-            .rel_path
-            .last()
-            .cloned()
-            .ok_or(Error::new(EINVAL))?;
-        let new_parent = dest_walk.parent_nodeid.ok_or(Error::new(EINVAL))?;
-        let _new_parent_pin = self.pin(new_parent)?;
-        let dest_exists = !dest_walk.last_to_be_created;
-        let dest_nodeid = dest_walk.nodeid;
+        let src_nodeid = src_nodeid.ok_or(Error::new(ENOENT))?;
+        // TODO: send FUSE_RENAME2 with the flag, so the check is atomic on the host.
+        if flags & RENAME_NOREPLACE as u32 != 0 && dest_nodeid.is_some() {
+            return Err(Error::new(EEXIST));
+        }
 
         let old_cstring = cstring(old_name.as_str(), "rename: old name")?;
         let new_cstring = cstring(new_name.as_str(), "rename: new name")?;
@@ -1715,9 +1779,14 @@ impl<T: FuseTransporter> Vfs<T> {
             .await
             .map_err(|e| e.into_syscall("FUSE_RENAME"))?;
 
+        // Unpin first, so `unlink_name` can drop a replaced inode right away
+        drop(dest_pin);
+
         {
             let mut g = self.state.borrow_mut();
-            if dest_exists && dest_nodeid != src_nodeid {
+            if let Some(dest_nodeid) = dest_nodeid
+                && dest_nodeid != src_nodeid
+            {
                 g.unlink_name(new_parent, &new_name, dest_nodeid);
             }
 
@@ -1734,7 +1803,6 @@ impl<T: FuseTransporter> Vfs<T> {
             g.invalidate_attr(new_parent);
             g.invalidate_attr(src_nodeid);
 
-            let new_path = dest_walk.rel_path.join("/");
             for handle in g.handles.values_mut() {
                 let path = match handle {
                     Handle::File { path, .. }
@@ -1758,7 +1826,7 @@ impl<T: FuseTransporter> Vfs<T> {
         Ok(())
     }
 
-    pub async fn link(&self, fd: usize, dest: &str, caller: Caller) -> Result<()> {
+    pub async fn link(&self, fd: usize, dest: Entry<'_, T>, caller: Caller) -> Result<()> {
         let src_nodeid = {
             let g = self.state.borrow();
             match g.handles.get(fd)? {
@@ -1776,20 +1844,13 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let _src_pin = self.pin(src_nodeid)?;
 
-        let dest_walk = self.walk_path(fd, dest, O_CREAT, caller).await?;
-        let new_name = dest_walk
-            .rel_path
-            .last()
-            .cloned()
-            .ok_or(Error::new(EINVAL))?;
-        let new_parent = dest_walk.parent_nodeid.ok_or(Error::new(EINVAL))?;
-        if !dest_walk.last_to_be_created {
+        if dest.nodeid.is_some() {
             return Err(Error::new(EEXIST));
         }
+        let new_parent = dest.parent;
+        let new_name = dest.name.as_str();
 
-        let _new_parent_pin = self.pin(new_parent)?;
-
-        let name_cstring = cstring(new_name.as_str(), "link: new name")?;
+        let name_cstring = cstring(new_name, "link: new name")?;
 
         let entry = self
             .fuse
@@ -1799,7 +1860,7 @@ impl<T: FuseTransporter> Vfs<T> {
 
         let merge_err = {
             let mut g = self.state.borrow_mut();
-            let err = g.merge_entry(new_parent, &new_name, entry).err();
+            let err = g.merge_entry(new_parent, new_name, entry).err();
             if err.is_none() {
                 g.invalidate_attr(new_parent);
             }
