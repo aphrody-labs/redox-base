@@ -18,9 +18,9 @@ fn switch_stdio(stdio: &str) -> io::Result<()> {
     let stdout = libredox::Fd::open(stdio, O_WRONLY, 0)?;
     let stderr = libredox::Fd::open(stdio, O_WRONLY, 0)?;
 
-    stdin.dup2(0, &[])?;
-    stdout.dup2(1, &[])?;
-    stderr.dup2(2, &[])?;
+    stdin.dup2(0)?;
+    stdout.dup2(1)?;
+    stderr.dup2(2)?;
 
     Ok(())
 }
