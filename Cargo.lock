@@ -1377,9 +1377,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libredox"
-version = "0.1.25"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
+checksum = "482919959e69f0d67493e9220edb433ffc42ae98e59ceba4ed58697eb49b9bf8"
 dependencies = [
  "bitflags 2.13.1",
  "ioslice",
@@ -1605,9 +1605,8 @@ checksum = "2839e79665f131bdb5782e51f2c6c9599c133c6098982a54c794358bf432529c"
 
 [[package]]
 name = "orbclient"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01f140a738f180203d7912dfd369936fff2fb0ad6f426c0aa007ed3e2b443e6b"
+version = "0.4.7"
+source = "git+https://gitlab.redox-os.org/redox-os/orbclient.git#e9573da7e4cce13898094aba9923f69547461c19"
 dependencies = [
  "libc",
  "libredox",
@@ -2064,8 +2063,8 @@ checksum = "083c57139a99303d842a4cfe1f0fd6483d77d81eda1442be84bcb1a0f737ed96"
 
 [[package]]
 name = "redox-rings"
-version = "0.1.0"
-source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#c56099c15a30636e7a528a6b37676daa7d9b6788"
+version = "0.2.0"
+source = "git+https://gitlab.redox-os.org/redox-os/redox-rings.git#d787c28c2dba79b9325d2a5a3e8c96dce4ebb2eb"
 dependencies = [
  "bitflags 2.13.1",
  "libredox",
@@ -2075,9 +2074,8 @@ dependencies = [
 
 [[package]]
 name = "redox-scheme"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19c965a2cf25eaf2bab12a7aa83165b018b880293ce1005ab76eb9ab795cc89c"
+version = "0.13.0"
+source = "git+https://gitlab.redox-os.org/redox-os/redox-scheme.git#3514d5696fb8cbbe7d517d37d3074d7cd5cfdded"
 dependencies = [
  "libredox",
  "redox_syscall 0.9.5",
@@ -2085,9 +2083,9 @@ dependencies = [
 
 [[package]]
 name = "redox_event"
-version = "0.4.8"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5018d583d6d2f5499352aea8d177e9067d1eb03ab17c78169d5ba7a30001b15"
+checksum = "19d5e82d50f9c0baa461ece6d4e4cb87efe7b666a9a5c9461fafcae46429e21e"
 dependencies = [
  "bitflags 2.13.1",
  "libredox",

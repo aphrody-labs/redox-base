@@ -85,16 +85,11 @@ pub fn run(write_fd: FdGuard, socket: Socket, auth: FdGuard, event: FdGuard) -> 
                     continue;
                 };
                 match scheme.work_on(state, &mut new_awoken) {
-                    Ready(resp) => loop {
-                        match socket.write_response(resp, SignalBehavior::Interrupt) {
-                            Ok(false) => break 'outer,
-                            Ok(_) => break,
-                            Err(err) if err.errno == EINTR => continue,
-                            Err(err) => {
-                                panic!(
-                                    "bootstrap: failed to write scheme response to kernel: {err}"
-                                )
-                            }
+                    Ready(resp) => match socket.write_response(resp, SignalBehavior::Restart) {
+                        Ok(false) => break 'outer,
+                        Ok(_) => {}
+                        Err(err) => {
+                            panic!("bootstrap: failed to write scheme response to kernel: {err}");
                         }
                     },
                     Pending => continue,
@@ -124,14 +119,11 @@ pub fn run(write_fd: FdGuard, socket: Socket, auth: FdGuard, event: FdGuard) -> 
                 else {
                     continue 'reqs;
                 };
-                loop {
-                    match socket.write_response(resp, SignalBehavior::Interrupt) {
-                        Ok(false) => break 'outer,
-                        Ok(_) => break,
-                        Err(err) if err.errno == EINTR => continue,
-                        Err(err) => {
-                            panic!("bootstrap: failed to write scheme response to kernel: {err}")
-                        }
+                match socket.write_response(resp, SignalBehavior::Restart) {
+                    Ok(false) => break 'outer,
+                    Ok(_) => {}
+                    Err(err) => {
+                        panic!("bootstrap: failed to write scheme response to kernel: {err}");
                     }
                 }
             }

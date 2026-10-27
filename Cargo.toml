@@ -89,16 +89,17 @@ edid = "0.3.0" #TODO: edid is abandoned, fork it and maintain?
 fdt = "0.1.5"
 libc = "0.2.181"
 log = "0.4"
-libredox = "0.1.25"
-orbclient = "0.4.1"
+libredox = "0.2.0"
+orbclient = { git = "https://gitlab.redox-os.org/redox-os/orbclient.git" }
 psf-rs = "2.2.0"
 parking_lot = "0.12"
 pico-args = "0.5"
 plain = "0.2.3"
-redox_event = "0.4.8"
+redox_event = "0.5.0"
 redox-ioctl = { git = "https://gitlab.redox-os.org/redox-os/relibc.git" }
 redox-log = { git = "https://gitlab.redox-os.org/redox-os/redox-log.git" }
-redox-scheme = { version = "0.12.0", default-features = false }
+# redox-scheme = { version = "0.13.0", default-features = false }
+redox-scheme = { git = "https://gitlab.redox-os.org/redox-os/redox-scheme.git", default-features = false }
 redox_syscall = { version = "0.9.5",  features = ["std"] }
 redox-rings = { git = "https://gitlab.redox-os.org/redox-os/redox-rings.git", features = ["userspace", "sync"] }
 redox_termios = "0.1.4"
