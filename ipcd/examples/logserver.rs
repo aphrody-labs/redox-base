@@ -10,8 +10,8 @@ fn from_syscall_error(error: syscall::Error) -> io::Error {
 }
 
 fn main() -> io::Result<()> {
-    let server = File::create("chan:log")?;
-    let mut event_file = File::open("event:")?;
+    let server = File::create("/scheme/chan/log")?;
+    let mut event_file = File::open("/scheme/event")?;
 
     syscall::fcntl(
         server.as_raw_fd() as usize,

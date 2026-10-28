@@ -10,7 +10,7 @@ fn dup(file: &File, buf: &str) -> io::Result<File> {
 
 fn main() -> io::Result<()> {
     let mut buf = [0; 5];
-    let server = File::create("chan:")?;
+    let server = File::create("/scheme/chan")?;
 
     let mut client = dup(&server, "connect")?;
     let mut stream = dup(&server, "listen")?;

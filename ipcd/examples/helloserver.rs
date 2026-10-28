@@ -4,7 +4,7 @@ use std::io::prelude::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 fn main() -> io::Result<()> {
-    let server = File::create("chan:hello")?;
+    let server = File::create("/scheme/chan/hello")?;
 
     loop {
         let stream = libredox::call::dup(server.as_raw_fd() as usize, b"listen")?;
