@@ -7,8 +7,9 @@ use drm_sys::DRM_CLIENT_NAME_MAX_LEN;
 use graphics_ipc::redox_uapi_exts::RedoxDrmEventConnectorHotplug;
 use redox_scheme::CallerCtx;
 use scheme_utils::{FpathWriter, ResourceSync};
-use syscall::{EFAULT, EINVAL, Error, EventFlags, MapFlags, Result};
+use syscall::{EFAULT, EINVAL, ENOENT, Error, EventFlags, MapFlags, Result};
 
+use crate::buffer::DrmBuffer;
 use crate::kms::framebuffer::{KmsFramebuffer, disable_planes_with_fb};
 use crate::kms::objects::KmsObjectId;
 use crate::kms::rc_object::KmsRcObjectRef;
@@ -155,6 +156,28 @@ impl<T: GraphicsAdapter> ResourceSync for DrmHandle<T> {
         res
     }
 
+    fn call_with_handles(
+        &mut self,
+        scheme_data: &mut Self::SchemeData,
+        handles: &mut [Self::ResourceEnum],
+        payload: &mut [u8],
+        metadata: &[u64],
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let res = ioctl::call_ioctl_handles(
+            &mut scheme_data.adapter,
+            &mut scheme_data.objects,
+            scheme_data.active_vt,
+            &mut scheme_data.vts,
+            self,
+            metadata[0],
+            handles,
+            payload,
+        );
+        scheme_data.objects.remove_all_deferred();
+        res
+    }
+
     fn mmap_prep(
         &mut self,
         scheme_data: &mut Self::SchemeData,
@@ -184,5 +207,34 @@ impl<T: GraphicsAdapter> ResourceSync for DrmHandle<T> {
             );
         }
         scheme_data.objects.remove_all_deferred();
+    }
+
+    fn dup(
+        &mut self,
+        _scheme_data: &mut Self::SchemeData,
+        buf: &[u8],
+        _ctx: &CallerCtx,
+    ) -> Result<scheme_utils::ResourceOpenResult<Self::ResourceEnum>> {
+        use redox_ioctl::drm as ipc;
+        assert!(!buf.is_empty());
+        if buf.len() != 16 {
+            return Err(Error::new(EINVAL));
+        }
+        let cmd = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let handle = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let writable = u32::from_ne_bytes(buf[12..16].try_into().unwrap()) != 0;
+        if cmd != ipc::PRIME_HANDLE_TO_FD {
+            return Err(Error::new(EINVAL));
+        }
+        let buffer = self
+            .buffers
+            .get(&handle)
+            .cloned()
+            .ok_or(Error::new(ENOENT))?;
+
+        Ok(scheme_utils::ResourceOpenResult::ThisScheme {
+            data: GraphicsResource::DrmBuffer(DrmBuffer { buffer, writable }),
+            flags: syscall::schemev2::NewFdFlags::empty(),
+        })
     }
 }

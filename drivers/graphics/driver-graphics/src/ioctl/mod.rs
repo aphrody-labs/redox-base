@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use redox_ioctl::drm as ipc;
 use syscall::{EINVAL, ENOENT, Error};
 
 use crate::kms::objects::{KmsObjectId, KmsObjects};
-use crate::{Buffer, DrmHandle, GraphicsAdapter, MAP_FAKE_OFFSET_MULTIPLIER, VtState};
+use crate::{
+    Buffer, DrmHandle, GraphicsAdapter, GraphicsResource, MAP_FAKE_OFFSET_MULTIPLIER, VtState,
+};
 
 mod crtc;
 mod cursor;
@@ -23,8 +26,6 @@ pub(crate) fn call_ioctl<T: GraphicsAdapter>(
     cmd: u64,
     payload: &mut [u8],
 ) -> syscall::Result<usize> {
-    use redox_ioctl::drm as ipc;
-
     match cmd {
         ipc::VERSION => ipc::DrmVersion::with(payload, |data| driver_info::version(adapter, data)),
         ipc::GET_UNIQUE => {
@@ -191,6 +192,34 @@ pub(crate) fn call_ioctl<T: GraphicsAdapter>(
             handle.client_name[..data.name().len()].copy_from_slice(data.name());
             Ok(0)
         }),
+
+        _ => return Err(Error::new(EINVAL)),
+    }
+}
+
+pub(crate) fn call_ioctl_handles<T: GraphicsAdapter>(
+    _adapter: &mut T,
+    _objects: &mut KmsObjects<T>,
+    _active_vt: usize,
+    _vts: &mut HashMap<usize, VtState<T>>,
+
+    handle: &mut DrmHandle<T>,
+    cmd: u64,
+    handles: &mut [GraphicsResource<T>],
+    _payload: &mut [u8],
+) -> syscall::Result<usize> {
+    match cmd {
+        ipc::PRIME_FD_TO_HANDLE => {
+            let buffer = match handles {
+                [GraphicsResource::DrmBuffer(drm_buffer)] => drm_buffer.buffer.clone(),
+                _ => return Err(Error::new(EINVAL)),
+            };
+            // FIXME reuse existing id if the client already has a reference to this buffer
+            handle.next_buffer_id += 1;
+            handle.buffers.insert(handle.next_buffer_id, buffer);
+            Ok(handle.next_buffer_id as usize)
+        }
+
         _ => return Err(Error::new(EINVAL)),
     }
 }

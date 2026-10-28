@@ -19,12 +19,14 @@ use scheme_utils::{Blocking, FpathWriter, ResourceOpenResult, ResourceSync, reso
 use syscall::schemev2::NewFdFlags;
 use syscall::{EINVAL, Error, EventFlags, Result};
 
+use crate::buffer::DrmBuffer;
 use crate::handle::DrmHandle;
 use crate::kms::connector::{KmsConnectorDriver, KmsConnectorState};
 use crate::kms::crtc::{KmsCrtc, KmsCrtcDriver, KmsCrtcState};
 use crate::kms::objects::{KmsObjectId, KmsObjects};
 use crate::kms::plane::{KmsPlane, KmsPlaneDriver, KmsPlaneState};
 
+mod buffer;
 mod handle;
 mod ioctl;
 pub mod kms;
@@ -293,6 +295,7 @@ resource_scheme! {
         SchemeRoot(SchemeRoot<T>),
         Control(Control<T>),
         DrmHandle(DrmHandle<T>),
+        DrmBuffer(DrmBuffer<T>),
     }
 }
 
