@@ -199,6 +199,17 @@ pub trait ResourceSync: Sized + Debug {
         Err(Error::new(EOPNOTSUPP))
     }
 
+    fn call_with_handles(
+        &mut self,
+        scheme_data: &mut Self::SchemeData,
+        handles: &mut [Self::ResourceEnum],
+        payload: &mut [u8],
+        metadata: &[u64],
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
     fn std_fs_call(
         &mut self,
         scheme_data: &mut Self::SchemeData,
@@ -488,6 +499,42 @@ macro_rules! __resource_scheme {
                 metadata: &[u64],
                 ctx: &redox_scheme::CallerCtx, // Only pid and id are correct here, uid/gid are not used
             ) -> usize);
+
+            fn call_multiple_ids(
+                &mut self,
+                ids: &[usize],
+                payload: &mut [u8],
+                metadata: &[u64],
+                ctx: &redox_scheme::CallerCtx,
+            ) -> syscall::Result<usize> {
+                if ids.len() != 2 {
+                    return Err(syscall::Error::new(syscall::EINVAL));
+                }
+                if ids[0] == ids[1] {
+                    return Err(syscall::Error::new(syscall::EINVAL));
+                }
+                let mut handle = self
+                    .handles
+                    .remove(ids[0])
+                    .ok_or_else(|| syscall::Error::new(syscall::EBADF))?;
+                let mut handles = [self
+                    .handles
+                    .remove(ids[1])
+                    .ok_or_else(|| syscall::Error::new(syscall::EBADF))?];
+                let res = match &mut handle {
+                    $($enum::$variant(arg) => arg.call_with_handles(
+                        &mut self.scheme_data,
+                        &mut handles,
+                        payload,
+                        metadata,
+                        ctx,
+                    ),)*
+                };
+                self.handles.insert_at(ids[0], handle);
+                let [handle1] = handles;
+                self.handles.insert_at(ids[1], handle1);
+                res
+            }
 
             $crate::resource_scheme!(@method enum $enum { $($variant($type),)* } => std_fs_call(
                 kind: syscall::StdFsCallKind,

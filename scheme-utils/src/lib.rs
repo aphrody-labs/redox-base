@@ -45,6 +45,10 @@ impl<T> HandleMap<T> {
         id.0
     }
 
+    pub fn insert_at(&mut self, id: usize, handle: T) -> Option<T> {
+        self.handles.insert(id, handle)
+    }
+
     pub fn remove(&mut self, id: usize) -> Option<T> {
         self.handles.remove(&id)
     }

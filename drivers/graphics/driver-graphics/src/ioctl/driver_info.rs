@@ -3,8 +3,9 @@ use std::mem;
 
 use drm_sys::{
     DRM_CAP_CURSOR_HEIGHT, DRM_CAP_CURSOR_WIDTH, DRM_CAP_DUMB_BUFFER, DRM_CAP_DUMB_PREFER_SHADOW,
-    DRM_CAP_DUMB_PREFERRED_DEPTH, DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT,
-    DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+    DRM_CAP_DUMB_PREFERRED_DEPTH, DRM_CAP_PRIME, DRM_CAP_TIMESTAMP_MONOTONIC,
+    DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_PRIME_CAP_EXPORT,
+    DRM_PRIME_CAP_IMPORT,
 };
 use graphics_ipc::redox_uapi_exts::REDOX_DRM_CLIENT_CAP_HOTPLUG_EVENTS;
 use syscall::{EINVAL, EOPNOTSUPP, Error};
@@ -78,6 +79,7 @@ pub(super) fn get_cap<T: GraphicsAdapter>(
                 .dumb_buffer_config()
                 .map_or(false, |config| config.prefer_shadow),
         ),
+        DRM_CAP_PRIME => u64::from(DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT),
         DRM_CAP_TIMESTAMP_MONOTONIC => 1,
         DRM_CAP_CURSOR_WIDTH => {
             if let Some((width, _height)) = adapter.cursor_size() {
