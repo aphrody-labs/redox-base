@@ -5,12 +5,9 @@ use scheme_utils::ReadinessBased;
 
 mod chan;
 mod shm;
-mod uds;
 
 use self::chan::ChanScheme;
 use self::shm::ShmScheme;
-use self::uds::dgram::UdsDgramScheme;
-use self::uds::stream::UdsStreamScheme;
 
 fn main() {
     daemon::Daemon::new(daemon_runner);
@@ -32,8 +29,6 @@ fn inner(daemon: daemon::Daemon) -> anyhow::Result<()> {
         enum EventSource {
             ChanSocket,
             ShmSocket,
-            UdsStreamSocket,
-            UdsDgramSocket,
         }
     }
 
@@ -49,28 +44,10 @@ fn inner(daemon: daemon::Daemon) -> anyhow::Result<()> {
     let mut shm = ShmScheme::new();
     let mut shm_handler = ReadinessBased::new(&shm_socket, 16);
 
-    // Prepare uds stream scheme
-    let uds_stream_socket = Socket::nonblock()
-        .map_err(|e| anyhow::anyhow!("failed to create uds stream scheme: {e}"))?;
-    let mut uds_stream = UdsStreamScheme::new(&uds_stream_socket, "uds_stream".to_owned())
-        .map_err(|e| anyhow::anyhow!("failed to create uds stream scheme: {e}"))?;
-    let mut uds_stream_handler = ReadinessBased::new(&uds_stream_socket, 16);
-
-    // Prepare uds dgram scheme
-    let uds_dgram_socket = Socket::nonblock()
-        .map_err(|e| anyhow::anyhow!("failed to create uds dgram scheme: {e}"))?;
-    let mut uds_dgram = UdsDgramScheme::new(&uds_dgram_socket, "uds_dgram".to_owned())
-        .map_err(|e| anyhow::anyhow!("failed to create uds dgram scheme: {e}"))?;
-    let mut uds_dgram_handler = ReadinessBased::new(&uds_dgram_socket, 16);
-
     register_sync_scheme(&chan_socket, "chan", &mut chan)
         .map_err(|e| anyhow::anyhow!("failed to register chan scheme: {e}"))?;
     register_sync_scheme(&shm_socket, "shm", &mut shm)
         .map_err(|e| anyhow::anyhow!("failed to register shm scheme: {e}"))?;
-    register_sync_scheme(&uds_stream_socket, "uds_stream", &mut uds_stream)
-        .map_err(|e| anyhow::anyhow!("failed to register uds stream scheme: {e}"))?;
-    register_sync_scheme(&uds_dgram_socket, "uds_dgram", &mut uds_dgram)
-        .map_err(|e| anyhow::anyhow!("failed to register uds dgram scheme: {e}"))?;
 
     daemon.ready();
 
@@ -91,20 +68,6 @@ fn inner(daemon: daemon::Daemon) -> anyhow::Result<()> {
             EventFlags::READ,
         )
         .map_err(|e| anyhow::anyhow!("failed to subscribe shm socket: {e}"))?;
-    event_queue
-        .subscribe(
-            uds_stream_socket.inner().raw(),
-            EventSource::UdsStreamSocket,
-            EventFlags::READ,
-        )
-        .map_err(|e| anyhow::anyhow!("failed to subscribe uds stream socket: {e}"))?;
-    event_queue
-        .subscribe(
-            uds_dgram_socket.inner().raw(),
-            EventSource::UdsDgramSocket,
-            EventFlags::READ,
-        )
-        .map_err(|e| anyhow::anyhow!("failed to subscribe uds dgram socket: {e}"))?;
 
     libredox::call::setrens(0, 0)?;
 
@@ -127,22 +90,6 @@ fn inner(daemon: daemon::Daemon) -> anyhow::Result<()> {
                 shm_handler.read_and_process_requests(&mut shm)?;
                 // shm is not a blocking scheme
                 shm_handler.write_responses()?;
-            }
-            EventSource::UdsStreamSocket => {
-                // Unix Domain Socket Stream scheme
-                uds_stream_handler.read_and_process_requests(&mut uds_stream)?;
-                uds_stream_handler
-                    .poll_all_requests(&mut uds_stream)
-                    .map_err(|e| anyhow::anyhow!("error occured in poll_all_requests: {e}"))?;
-                uds_stream_handler.write_responses()?;
-            }
-            EventSource::UdsDgramSocket => {
-                // Unix Domain Socket Dgram scheme
-                uds_dgram_handler.read_and_process_requests(&mut uds_dgram)?;
-                uds_dgram_handler
-                    .poll_all_requests(&mut uds_dgram)
-                    .map_err(|e| anyhow::anyhow!("error occured in poll_all_requests: {e}"))?;
-                uds_dgram_handler.write_responses()?;
             }
         }
     }

@@ -16,7 +16,7 @@ use syscall::flag::*;
 use syscall::schemev2::NewFdFlags;
 use syscall::{Error, Stat};
 
-use crate::uds::create_token_generator;
+use crate::common::create_token_generator;
 
 #[derive(Clone, Copy, Default)]
 pub struct MsgFlags(libc::c_int);

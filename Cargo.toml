@@ -16,6 +16,7 @@ members = [
     "ramfs",
     "randd",
     "scheme-utils",
+    "udsd",
     "zerod",
 
     "drivers/common",
