@@ -517,10 +517,15 @@ macro_rules! __resource_scheme {
                     .handles
                     .remove(ids[0])
                     .ok_or_else(|| syscall::Error::new(syscall::EBADF))?;
-                let mut handles = [self
-                    .handles
-                    .remove(ids[1])
-                    .ok_or_else(|| syscall::Error::new(syscall::EBADF))?];
+                let mut handles = [
+                    match self.handles.remove(ids[1]) {
+                        Some(handle) => handle,
+                        None => {
+                            self.handles.insert_at(ids[0], handle);
+                            return Err(syscall::Error::new(syscall::EBADF));
+                        }
+                    },
+                ];
                 let res = match &mut handle {
                     $($enum::$variant(arg) => arg.call_with_handles(
                         &mut self.scheme_data,
