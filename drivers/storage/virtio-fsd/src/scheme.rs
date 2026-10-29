@@ -1,0 +1,707 @@
+use std::cell::RefCell;
+use std::io;
+use std::mem::size_of;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use futures::executor::LocalPool;
+use futures::task::LocalSpawnExt;
+use libredox::call::get_proc_credentials;
+use libredox::protocol::ProcMeta;
+use libredox::{Fd, flag};
+use log::warn;
+use plain::Plain;
+use redox_scheme::scheme::{Op, SchemeAsync, SchemeState};
+use redox_scheme::{
+    CallerCtx, OpenResult, RecvFdRequest, RequestKind, Response, SignalBehavior, Socket,
+};
+use scheme_utils::FpathWriter;
+use syscall::dirent::{DirEntry, DirentBuf, DirentKind};
+use syscall::error::{EOPNOTSUPP, Error, Result};
+use syscall::schemev2::NewFdFlags;
+use syscall::{
+    EAGAIN, EBADMSG, EEXIST, EINTR, EINVAL, EISDIR, ELOOP, EPERM, EWOULDBLOCK, EXDEV, EventFlags,
+    F_GETFL, F_SETFL, MODE_DIR, MODE_FILE, MODE_PERM, MODE_SYMLINK, MapFlags, MunmapFlags, Stat,
+    StatVfs, StdFsCallKind, StdFsCallMeta, TimeSpec,
+};
+
+use crate::fuse::{Caller, FuseTransporter};
+use crate::vfs::Vfs;
+
+// TODO: host-level locks via FUSE.
+// Path resolution and I/O go to FUSE while fcntl locks stay in `lock_state` (local to redox).
+pub struct VirtioFsScheme<T: FuseTransporter> {
+    socket: Arc<Socket>,
+    vfs: Rc<Vfs<T>>,
+    scheme_name: Rc<str>,
+    debug_scheme_name: Rc<str>,
+    lock_state: Rc<RefCell<SchemeState>>,
+    proc_creds: Rc<Fd>,
+}
+
+impl<T: FuseTransporter> Clone for VirtioFsScheme<T> {
+    fn clone(&self) -> Self {
+        Self {
+            socket: Arc::clone(&self.socket),
+            vfs: Rc::clone(&self.vfs),
+            scheme_name: Rc::clone(&self.scheme_name),
+            debug_scheme_name: Rc::clone(&self.debug_scheme_name),
+            lock_state: Rc::clone(&self.lock_state),
+            proc_creds: Rc::clone(&self.proc_creds),
+        }
+    }
+}
+
+impl<T: FuseTransporter + 'static> VirtioFsScheme<T> {
+    pub fn new(
+        socket: Arc<Socket>,
+        vfs: Vfs<T>,
+        scheme_name: &str,
+        debug_scheme_name: &str,
+    ) -> Self {
+        Self {
+            vfs: Rc::new(vfs),
+            socket,
+            scheme_name: Rc::from(scheme_name),
+            debug_scheme_name: Rc::from(debug_scheme_name),
+            lock_state: Rc::new(RefCell::new(SchemeState::new())),
+            proc_creds: Rc::new(
+                Fd::open("/scheme/proc/proc-creds-capability", flag::O_RDONLY, 0)
+                    .expect("virtio-fsd: failed to open proc-creds capability"),
+            ),
+        }
+    }
+
+    /// Root handle for the debug scheme, to be registered under `debug_scheme_name`.
+    pub fn debug_scheme_root(&self) -> usize {
+        self.vfs.debug_root()
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.vfs.shutdown().await
+    }
+
+    fn drop_file_locks(&self, id: usize, pid: usize) {
+        let Ok(inode) = self.vfs.get_inode(id) else {
+            return;
+        };
+        self.lock_state
+            .borrow_mut()
+            .on_detach(id, u64::from(inode) as usize, pid);
+    }
+
+    pub fn tick(&mut self) -> io::Result<()> {
+        // We interleave requests on the same thread, then `pool.run()`
+        // once EAGAIN is encountered.
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let mut closes = Vec::new();
+
+        loop {
+            let request = match self.socket.next_request(SignalBehavior::Interrupt) {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    pool.run();
+                    futures::executor::block_on(self.vfs.shutdown());
+                    std::process::exit(0);
+                }
+                Err(error) if error.errno == EWOULDBLOCK || error.errno == EAGAIN => break,
+                Err(err) if err.errno == EINTR => continue,
+                Err(err) => return Err(err.into()),
+            };
+
+            match request.kind() {
+                RequestKind::Call(call_request) => {
+                    let caller = call_request.caller();
+                    match call_request.op() {
+                        Ok(op) if is_lock_op(&op) => {
+                            let mut scheme = self.clone();
+
+                            let lock_state = Rc::clone(&self.lock_state);
+                            let mut state = lock_state.borrow_mut();
+
+                            // Lock ops happen sequentially.
+                            let response = futures::executor::block_on(op.handle_async(
+                                caller,
+                                &mut scheme,
+                                &mut state,
+                            ));
+
+                            drop(state);
+
+                            if let Err(err) = scheme
+                                .socket
+                                .write_response(response, SignalBehavior::Restart)
+                            {
+                                warn!("virtio-fsd: write_response: {err}");
+                            }
+                        }
+                        Ok(op) => {
+                            let mut scheme = self.clone();
+                            spawner
+                                .spawn_local(async move {
+                                    let mut dummy_state = SchemeState::new();
+                                    let response = op
+                                        .handle_async(caller, &mut scheme, &mut dummy_state)
+                                        .await;
+
+                                    if let Err(err) = scheme
+                                        .socket
+                                        .write_response(response, SignalBehavior::Restart)
+                                    {
+                                        warn!("virtio-fsd: write_response: {err}");
+                                    }
+                                })
+                                .expect("virtio-fsd: failed to spawn scheme call");
+                        }
+                        Err(req) => {
+                            let mut scheme = self.clone();
+                            spawner
+                                .spawn_local(async move {
+                                    let mut dummy_state = SchemeState::new();
+                                    let response =
+                                        req.handle_async(&mut scheme, &mut dummy_state).await;
+                                    if let Err(err) = scheme
+                                        .socket
+                                        .write_response(response, SignalBehavior::Restart)
+                                    {
+                                        warn!("virtio-fsd: write_response: {err}");
+                                    }
+                                })
+                                .expect("virtio-fsd: failed to spawn scheme call");
+                        }
+                    }
+                }
+                RequestKind::OnClose { id } => {
+                    self.drop_file_locks(id, 0);
+                    closes.push(id);
+                }
+                RequestKind::OnDetach { id, pid } => {
+                    self.drop_file_locks(id, pid);
+                }
+                RequestKind::SendFd(request) => {
+                    let _ = self.socket.write_response(
+                        Response::err(EOPNOTSUPP, request),
+                        SignalBehavior::Restart,
+                    );
+                }
+                RequestKind::RecvFd(request) => {
+                    let _ = self.socket.write_response(
+                        Response::err(EOPNOTSUPP, request),
+                        SignalBehavior::Restart,
+                    );
+                }
+                RequestKind::MsyncMsg | RequestKind::MunmapMsg | RequestKind::MmapMsg => {}
+                RequestKind::Cancellation(_cancellation_request) => {
+                    // TODO: send FUSE_INTERRUPT.
+                }
+            }
+        }
+
+        pool.run();
+        for id in closes {
+            futures::executor::block_on(self.vfs.close(id));
+        }
+        Ok(())
+    }
+}
+
+impl<T: FuseTransporter + 'static> SchemeAsync for VirtioFsScheme<T> {
+    fn scheme_root(&mut self) -> Result<usize> {
+        Ok(self.vfs.scheme_root())
+    }
+
+    async fn inode(&self, id: usize) -> Result<usize> {
+        self.vfs.get_inode(id).map(|ino| u64::from(ino) as usize)
+    }
+
+    async fn openat(
+        &mut self,
+        fd: usize,
+        path: &str,
+        flags: usize,
+        fcntl_flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<OpenResult> {
+        let flags = flags | fcntl_flags as usize;
+        let caller = caller(ctx);
+
+        // The debug scheme is served by the same socket. Its handles never
+        // touch the share, so keep them out of the path walk below.
+        if self.vfs.is_debug(fd) {
+            let number = self.vfs.open_debug(fd, path, flags)?;
+            return Ok(OpenResult::ThisScheme {
+                number,
+                flags: NewFdFlags::POSITIONED,
+            });
+        }
+
+        let mut walk = self.vfs.walk_path(fd, path, flags, caller).await?;
+        let to_be_created = walk.last_to_be_created;
+
+        let o_stat = flags & syscall::O_STAT != 0;
+        let o_symlink = flags & syscall::O_SYMLINK != 0;
+        let o_nofollow = flags & syscall::O_NOFOLLOW != 0;
+
+        if o_symlink && flags & syscall::O_DIRECTORY != 0 {
+            return Err(Error::new(EINVAL));
+        }
+
+        // ln -s does not send O_EXCL. If the name already exists, fail here
+        // rather than opening the link and erroring on the later write.
+        if o_symlink && flags & syscall::O_CREAT != 0 && !to_be_created {
+            return Err(Error::new(EEXIST));
+        }
+
+        // O_SYMLINK opens the link itself (how Redox implements readlink).
+        // O_STAT is lstat: metadata of the link, do not follow. Otherwise follow.
+        if walk.node_mode == MODE_SYMLINK && !o_stat && !o_symlink {
+            if o_nofollow {
+                return Err(Error::new(ELOOP));
+            }
+            walk = self.vfs.follow_chain(walk, caller).await?;
+        }
+
+        if o_symlink && !to_be_created && walk.node_mode != MODE_SYMLINK {
+            return Err(Error::new(EINVAL));
+        }
+
+        if !to_be_created && flags & syscall::O_CREAT != 0 && flags & syscall::O_EXCL != 0 {
+            return Err(Error::new(EEXIST));
+        }
+
+        if to_be_created {
+            let entry = self.vfs.entry_of_walk(&walk)?;
+            if o_symlink {
+                let fd = self.vfs.pre_create_symlink(entry, caller)?;
+                return Ok(OpenResult::ThisScheme {
+                    number: fd,
+                    flags: NewFdFlags::POSITIONED,
+                });
+            }
+
+            let perm = flags as u32 & u32::from(MODE_PERM);
+            if flags & syscall::O_DIRECTORY != 0 {
+                let accmode = flags & syscall::O_ACCMODE;
+                // Write access is rejected by the I/O open below. O_STAT skips that open.
+                if !o_stat && (accmode == syscall::O_WRONLY || accmode == syscall::O_RDWR) {
+                    return Err(Error::new(EISDIR));
+                }
+                (walk.nodeid, walk.node_mode) = self
+                    .vfs
+                    .mkdir(entry, perm | u32::from(MODE_DIR), caller)
+                    .await?;
+            } else {
+                (walk.nodeid, walk.node_mode) = self
+                    .vfs
+                    .create(entry, flags, perm | u32::from(MODE_FILE), caller)
+                    .await?;
+            }
+        }
+
+        if o_stat {
+            let fd = self
+                .vfs
+                .insert_stat_only(walk.nodeid, walk.rel_path, caller)?;
+            return Ok(OpenResult::ThisScheme {
+                number: fd,
+                flags: NewFdFlags::POSITIONED,
+            });
+        }
+
+        if o_symlink {
+            let target = self.vfs.readlink(walk.nodeid, caller).await?;
+            let fd = self
+                .vfs
+                .insert_symlink(walk.nodeid, walk.rel_path, target, caller)?;
+            return Ok(OpenResult::ThisScheme {
+                number: fd,
+                flags: NewFdFlags::POSITIONED,
+            });
+        }
+
+        let is_dir = walk.node_mode == MODE_DIR;
+        if is_dir && flags & syscall::O_DIRECTORY == 0 {
+            return Err(Error::new(EISDIR));
+        }
+        let fd = self
+            .vfs
+            .open(walk.nodeid, flags, is_dir, walk.rel_path, caller)
+            .await?;
+        return Ok(OpenResult::ThisScheme {
+            number: fd,
+            flags: NewFdFlags::POSITIONED,
+        });
+    }
+
+    async fn unlinkat(
+        &mut self,
+        fd: usize,
+        path: &str,
+        flags: usize,
+        ctx: &CallerCtx,
+    ) -> Result<()> {
+        let caller = self.effective_caller(ctx.pid)?;
+        let path = self.at_path(path)?;
+        let entry = self.vfs.entry_at(fd, &path, caller).await?;
+
+        let is_dir = flags & syscall::AT_REMOVEDIR == syscall::AT_REMOVEDIR;
+        self.vfs.rm(entry, is_dir, caller).await
+    }
+
+    // Ordinary dup/dup2 is done in the kernel and we never see it. This is only
+    // for schemes that treat dup(fd, "some-name") as a special open, which we
+    // don't. redoxfs skips it too.
+    async fn dup(&mut self, _old_id: usize, _buf: &[u8], _ctx: &CallerCtx) -> Result<OpenResult> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    async fn read(
+        &mut self,
+        id: usize,
+        buf: &mut [u8],
+        offset: u64,
+        fcntl_flags: u32,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        self.vfs.read(id, buf, offset, fcntl_flags).await
+    }
+
+    async fn write(
+        &mut self,
+        id: usize,
+        buf: &[u8],
+        offset: u64,
+        fcntl_flags: u32,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        self.vfs.write(id, buf, offset, fcntl_flags).await
+    }
+
+    async fn fsize(&mut self, id: usize, _ctx: &CallerCtx) -> Result<u64> {
+        Ok(self.vfs.getattr(id).await?.size)
+    }
+
+    async fn fchmod(&mut self, id: usize, new_mode: u16, ctx: &CallerCtx) -> Result<()> {
+        self.vfs.fchmod(id, new_mode, caller(ctx)).await
+    }
+
+    async fn fchown(
+        &mut self,
+        id: usize,
+        new_uid: u32,
+        new_gid: u32,
+        ctx: &CallerCtx,
+    ) -> Result<()> {
+        self.vfs.fchown(id, new_uid, new_gid, caller(ctx)).await
+    }
+
+    async fn fcntl(
+        &mut self,
+        id: usize,
+        cmd: usize,
+        _arg: usize,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        // F_GETFL/F_SETFL: kernel keeps the bits and passes them back as
+        // fcntl_flags on read/write. We only have to agree. F_GETFD/F_SETFD
+        // and F_DUPFD never reach the scheme.
+        self.vfs.has_fd(id)?;
+        match cmd {
+            F_GETFL | F_SETFL => Ok(0),
+            _ => Err(Error::new(EINVAL)),
+        }
+    }
+
+    async fn fevent(
+        &mut self,
+        id: usize,
+        _flags: EventFlags,
+        _ctx: &CallerCtx,
+    ) -> Result<EventFlags> {
+        // files here are always ready, same as redoxfs.
+        self.vfs.has_fd(id)?;
+        Err(Error::new(EPERM))
+    }
+
+    async fn flink(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
+        let caller = caller(ctx);
+
+        let dest_str = get_dest(self.scheme_name.as_ref(), path)?;
+        // `dest` is absolute, so `id` is only checked for being a debug handle.
+        let dest = self.vfs.entry_at(id, &dest_str, caller).await?;
+
+        self.vfs.link(id, dest, caller).await?;
+
+        Ok(0)
+    }
+
+    async fn flinkat(
+        &mut self,
+        id: usize,
+        dirid: usize,
+        path: &str,
+        _flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let caller = self.effective_caller(ctx.pid)?;
+        let path = self.at_path(path)?;
+        let dest = self.vfs.entry_at(dirid, &path, caller).await?;
+
+        self.vfs.link(id, dest, caller).await?;
+
+        Ok(0)
+    }
+
+    async fn fpath(&mut self, id: usize, buf: &mut [u8], _ctx: &CallerCtx) -> Result<usize> {
+        let path = self.vfs.get_path(id)?;
+        let scheme_name = if self.vfs.is_debug(id) {
+            &self.debug_scheme_name
+        } else {
+            &self.scheme_name
+        };
+
+        FpathWriter::with(buf, scheme_name.as_ref(), |w| {
+            w.push_str(&path);
+            Ok(())
+        })
+    }
+
+    async fn frename(&mut self, id: usize, path: &str, ctx: &CallerCtx) -> Result<usize> {
+        let caller = caller(ctx);
+
+        let src = self.vfs.entry_of_fd(id, caller).await?;
+
+        let dest_str = get_dest(self.scheme_name.as_ref(), path)?;
+        let dest = self.vfs.entry_at(id, &dest_str, caller).await?;
+
+        self.vfs.rename(src, dest, 0, caller).await?;
+
+        Ok(0)
+    }
+
+    async fn frenameat(
+        &mut self,
+        old_dir: usize,
+        old_path: &str,
+        new_dir: usize,
+        new_path: &str,
+        flags: u32,
+        ctx: &CallerCtx,
+    ) -> Result<usize> {
+        let caller = self.effective_caller(ctx.pid)?;
+
+        let old_path = self.at_path(old_path)?;
+        let new_path = self.at_path(new_path)?;
+
+        let src = self.vfs.entry_at(old_dir, &old_path, caller).await?;
+        let dest = self.vfs.entry_at(new_dir, &new_path, caller).await?;
+        self.vfs.rename(src, dest, flags, caller).await?;
+
+        Ok(0)
+    }
+
+    async fn fstat(&mut self, id: usize, stat: &mut Stat, _ctx: &CallerCtx) -> Result<()> {
+        let attrs = self.vfs.getattr(id).await?;
+
+        *stat = Stat {
+            // the device ID of the filesystem itself. we are the filesystem, so we just invent a unique id.
+            // if multiple instances of this filesystem are possible, an atomically incremented value is needed.
+            st_dev: 1,
+            st_ino: attrs.ino,
+            st_mode: attrs.mode as u16,
+
+            st_nlink: attrs.nlink,
+            st_uid: attrs.uid,
+            st_gid: attrs.gid,
+            st_size: attrs.size,
+            st_blksize: attrs.blksize,
+            st_blocks: attrs.blocks,
+
+            st_atime: attrs.atime,
+            st_atime_nsec: attrs.atimensec,
+            st_mtime: attrs.mtime,
+            st_mtime_nsec: attrs.mtimensec,
+            st_ctime: attrs.ctime,
+            st_ctime_nsec: attrs.ctimensec,
+        };
+
+        return Ok(());
+    }
+
+    async fn fstatvfs(&mut self, id: usize, stat: &mut StatVfs, _ctx: &CallerCtx) -> Result<()> {
+        let k = self.vfs.statfs(id).await?;
+        let bsize = if k.bsize != 0 { k.bsize } else { k.frsize };
+
+        *stat = StatVfs {
+            f_bsize: bsize,
+            f_blocks: k.blocks,
+            f_bfree: k.bfree,
+            f_bavail: k.bavail,
+        };
+
+        Ok(())
+    }
+
+    async fn fsync(&mut self, id: usize, _ctx: &CallerCtx) -> Result<()> {
+        self.vfs.fsync(id).await
+    }
+
+    async fn ftruncate(&mut self, id: usize, len: u64, _ctx: &CallerCtx) -> Result<()> {
+        self.vfs.ftruncate(id, len).await
+    }
+
+    async fn futimens(&mut self, id: usize, times: &[TimeSpec], ctx: &CallerCtx) -> Result<()> {
+        self.vfs.futimens(id, times, caller(ctx)).await
+    }
+
+    async fn call(
+        &mut self,
+        _id: usize,
+        _payload: &mut [u8],
+        _metadata: &[u64],
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    async fn std_fs_call(
+        &mut self,
+        _id: usize,
+        _kind: StdFsCallKind,
+        _payload: &mut [u8],
+        _metadata: StdFsCallMeta,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    async fn getdents<'buf>(
+        &mut self,
+        id: usize,
+        mut buf: DirentBuf<&'buf mut [u8]>,
+        opaque_offset: u64,
+    ) -> Result<DirentBuf<&'buf mut [u8]>> {
+        let payload = self.vfs.readdir(id, opaque_offset).await?;
+
+        for dir in payload.iter() {
+            let name = match str::from_utf8(dir.name) {
+                Ok(n) => n,
+                Err(err) => {
+                    warn!(
+                        "virtio-fsd: FUSE_READDIR: name is not valid to utf8: {}",
+                        err
+                    );
+                    return Err(Error::new(EBADMSG));
+                }
+            };
+            let kind = DirentKind::try_from_raw(dir.typ as u8).unwrap_or(DirentKind::Unspecified);
+
+            buf.entry(DirEntry {
+                inode: dir.ino,
+                next_opaque_id: dir.off,
+                name,
+                kind,
+            })?;
+        }
+        Ok(buf)
+    }
+
+    // Mapping file contents needs DAX, which we aren't doing yet.
+    async fn mmap_prep(
+        &mut self,
+        _id: usize,
+        _offset: u64,
+        _size: usize,
+        _flags: MapFlags,
+        _ctx: &CallerCtx,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    // Only needed once mmap_prep actually maps something.
+    async fn munmap(
+        &mut self,
+        _id: usize,
+        _offset: u64,
+        _size: usize,
+        _flags: MunmapFlags,
+        _ctx: &CallerCtx,
+    ) -> Result<()> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    async fn on_recvfd(&mut self, _recvfd_request: &RecvFdRequest) -> Result<OpenResult> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+}
+
+impl<T: FuseTransporter> VirtioFsScheme<T> {
+    fn effective_caller(&self, pid: usize) -> Result<Caller> {
+        let mut buf = [0u8; size_of::<ProcMeta>()];
+
+        get_proc_credentials(self.proc_creds.raw(), pid, &mut buf)
+            .map_err(|err| Error::new(err.errno()))?;
+
+        let proc_meta: &ProcMeta = Plain::from_bytes(&buf).map_err(|err| {
+            warn!("virtio-fsd: Plain failed to parse ProcMeta: {err:?}");
+            Error::new(EINVAL)
+        })?;
+
+        Ok(Caller {
+            uid: proc_meta.euid,
+            gid: proc_meta.egid,
+            pid: pid as u32,
+        })
+    }
+
+    fn at_path(&self, path: &str) -> Result<String> {
+        if path.starts_with('/') {
+            get_dest(self.scheme_name.as_ref(), path)
+        } else if path.is_empty() {
+            Err(Error::new(EINVAL))
+        } else {
+            Ok(path.to_owned())
+        }
+    }
+}
+
+// Helpers
+
+fn is_lock_op(op: &Op) -> bool {
+    let Op::StdFsCall(req) = op else {
+        return false;
+    };
+
+    matches!(
+        StdFsCallKind::try_from_raw(req.metadata()[0] as u8),
+        Some(StdFsCallKind::Lock | StdFsCallKind::Unlock | StdFsCallKind::GetLock)
+    )
+}
+
+fn caller(ctx: &CallerCtx) -> Caller {
+    Caller {
+        uid: ctx.uid,
+        gid: ctx.gid,
+        pid: ctx.pid as u32,
+    }
+}
+
+// Relibc `flink` and `frename` send path as `/scheme/<scheme_name>/…`
+fn get_dest(scheme: &str, path: &str) -> Result<String> {
+    if let Some(after) = path.strip_prefix("/scheme/") {
+        let (name, rest) = after.split_once('/').unwrap_or((after, ""));
+        if name != scheme {
+            return Err(Error::new(EXDEV));
+        }
+        if rest.is_empty() {
+            return Ok("/".to_owned());
+        }
+        return Ok(format!("/{rest}"));
+    }
+    if path.starts_with('/') {
+        Ok(path.to_owned())
+    } else {
+        Ok(format!("/{path}"))
+    }
+}

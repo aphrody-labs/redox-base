@@ -19,11 +19,21 @@ INITFS_DRIVERS_BINS = nvmed virtio-blkd virtio-gpud
 BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
 DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8139d rtl8168d \
 	usbctl usbhidd usbhubd usbscsid virtio-netd xhcid
+SELFTEST_DIRS := $(patsubst selftests/%/Cargo.toml,%,$(wildcard selftests/*/Cargo.toml))
+TEST_BINS := $(addsuffix -selftest,$(SELFTEST_DIRS))
 
 ifneq (,$(filter i586-unknown-redox i686-unknown-redox x86_64-unknown-redox,$(TARGET)))
     INITFS_BINS += ps2d
     INITFS_DRIVERS_BINS += ahcid ided
     DRIVERS_BINS += ac97d sb16d vboxd
+endif
+
+# FIXME fuse-abi's layout tests require structs containing a u64 to be 8-byte
+# aligned on every target, but on 32-bit x86 they are only 4-byte aligned, so
+# the crate fails to compile there. Remove this and add virtio-fsd directly to
+# DRIVERS_BINS once fuse-abi is fixed.
+ifeq (,$(filter i586-unknown-redox i686-unknown-redox,$(TARGET)))
+    DRIVERS_BINS += virtio-fsd
 endif
 
 ifeq ($(TARGET),aarch64-unknown-redox)
@@ -37,8 +47,9 @@ INITFS_CARGO_ARGS = $(foreach bin,$(INITFS_BINS),-p $(bin))
 INITFS_DRIVERS_CARGO_ARGS = $(foreach bin,$(INITFS_DRIVERS_BINS),-p $(bin))
 BASE_CARGO_ARGS = $(foreach bin,$(BASE_BINS),-p $(bin))
 DRIVERS_CARGO_ARGS = $(foreach bin,$(DRIVERS_BINS),-p $(bin))
+TEST_CARGO_ARGS = $(foreach bin,$(TEST_BINS),-p $(bin))
 
-.PHONY: all base install install-base test test-gui test-ipcd
+.PHONY: all base install install-base test test-gui test-ipcd selftests test-selftests test-virtio-fs
 
 all: base
 install: install-base
@@ -50,6 +61,27 @@ clean:
 test: all
 	$(MAKE) install
 	REDOXER_SYSROOT=$(DESTDIR) redoxer exec true
+
+test-selftests: all
+	$(MAKE) install
+	$(MAKE) selftests
+	@for bin in $(TEST_BINS); do \
+		cp -v "$(TARGET_DIR)/$$bin" "$(DESTDIR)/usr/bin"; \
+	done
+	@for d in $(SELFTEST_DIRS); do \
+		run="$(SRC_DIR)/selftests/$$d/scripts/redoxer-run.sh"; \
+		if [ -x "$$run" ]; then \
+			REDOXER_SYSROOT=$(DESTDIR) "$$run"; \
+		else \
+			env -u REDOXER_SYSROOT redoxer exec --folder "$(DESTDIR)/:/" $$d-selftest; \
+		fi; \
+	done
+
+test-virtio-fs: all
+	$(MAKE) install
+	$(MAKE) selftests
+	cp -v "$(TARGET_DIR)/virtio-fsd-selftest" "$(DESTDIR)/usr/bin"
+	REDOXER_SYSROOT=$(DESTDIR) $(SRC_DIR)/selftests/virtio-fsd/scripts/redoxer-run.sh
 
 # test with interactive gui
 test-gui: all
@@ -90,6 +122,14 @@ base:
 # Build bootstrap
 	cd "$(SRC_DIR)/bootstrap" && RUSTFLAGS= $(CARGO) rustc $(BUILD_FLAGS) \
 		-- -Ctarget-feature=+crt-static -Clinker="$(LINKER)"
+
+# Not part of the image. CI runs these under redoxer. the virtio-fsd-selftest
+# package is the opt-in build for a live system.
+selftests:
+	@mkdir -pv "$(BUILD_DIR)"
+		$(CARGO) build $(BUILD_FLAGS) \
+		--manifest-path "$(SRC_DIR)/Cargo.toml" \
+		$(TEST_CARGO_ARGS)
 
 install-base: base $(SYSROOT)/bin/redoxfs
 	@mkdir -pv "$(DESTDIR)/usr/bin" "$(DESTDIR)/usr/lib/drivers"

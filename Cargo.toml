@@ -66,10 +66,13 @@ members = [
     "drivers/storage/nvmed",
     "drivers/storage/usbscsid",
     "drivers/storage/virtio-blkd",
+    "drivers/storage/virtio-fsd",
 
     "drivers/usb/xhcid",
     "drivers/usb/usbctl",
     "drivers/usb/usbhubd",
+
+    "selftests/virtio-fsd",
 ]
 
 # Bootstrap needs it's own profile configuration
