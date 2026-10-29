@@ -38,7 +38,7 @@ INITFS_DRIVERS_CARGO_ARGS = $(foreach bin,$(INITFS_DRIVERS_BINS),-p $(bin))
 BASE_CARGO_ARGS = $(foreach bin,$(BASE_BINS),-p $(bin))
 DRIVERS_CARGO_ARGS = $(foreach bin,$(DRIVERS_BINS),-p $(bin))
 
-.PHONY: all base install install-base test
+.PHONY: all base install install-base test test-gui test-ipcd
 
 all: base
 install: install-base
@@ -55,6 +55,13 @@ test: all
 test-gui: all
 	$(MAKE) install
 	REDOXER_SYSROOT=$(DESTDIR) redoxer exec --gui ion
+
+# test the ipcd examples
+test-ipcd: all
+	$(MAKE) install
+	$(CARGO) build --target $(TARGET) -p ipcd --examples --target-dir $(BUILD_DIR)/ipcd
+	REDOXER_SYSROOT=$(DESTDIR) redoxer exec --folder $(SRC_DIR)/ipcd:/root --folder $(BUILD_DIR)/ipcd/$(TARGET)/debug:/root/target -- sh -- ipcd/redoxer.sh event main unnamed shm_demo
+	# FIXME: shm is currently broken
 
 clippy:
 	redoxer clippy

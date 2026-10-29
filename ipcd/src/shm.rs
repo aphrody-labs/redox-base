@@ -10,8 +10,7 @@ use syscall::data::Stat;
 use syscall::error::*;
 use syscall::schemev2::NewFdFlags;
 use syscall::{
-    Error, Map, MapFlags, MremapFlags, Result, StdFsCallKind, StdFsCallMeta, MAP_PRIVATE,
-    PAGE_SIZE, PROT_READ, PROT_WRITE,
+    Error, Map, MapFlags, MremapFlags, Result, MAP_PRIVATE, PAGE_SIZE, PROT_READ, PROT_WRITE,
 };
 
 enum Handle {

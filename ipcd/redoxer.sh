@@ -2,8 +2,8 @@
 
 set -e
 
-old_path="file:/bin/ipcd"
-new_path="target/x86_64-unknown-redox/debug/ipcd"
+old_path="/usr/bin/ipcd"
+new_path="target/debug/ipcd"
 if [ -e "${new_path}" ]
 then
     mv -v "${new_path}" "${old_path}"
@@ -16,5 +16,5 @@ do
     shift
 
     echo "# ${example} #"
-    "target/x86_64-unknown-redox/debug/examples/${example}"
+    "target/debug/examples/${example}"
 done

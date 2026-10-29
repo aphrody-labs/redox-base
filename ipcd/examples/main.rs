@@ -24,14 +24,14 @@ fn dup(file: &File, buf: &str) -> io::Result<File> {
 
 fn main() -> io::Result<()> {
     let mut buf = [0; 5];
-    let server = File::create("chan:hello_world")?;
+    let server = File::create("/scheme/chan/hello_world")?;
     {
         println!("Testing O_EXCL...");
         assert_eq!(
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open("chan:hello_world")
+                .open("/scheme/chan/hello_world")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
@@ -39,9 +39,9 @@ fn main() -> io::Result<()> {
 
         println!("Testing connecting...");
 
-        File::open("chan:hello_world")?; // closed connection will silently be skipped
-        let mut client = File::create("chan:hello_world")?; // O_CREAT without O_EXCL does nothing
-        let tmp = File::open("chan:hello_world")?; // multiple connections are handled
+        File::open("/scheme/chan/hello_world")?; // closed connection will silently be skipped
+        let mut client = File::create("/scheme/chan/hello_world")?; // O_CREAT without O_EXCL does nothing
+        let tmp = File::open("/scheme/chan/hello_world")?; // multiple connections are handled
 
         let mut stream = dup(&server, "listen")?;
         assert!(dup(&server, "listen").is_ok());
@@ -109,7 +109,7 @@ fn main() -> io::Result<()> {
 
     drop(client);
     {
-        let mut client = File::open("chan:hello_world")?;
+        let mut client = File::open("/scheme/chan/hello_world")?;
         nonblock(&client)?;
 
         assert_eq!(

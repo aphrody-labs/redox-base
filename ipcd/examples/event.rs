@@ -21,11 +21,11 @@ fn dup(file: &File, buf: &str) -> io::Result<File> {
 }
 
 fn main() -> io::Result<()> {
-    let server = File::create("chan:hello_world")?;
+    let server = File::create("/scheme/chan/hello_world")?;
 
     nonblock(&server)?;
 
-    let mut event_file = File::open("event:")?;
+    let mut event_file = File::open("/scheme/event")?;
     let mut time_file = File::open(format!("time:{}", syscall::CLOCK_MONOTONIC))?;
 
     let mut time = syscall::TimeSpec::default();
@@ -62,7 +62,7 @@ fn main() -> io::Result<()> {
     assert_eq!(event.flags, syscall::EVENT_READ);
     println!("-> Timed out");
 
-    let mut client = File::open("chan:hello_world")?;
+    let mut client = File::open("/scheme/chan/hello_world")?;
     event_file.write(&syscall::Event {
         id: client.as_raw_fd() as usize,
         flags: syscall::EVENT_WRITE | syscall::EVENT_READ,

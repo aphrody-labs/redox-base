@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
-use std::{io, mem, thread};
+use std::{io, thread};
 
 fn from_syscall_error(error: syscall::Error) -> io::Error {
     io::Error::from_raw_os_error(error.errno as i32)
 }
 fn main() -> Result<(), io::Error> {
-    let file = File::open("shm:counter")?;
+    let file = File::create("/scheme/shm/counter")?;
+    file.set_len(size_of::<usize>() as u64)?;
     println!("Reading from map... ");
     let counter = unsafe {
         &mut *(syscall::fmap(

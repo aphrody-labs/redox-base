@@ -6,8 +6,9 @@ fn from_syscall_error(error: syscall::Error) -> io::Error {
     io::Error::from_raw_os_error(error.errno as i32)
 }
 fn main() -> Result<(), io::Error> {
-    let file1 = File::open("shm:example")?;
-    let file2 = File::open("shm:example")?;
+    let file1 = File::create("/scheme/shm/example")?;
+    let file2 = File::open("/scheme/shm/example")?;
+    file1.set_len(128)?;
 
     let one = unsafe {
         slice::from_raw_parts_mut(
