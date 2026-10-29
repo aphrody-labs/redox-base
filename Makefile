@@ -18,7 +18,7 @@ INITFS_BINS = ipcd init logd ramfs randd udsd zerod \
 INITFS_DRIVERS_BINS = nvmed virtio-blkd virtio-gpud
 BASE_BINS = fbcond getty inputd pcid pcid-spawner redoxerd audiod dhcpd ptyd netstack nbdd
 DRIVERS_BINS = e1000d ihdad ihdgd ixgbed rtl8139d rtl8168d \
-	usbctl usbhidd usbhubd usbscsid virtio-netd xhcid virtio-fsd
+	usbctl usbhidd usbhubd usbscsid virtio-netd xhcid
 SELFTEST_DIRS := $(patsubst selftests/%/Cargo.toml,%,$(wildcard selftests/*/Cargo.toml))
 TEST_BINS := $(addsuffix -selftest,$(SELFTEST_DIRS))
 
@@ -26,6 +26,14 @@ ifneq (,$(filter i586-unknown-redox i686-unknown-redox x86_64-unknown-redox,$(TA
     INITFS_BINS += ps2d
     INITFS_DRIVERS_BINS += ahcid ided
     DRIVERS_BINS += ac97d sb16d vboxd
+endif
+
+# FIXME fuse-abi's layout tests require structs containing a u64 to be 8-byte
+# aligned on every target, but on 32-bit x86 they are only 4-byte aligned, so
+# the crate fails to compile there. Remove this and add virtio-fsd directly to
+# DRIVERS_BINS once fuse-abi is fixed.
+ifeq (,$(filter i586-unknown-redox i686-unknown-redox,$(TARGET)))
+    DRIVERS_BINS += virtio-fsd
 endif
 
 ifeq ($(TARGET),aarch64-unknown-redox)
