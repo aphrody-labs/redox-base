@@ -1,0 +1,8 @@
+[unit]
+description = "Unix domain sockets daemon"
+requires_weak = ["00_randd.service"]
+default_dependencies = false
+
+[service]
+cmd = "udsd"
+type = "notify"

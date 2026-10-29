@@ -12,8 +12,6 @@ redox-scheme.workspace = true
 scheme-utils = { path = "../scheme-utils" }
 redox_event.workspace = true
 anyhow.workspace = true
-libc.workspace = true
-rand = "0.10"
 
 [lints]
 workspace = true

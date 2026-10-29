@@ -15,11 +15,11 @@ use syscall::flag::*;
 use syscall::schemev2::NewFdFlags;
 use syscall::{Error, FobtainFdFlags};
 
-use super::scheme::{MsgFlags, UdsScheme};
-use super::{
+use crate::common::{
     get_uid_gid_from_pid, path_buf_to_str, read_msghdr_info, read_num, AncillaryData, Credential,
     DataPacket, MsgWriter, MAX_DGRAM_MSG_LEN, SOCK_MIN_SNDBUF,
 };
+use crate::scheme::{MsgFlags, UdsScheme};
 
 pub type UdsDgramScheme<'sock> = UdsScheme<'sock, Socket>;
 

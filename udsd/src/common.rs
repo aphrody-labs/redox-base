@@ -9,15 +9,11 @@ use rand::SeedableRng;
 use syscall::error::*;
 use syscall::Error;
 
-pub mod dgram;
-mod scheme;
-pub mod stream;
-
 // TODO: Remove this when Rust libc crate is updated to include SCM_CREDENTIALS
 const SCM_CREDENTIALS: i32 = 2;
 
-const MAX_DGRAM_MSG_LEN: usize = 65536;
-const MIN_RECV_MSG_LEN: usize = size_of::<usize>() * 2; // name_len, payload_len,
+pub(crate) const MAX_DGRAM_MSG_LEN: usize = 65536;
+pub(crate) const MIN_RECV_MSG_LEN: usize = size_of::<usize>() * 2; // name_len, payload_len,
 const CMSG_HEADER_LEN_IN_STREAM: usize = CMSG_LEVEL_SIZE + CMSG_TYPE_SIZE + CMSG_DATA_LEN_SIZE;
 const CMSG_LEVEL_SIZE: usize = size_of::<i32>();
 const CMSG_TYPE_SIZE: usize = size_of::<i32>();
@@ -28,28 +24,28 @@ const GID_SIZE: usize = size_of::<i32>();
 
 // The man7 pages say that the default is doubled and equal to 2048,
 // but the Linux kernel defines it this way plus alignments.
-const SOCK_MIN_SNDBUF: usize = 2048 * 2;
+pub(crate) const SOCK_MIN_SNDBUF: usize = 2048 * 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Credential {
+pub(crate) struct Credential {
     pid: i32,
     uid: i32,
     gid: i32,
 }
 impl Credential {
-    fn new(pid: i32, uid: i32, gid: i32) -> Self {
+    pub(crate) fn new(pid: i32, uid: i32, gid: i32) -> Self {
         Self { pid, uid, gid }
     }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct AncillaryData {
-    cred: Credential,
-    num_fds: usize,
-    name: Option<String>,
+pub(crate) struct AncillaryData {
+    pub(crate) cred: Credential,
+    pub(crate) num_fds: usize,
+    pub(crate) name: Option<String>,
 }
 impl AncillaryData {
-    fn new(cred: Credential, name: Option<String>) -> Self {
+    pub(crate) fn new(cred: Credential, name: Option<String>) -> Self {
         Self {
             cred,
             name,
@@ -88,16 +84,16 @@ impl AncillaryDataHeader {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct DataPacket {
-    payload: Vec<u8>,
-    ancillary_data: AncillaryData,
+pub(crate) struct DataPacket {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) ancillary_data: AncillaryData,
     // Only for stream packets
-    read_offset: usize,
-    ancillary_taken: bool,
+    pub(crate) read_offset: usize,
+    pub(crate) ancillary_taken: bool,
 }
 
 impl DataPacket {
-    fn new(payload: Vec<u8>, ancillary_data: AncillaryData) -> Self {
+    pub(crate) fn new(payload: Vec<u8>, ancillary_data: AncillaryData) -> Self {
         Self {
             payload,
             ancillary_data,
@@ -106,11 +102,15 @@ impl DataPacket {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.payload.len()
     }
 
-    fn from_stream(stream: &[u8], name: Option<String>, cred: Credential) -> Result<Self> {
+    pub(crate) fn from_stream(
+        stream: &[u8],
+        name: Option<String>,
+        cred: Credential,
+    ) -> Result<Self> {
         let mut cursor: usize = 0;
         let payload_len = read_num::<usize>(&stream[cursor..])?;
         cursor += size_of::<usize>();
@@ -155,7 +155,7 @@ impl DataPacket {
     }
 }
 
-trait NumFromBytes: Sized + Debug {
+pub(crate) trait NumFromBytes: Sized + Debug {
     fn from_le_bytes_slice(buffer: &[u8]) -> Result<Self, Error>;
 }
 
@@ -184,14 +184,14 @@ macro_rules! num_from_bytes_impl {
 
 num_from_bytes_impl!(i32, u32, u64, usize);
 
-fn read_num<T>(buffer: &[u8]) -> Result<T, Error>
+pub(crate) fn read_num<T>(buffer: &[u8]) -> Result<T, Error>
 where
     T: NumFromBytes,
 {
     T::from_le_bytes_slice(buffer)
 }
 
-fn get_uid_gid_from_pid(cap_fd: &Fd, target_pid: usize) -> Result<(u32, u32, u32)> {
+pub(crate) fn get_uid_gid_from_pid(cap_fd: &Fd, target_pid: usize) -> Result<(u32, u32, u32)> {
     let mut buffer = [0u8; core::mem::size_of::<ProcMeta>()];
     let _ = libredox::call::get_proc_credentials(cap_fd.raw(), target_pid, &mut buffer).map_err(
         |e| {
@@ -211,7 +211,7 @@ fn get_uid_gid_from_pid(cap_fd: &Fd, target_pid: usize) -> Result<(u32, u32, u32
     Ok((pid, uid, gid))
 }
 
-fn read_msghdr_info(stream: &mut [u8]) -> Result<(usize, usize, usize)> {
+pub(crate) fn read_msghdr_info(stream: &mut [u8]) -> Result<(usize, usize, usize)> {
     if stream.len() < size_of::<usize>() * 3 {
         eprintln!(
             "get_msghdr_info: stream buffer is too small to read headers. len: {}",
@@ -235,23 +235,23 @@ fn read_msghdr_info(stream: &mut [u8]) -> Result<(usize, usize, usize)> {
     ))
 }
 
-struct MsgWriter<'a> {
+pub(crate) struct MsgWriter<'a> {
     buffer: &'a mut [u8],
     written_len: usize,
 }
 impl<'a> MsgWriter<'a> {
-    fn new(buffer: &'a mut [u8]) -> Self {
+    pub(crate) fn new(buffer: &'a mut [u8]) -> Self {
         Self {
             buffer,
             written_len: 0,
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.written_len
     }
 
-    fn write_name(
+    pub(crate) fn write_name(
         &mut self,
         name: Option<String>,
         name_buf_size: usize,
@@ -285,7 +285,12 @@ impl<'a> MsgWriter<'a> {
         }
     }
 
-    fn write_payload(&mut self, payload: &[u8], full_len: usize, iov_size: usize) -> Result<usize> {
+    pub(crate) fn write_payload(
+        &mut self,
+        payload: &[u8],
+        full_len: usize,
+        iov_size: usize,
+    ) -> Result<usize> {
         let Some(payload_len_buffer) = self
             .buffer
             .get_mut(self.written_len..self.written_len + size_of::<usize>())
@@ -353,7 +358,7 @@ impl<'a> MsgWriter<'a> {
         true
     }
 
-    fn write_rights(&mut self, num_fds: usize) -> bool {
+    pub(crate) fn write_rights(&mut self, num_fds: usize) -> bool {
         let data = num_fds.to_le_bytes();
         if num_fds == 0 {
             return true;
@@ -361,7 +366,7 @@ impl<'a> MsgWriter<'a> {
         self.write_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, &data)
     }
 
-    fn write_credentials(&mut self, credential: &Credential) -> bool {
+    pub(crate) fn write_credentials(&mut self, credential: &Credential) -> bool {
         let mut data = [0u8; PID_SIZE + UID_SIZE + GID_SIZE];
         data[..PID_SIZE].copy_from_slice(&credential.pid.to_le_bytes());
         data[PID_SIZE..PID_SIZE + UID_SIZE].copy_from_slice(&credential.uid.to_le_bytes());
@@ -371,7 +376,7 @@ impl<'a> MsgWriter<'a> {
     }
 }
 
-fn path_buf_to_str(path_buf: &[u8]) -> Result<&str> {
+pub(crate) fn path_buf_to_str(path_buf: &[u8]) -> Result<&str> {
     match std::str::from_utf8(path_buf) {
         Ok("") => Err(Error::new(EINVAL)),
         Ok(s) => Ok(s),
@@ -379,7 +384,7 @@ fn path_buf_to_str(path_buf: &[u8]) -> Result<&str> {
     }
 }
 
-fn create_token_generator() -> SmallRng {
+pub(crate) fn create_token_generator() -> SmallRng {
     let mut seed = <SmallRng as SeedableRng>::Seed::default();
     if let Err(err) = getrandom(seed.as_mut()) {
         panic!("from_entropy failed: {}", err);
