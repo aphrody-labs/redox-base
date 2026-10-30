@@ -13,6 +13,7 @@ redox_syscall.workspace = true
 spin.workspace = true
 redox-rings.workspace = true
 
+audiod = { path = "../../../audiod" }
 common = { path = "../../common" }
 daemon = { path = "../../../daemon" }
 pcid = { path = "../../pcid" }

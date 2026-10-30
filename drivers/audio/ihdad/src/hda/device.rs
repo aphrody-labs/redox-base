@@ -6,6 +6,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::{str, thread};
 
+use audiod::{AudioChunk, HW_BUFFER_SIZE, NUM_SUB_BUFFS, SUB_BUFF_SIZE};
 use common::dma::Dma;
 use common::io::{Io, Mmio};
 use common::timeout::Timeout;
@@ -54,9 +55,6 @@ const IRV: u16 = 1 << 1;
 // CORB and RIRB offset
 
 const COMMAND_BUFFER_OFFSET: usize = 0x40;
-
-const NUM_SUB_BUFFS: usize = 32;
-const SUB_BUFF_SIZE: usize = 2048;
 
 enum Handle {
     Todo,
@@ -116,9 +114,6 @@ struct Regs {
     dplbase: Mmio<u32>, // 0x70
     dpubase: Mmio<u32>, // 0x74
 }
-
-const HW_BUFFER_SIZE: usize = 512;
-pub type AudioChunk = [(i16, i16); HW_BUFFER_SIZE];
 
 pub struct IntelHDA {
     vend_prod: u32,
@@ -994,22 +989,11 @@ impl IntelHDA {
             Err(_) => [(0, 0); HW_BUFFER_SIZE],
         };
 
-        let index = 0;
-        let output = self.get_output_stream_descriptor(index).unwrap();
-        let os = self.output_streams.get_mut(index).unwrap();
-
-        let open_block = (output.link_position() as usize) / os.block_size();
-        let current_block = os.current_block();
-
-        if current_block == (open_block + 3) % NUM_SUB_BUFFS {
-            return;
-        }
-
         let buf_ptr = chunk.as_ptr() as *const u8;
         let buf_len = size_of_val(&chunk);
         let buf = unsafe { std::slice::from_raw_parts(buf_ptr, buf_len) };
 
-        let _ = os.write_block(buf);
+        let _ = self.write_to_output(0, buf);
     }
 }
 
@@ -1105,7 +1089,7 @@ impl SchemeSync for IntelHDA {
                 let fd = shm_fd.raw();
 
                 let consumer =
-                    redox_rings::user::Consumer::<AudioChunk>::from_fd(shm_fd, true, None)?;
+                    redox_rings::user::Consumer::<AudioChunk>::from_fd(shm_fd, true, Some(2))?;
 
                 if self.consumer.is_some() {
                     return Err(Error::new(EEXIST));

@@ -1,3 +1,4 @@
+use audiod::{NUM_SUB_BUFFS, SUB_BUFF_SIZE};
 use common::dma::Dma;
 use common::io::{Io, Mmio, Pio};
 use redox_scheme::scheme::SchemeSync;
@@ -7,9 +8,6 @@ use spin::Mutex;
 use syscall::error::{Error, Result, EACCES, EBADF, EINVAL, ENOENT};
 use syscall::schemev2::NewFdFlags;
 use syscall::EWOULDBLOCK;
-
-const NUM_SUB_BUFFS: usize = 32;
-const SUB_BUFF_SIZE: usize = 2048;
 
 enum Handle {
     Todo,

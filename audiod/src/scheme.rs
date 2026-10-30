@@ -2,16 +2,12 @@ use std::collections::VecDeque;
 use std::str;
 use std::sync::{Arc, Mutex};
 
+use audiod::{AudioChunk, HANDLE_BUFFER_SIZE, HW_BUFFER_SIZE};
 use redox_scheme::scheme::SchemeSync;
 use redox_scheme::{CallerCtx, OpenResult};
 use scheme_utils::HandleMap;
 use syscall::error::{Error, Result, EACCES, EBADF, EINVAL, ENOENT, EWOULDBLOCK};
 use syscall::schemev2::NewFdFlags;
-
-// The strict buffer size of the audiohw: driver
-const HW_BUFFER_SIZE: usize = 512;
-// The desired buffer size of each handle
-const HANDLE_BUFFER_SIZE: usize = 4096;
 
 enum Handle {
     Audio { buffer: VecDeque<(i16, i16)> },
@@ -20,8 +16,6 @@ enum Handle {
     Volume,
     SchemeRoot,
 }
-
-pub type AudioChunk = [(i16, i16); HW_BUFFER_SIZE];
 
 pub struct AudioSchemeInner {
     handles: HandleMap<Handle>,

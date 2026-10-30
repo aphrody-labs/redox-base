@@ -6,6 +6,7 @@ version = 4
 name = "ac97d"
 version = "0.1.0"
 dependencies = [
+ "audiod",
  "common",
  "daemon",
  "libredox 0.2.0",
@@ -1228,6 +1229,7 @@ dependencies = [
 name = "ihdad"
 version = "0.1.0"
 dependencies = [
+ "audiod",
  "bitflags 2.13.1",
  "common",
  "daemon",

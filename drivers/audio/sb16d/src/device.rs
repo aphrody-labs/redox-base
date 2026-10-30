@@ -8,9 +8,6 @@ use spin::Mutex;
 use syscall::error::{Error, Result, EACCES, EBADF, ENODEV};
 use syscall::schemev2::NewFdFlags;
 
-const NUM_SUB_BUFFS: usize = 32;
-const SUB_BUFF_SIZE: usize = 2048;
-
 enum Handle {
     Todo,
     SchemeRoot,

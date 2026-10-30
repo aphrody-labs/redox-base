@@ -12,6 +12,7 @@ redox_event.workspace = true
 redox_syscall.workspace = true
 spin.workspace = true
 
+audiod = { path = "../../../audiod" }
 daemon = { path = "../../../daemon" }
 pcid = { path = "../../pcid" }
 redox-scheme.workspace = true

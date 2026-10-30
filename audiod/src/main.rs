@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::{process, thread};
 
 use anyhow::Context;
+use audiod::AudioChunk;
 use daemon::SchemeDaemon;
 use ioslice::IoSlice;
 use libredox::error::Result;
@@ -12,7 +13,7 @@ use libredox::{flag, Fd};
 use redox_scheme::Socket;
 use scheme_utils::ReadinessBased;
 
-use self::scheme::{AudioChunk, AudioScheme, AudioSchemeInner};
+use self::scheme::{AudioScheme, AudioSchemeInner};
 
 mod scheme;
 
@@ -34,7 +35,7 @@ fn uring_thread(inner_mutex: Arc<Mutex<AudioSchemeInner>>, pid: usize, shm_fd: F
                     break;
                 }
                 Err(_) => {
-                    thread::sleep(std::time::Duration::from_millis(1));
+                    thread::sleep(std::time::Duration::from_micros(100));
                 }
             }
         }
