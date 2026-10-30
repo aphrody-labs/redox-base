@@ -457,7 +457,7 @@ impl Socket {
 
     fn get_connected_peer(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
     ) -> Result<(usize, Rc<RefCell<Socket>>), Error> {
         let mut socket = socket.borrow_mut();
 
@@ -533,7 +533,7 @@ impl super::scheme::Socket for Socket {
 
     fn handle_connect(
         scheme: &UdsScheme<Self>,
-        client_rc: &Rc<RefCell<Self>>,
+        client_rc: &RefCell<Self>,
         token_buf: &[u8],
     ) -> Result<usize> {
         let token = read_num::<u64>(token_buf)?;
@@ -590,20 +590,14 @@ impl super::scheme::Socket for Socket {
         connecting_res
     }
 
-    fn handle_setsockopt(
-        socket_rc: &Rc<RefCell<Self>>,
-        option: i32,
-        value_slice: &[u8],
-    ) -> Result<usize> {
-        let mut socket = socket_rc.borrow_mut();
-
+    fn handle_setsockopt(&mut self, option: i32, value_slice: &[u8]) -> Result<usize> {
         match option {
             libc::SO_PASSCRED => {
                 let value = read_num::<i32>(value_slice)?;
                 if value != 0 {
-                    socket.options.insert(libc::SO_PASSCRED);
+                    self.options.insert(libc::SO_PASSCRED);
                 } else {
-                    socket.options.remove(&libc::SO_PASSCRED);
+                    self.options.remove(&libc::SO_PASSCRED);
                 }
                 Ok(value_slice.len())
             }
@@ -614,7 +608,7 @@ impl super::scheme::Socket for Socket {
             _ => {
                 eprintln!(
                     "socket_setsockopt(id: {}): Unsupported option: {}",
-                    socket.primary_id, option
+                    self.primary_id, option
                 );
                 Err(Error::new(ENOPROTOOPT))
             }
@@ -623,7 +617,7 @@ impl super::scheme::Socket for Socket {
 
     fn handle_getsockopt(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         option: i32,
         payload: &mut [u8],
     ) -> Result<usize> {
@@ -748,39 +742,20 @@ impl super::scheme::Socket for Socket {
         Self::recvmsg_inner(&mut socket, scheme, msg_flags, msg_stream)
     }
 
-    fn handle_unbind(socket_rc: &Rc<RefCell<Self>>) -> Result<usize> {
-        let mut socket = socket_rc.borrow_mut();
-
-        if socket.state != State::Bound {
+    fn handle_unbind(&mut self) -> Result<usize> {
+        if self.state != State::Bound {
             return Err(Error::new(EINVAL));
         }
 
-        socket.state = State::Unbound;
-        socket.path = None;
+        self.state = State::Unbound;
+        self.path = None;
 
         Ok(0)
     }
 
-    fn handle_get_token(socket_rc: &Rc<RefCell<Self>>, payload: &mut [u8]) -> Result<usize> {
-        let Some(token) = socket_rc.borrow().issued_token else {
-            return Err(Error::new(EINVAL));
-        };
-        let token_bytes = token.to_le_bytes();
-        let token_bytes_len = token_bytes.len();
-        if payload.len() < token_bytes_len {
-            eprintln!(
-                "handle_get_token(id: {}): Payload buffer is too small for token.",
-                socket_rc.borrow().primary_id
-            );
-            return Err(Error::new(ENOBUFS));
-        }
-        payload[..token_bytes_len].copy_from_slice(&token_bytes);
-        Ok(token_bytes_len)
-    }
-
     fn handle_get_peer_name(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         payload: &mut [u8],
     ) -> Result<usize> {
         let (_, socket_rc) = Socket::get_connected_peer(scheme, socket)?;
@@ -879,7 +854,7 @@ impl super::scheme::Socket for Socket {
 
     fn write_inner(
         scheme: &UdsScheme<Self>,
-        sender: &Rc<RefCell<Self>>,
+        sender: &RefCell<Self>,
         buf: &[u8],
         ctx: &CallerCtx,
     ) -> Result<usize> {
@@ -914,7 +889,7 @@ impl super::scheme::Socket for Socket {
 
     fn sendfd_inner(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         sendfd_request: &SendFdRequest,
     ) -> Result<usize> {
         let (receiver_id, receiver_rc) = Self::get_connected_peer(scheme, socket)?;
@@ -943,7 +918,7 @@ impl super::scheme::Socket for Socket {
 
     fn recvfd_inner(
         scheme: &UdsScheme<Self>,
-        socket_rc: &Rc<RefCell<Self>>,
+        socket_rc: &RefCell<Self>,
         recvfd_request: &RecvFdRequest,
     ) -> Result<OpenResult> {
         let mut socket = socket_rc.borrow_mut();
@@ -983,11 +958,10 @@ impl super::scheme::Socket for Socket {
         }
     }
 
-    fn read_inner(socket_rc: &Rc<RefCell<Self>>, buf: &mut [u8], flags: u32) -> Result<usize> {
-        let mut socket = socket_rc.borrow_mut();
-        let connection = match socket.state {
+    fn read_inner(&mut self, buf: &mut [u8], flags: u32) -> Result<usize> {
+        let connection = match self.state {
             State::Established | State::Accepted | State::Connecting => {
-                socket.require_connected_connection(MsgFlags::default())?
+                self.require_connected_connection(MsgFlags::default())?
             }
             State::Closed => return Ok(0),
             State::Listening => return Err(Error::new(EOPNOTSUPP)),
@@ -1065,6 +1039,10 @@ impl super::scheme::Socket for Socket {
 
     fn set_flags(&mut self, flags: usize) {
         self.flags = flags;
+    }
+
+    fn issued_token(&self) -> Option<u64> {
+        self.issued_token
     }
 }
 

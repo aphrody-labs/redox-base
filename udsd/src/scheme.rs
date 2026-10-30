@@ -53,18 +53,14 @@ pub trait Socket: Sized {
     /// After these three phases, the socket connection is considered established.
     fn handle_connect(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         token_buf: &[u8],
     ) -> Result<usize>;
 
-    fn handle_setsockopt(
-        socket: &Rc<RefCell<Self>>,
-        option: i32,
-        value_slice: &[u8],
-    ) -> Result<usize>;
+    fn handle_setsockopt(&mut self, option: i32, value_slice: &[u8]) -> Result<usize>;
     fn handle_getsockopt(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         option: i32,
         payload: &mut [u8],
     ) -> Result<usize>;
@@ -83,13 +79,11 @@ pub trait Socket: Sized {
         msg_stream: &mut [u8],
     ) -> Result<usize>;
 
-    fn handle_unbind(socket: &Rc<RefCell<Self>>) -> Result<usize>;
-
-    fn handle_get_token(socket: &Rc<RefCell<Self>>, payload: &mut [u8]) -> Result<usize>;
+    fn handle_unbind(&mut self) -> Result<usize>;
 
     fn handle_get_peer_name(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         payload: &mut [u8],
     ) -> Result<usize>;
     /// Handle a `dup` call for `b"listen"`.
@@ -109,21 +103,21 @@ pub trait Socket: Sized {
 
     fn write_inner(
         scheme: &UdsScheme<Self>,
-        sender: &Rc<RefCell<Self>>,
+        sender: &RefCell<Self>,
         buf: &[u8],
         ctx: &CallerCtx,
     ) -> Result<usize>;
     fn sendfd_inner(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         sendfd_request: &SendFdRequest,
     ) -> Result<usize>;
     fn recvfd_inner(
         scheme: &UdsScheme<Self>,
-        socket: &Rc<RefCell<Self>>,
+        socket: &RefCell<Self>,
         recvfd_request: &RecvFdRequest,
     ) -> Result<OpenResult>;
-    fn read_inner(socket: &Rc<RefCell<Self>>, buf: &mut [u8], flags: u32) -> Result<usize>;
+    fn read_inner(&mut self, buf: &mut [u8], flags: u32) -> Result<usize>;
 
     fn handle_closure(scheme: &mut UdsScheme<Self>, id: usize, socket_rc: Rc<RefCell<Self>>);
 
@@ -131,6 +125,7 @@ pub trait Socket: Sized {
     fn events(&self) -> EventFlags;
     fn get_flags(&self) -> usize;
     fn set_flags(&mut self, flags: usize);
+    fn issued_token(&self) -> Option<u64>;
 }
 
 enum Handle<S: Socket> {
@@ -289,11 +284,9 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
         match verb {
             SocketCall::Bind => S::handle_bind(self, id, &payload),
             SocketCall::Connect => S::handle_connect(self, self.get_socket(id)?, &payload),
-            SocketCall::SetSockOpt => S::handle_setsockopt(
-                socket,
-                *metadata.get(1).ok_or(Error::new(EINVAL))? as i32,
-                &payload,
-            ),
+            SocketCall::SetSockOpt => socket
+                .borrow_mut()
+                .handle_setsockopt(*metadata.get(1).ok_or(Error::new(EINVAL))? as i32, &payload),
             SocketCall::GetSockOpt => S::handle_getsockopt(
                 self,
                 socket,
@@ -319,8 +312,20 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
                     .unwrap_or_default(),
                 payload,
             ),
-            SocketCall::Unbind => S::handle_unbind(socket),
-            SocketCall::GetToken => S::handle_get_token(socket, payload),
+            SocketCall::Unbind => socket.borrow_mut().handle_unbind(),
+            SocketCall::GetToken => {
+                let Some(token) = socket.borrow().issued_token() else {
+                    return Err(Error::new(EINVAL));
+                };
+                let token_bytes = token.to_le_bytes();
+                let token_bytes_len = token_bytes.len();
+                if payload.len() < token_bytes_len {
+                    eprintln!("handle_get_token(id: {id}): Payload buffer is too small for token.",);
+                    return Err(Error::new(ENOBUFS));
+                }
+                payload[..token_bytes_len].copy_from_slice(&token_bytes);
+                Ok(token_bytes_len)
+            }
             SocketCall::GetPeerName => S::handle_get_peer_name(self, socket, payload),
             _ => Err(Error::new(EOPNOTSUPP)),
         }
@@ -371,7 +376,7 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
         flags: u32,
         _ctx: &CallerCtx,
     ) -> Result<usize> {
-        S::read_inner(self.get_socket(id)?, buf, flags)
+        self.get_socket(id)?.borrow_mut().read_inner(buf, flags)
     }
 
     fn on_close(&mut self, id: usize) {
