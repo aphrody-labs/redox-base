@@ -258,29 +258,12 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_connect(
-        scheme: &UdsScheme<Self>,
+        _scheme: &UdsScheme<Self>,
         socket_rc: &RefCell<Self>,
-        token_buf: &[u8],
+        target_rc: &RefCell<Self>,
     ) -> Result<usize> {
-        let token = read_num::<u64>(token_buf)?;
-        {
-            let target_rc = scheme
-                .socket_tokens
-                .get(&token)
-                .ok_or(Error::new(ECONNREFUSED))?;
-            let target_socket_token = target_rc
-                .borrow()
-                .issued_token
-                .ok_or(Error::new(ECONNREFUSED))?;
-            if target_socket_token != token {
-                return Err(Error::new(EACCES));
-            }
-
-            let target_id = target_rc.borrow().primary_id;
-
-            socket_rc.borrow_mut().peer = Some(target_id);
-        }
-
+        let target_id = target_rc.borrow().primary_id;
+        socket_rc.borrow_mut().peer = Some(target_id);
         Ok(0)
     }
 

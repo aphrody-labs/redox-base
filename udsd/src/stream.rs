@@ -534,16 +534,9 @@ impl super::scheme::Socket for Socket {
     fn handle_connect(
         scheme: &UdsScheme<Self>,
         client_rc: &RefCell<Self>,
-        token_buf: &[u8],
+        listener_rc: &RefCell<Self>,
     ) -> Result<usize> {
-        let token = read_num::<u64>(token_buf)?;
         let (listener_id, connecting_res) = {
-            let listener_rc = scheme
-                .socket_tokens
-                .get(&token)
-                .ok_or_else(|| Error::new(ECONNREFUSED))?
-                .clone();
-
             let mut client = client_rc.borrow_mut();
 
             // Phase 1: listener is bound but not yet listening

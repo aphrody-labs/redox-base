@@ -16,7 +16,7 @@ use syscall::flag::*;
 use syscall::schemev2::NewFdFlags;
 use syscall::{Error, Stat};
 
-use crate::common::create_token_generator;
+use crate::common::{create_token_generator, read_num};
 
 #[derive(Clone, Copy, Default)]
 pub struct MsgFlags(libc::c_int);
@@ -54,7 +54,7 @@ pub trait Socket: Sized {
     fn handle_connect(
         scheme: &UdsScheme<Self>,
         socket: &RefCell<Self>,
-        token_buf: &[u8],
+        target_socket: &RefCell<Self>,
     ) -> Result<usize>;
 
     fn handle_setsockopt(&mut self, option: i32, value_slice: &[u8]) -> Result<usize>;
@@ -283,7 +283,23 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
         let socket = self.get_socket(id)?;
         match verb {
             SocketCall::Bind => S::handle_bind(self, id, &payload),
-            SocketCall::Connect => S::handle_connect(self, self.get_socket(id)?, &payload),
+            SocketCall::Connect => {
+                let token = read_num::<u64>(payload)?;
+
+                let target_rc = self
+                    .socket_tokens
+                    .get(&token)
+                    .ok_or(Error::new(ECONNREFUSED))?;
+                let target_socket_token = target_rc
+                    .borrow()
+                    .issued_token()
+                    .ok_or(Error::new(ECONNREFUSED))?;
+                if target_socket_token != token {
+                    return Err(Error::new(EACCES));
+                }
+
+                S::handle_connect(self, self.get_socket(id)?, target_rc)
+            }
             SocketCall::SetSockOpt => socket
                 .borrow_mut()
                 .handle_setsockopt(*metadata.get(1).ok_or(Error::new(EINVAL))? as i32, &payload),
