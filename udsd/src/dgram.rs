@@ -123,21 +123,24 @@ impl DataPacket {
 impl Socket {
     fn get_connected_peer(
         scheme: &UdsScheme<Self>,
-        id: usize,
+        socket: &RefCell<Self>,
     ) -> Result<(usize, Rc<RefCell<Socket>>), Error> {
-        let socket = scheme.get_socket(id)?.borrow();
+        let socket = socket.borrow();
 
         let remote_id = socket.peer.ok_or(Error::new(ENOTCONN))?;
 
         let remote_rc = scheme.get_socket(remote_id).map_err(|e| {
-            eprintln!("get_connected_peer(id: {}): Peer socket (id: {}) has vanished. Original error: {:?}", id, remote_id, e);
+            eprintln!(
+                "get_connected_peer(id: {}): Peer socket (id: {}) has vanished. Original error: {:?}",
+                socket.primary_id, remote_id, e
+            );
             Error::new(EPIPE)
         })?;
 
         if remote_rc.borrow().state == State::Closed {
             eprintln!(
                 "get_connected_peer(id: {}): Attempted to interact with a closed peer (id: {}).",
-                id, remote_id
+                socket.primary_id, remote_id
             );
             return Err(Error::new(ECONNREFUSED));
         }
@@ -254,46 +257,24 @@ impl super::scheme::Socket for Socket {
         Ok(0)
     }
 
-    fn handle_connect(scheme: &mut UdsScheme<Self>, id: usize, token_buf: &[u8]) -> Result<usize> {
-        let token = read_num::<u64>(token_buf)?;
-        {
-            let target_rc = scheme
-                .socket_tokens
-                .get(&token)
-                .ok_or(Error::new(ECONNREFUSED))?;
-            let target_socket_token = target_rc
-                .borrow()
-                .issued_token
-                .ok_or(Error::new(ECONNREFUSED))?;
-            if target_socket_token != token {
-                return Err(Error::new(EACCES));
-            }
-
-            let target_id = target_rc.borrow().primary_id;
-
-            let socket_rc = scheme.get_socket(id)?;
-            socket_rc.borrow_mut().peer = Some(target_id);
-        }
-
+    fn handle_connect(
+        _scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
+        target_rc: &RefCell<Self>,
+    ) -> Result<usize> {
+        let target_id = target_rc.borrow().primary_id;
+        socket_rc.borrow_mut().peer = Some(target_id);
         Ok(0)
     }
 
-    fn handle_setsockopt(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
-        option: i32,
-        value_slice: &[u8],
-    ) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
-        let mut socket = socket_rc.borrow_mut();
-
+    fn handle_setsockopt(&mut self, option: i32, value_slice: &[u8]) -> Result<usize> {
         match option {
             SO_PASSCRED => {
                 let value = read_num::<i32>(value_slice)?;
                 if value != 0 {
-                    socket.options.insert(SO_PASSCRED);
+                    self.options.insert(SO_PASSCRED);
                 } else {
-                    socket.options.remove(&SO_PASSCRED);
+                    self.options.remove(&SO_PASSCRED);
                 }
                 Ok(value_slice.len())
             }
@@ -302,13 +283,13 @@ impl super::scheme::Socket for Socket {
                 let value = value.try_into().unwrap_or(usize::MAX);
                 // TODO: Select min between the value and wmem_max when it's there.
                 let value = cmp::min(value, SOCK_MIN_SNDBUF);
-                socket.snd_buf_size = value;
+                self.snd_buf_size = value;
                 Ok(0)
             }
             _ => {
                 eprintln!(
                     "handle_setsockopt(id: {}): Unsupported option: {}",
-                    id, option
+                    self.primary_id, option
                 );
                 Err(Error::new(ENOPROTOOPT))
             }
@@ -316,8 +297,8 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_getsockopt(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        _scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         option: i32,
         payload: &mut [u8],
     ) -> Result<usize> {
@@ -327,7 +308,7 @@ impl super::scheme::Socket for Socket {
                 if payload.len() < size_of::<i32>() {
                     eprintln!(
                         "handle_getsockopt(id: {}): SO_DOMAIN payload buffer is too small. len: {}",
-                        id,
+                        socket_rc.borrow().primary_id,
                         payload.len()
                     );
                     return Err(Error::new(ENOBUFS));
@@ -341,18 +322,17 @@ impl super::scheme::Socket for Socket {
                 if payload.len() < size_of::<i32>() {
                     eprintln!(
                         "handle_getsockopt(id: {}): SO_SNDBUF payload buffer is too small. len: {}",
-                        id,
+                        socket_rc.borrow().primary_id,
                         payload.len()
                     );
                     return Err(Error::new(ENOBUFS));
                 }
 
-                let socket_rc = scheme.get_socket(id)?;
                 let socket = socket_rc.borrow();
                 let sndbuf: i32 = socket.snd_buf_size.try_into().unwrap_or_else(|_| {
                     eprintln!(
                         "handle_getsockopt(id: {}): SO_SNDBUF value overflows the payload buffer.",
-                        id,
+                        socket.primary_id,
                     );
                     return i32::MAX;
                 });
@@ -363,7 +343,8 @@ impl super::scheme::Socket for Socket {
             _ => {
                 eprintln!(
                     "handle_getsockopt(id: {}): Unsupported option: {}",
-                    id, option
+                    socket_rc.borrow().primary_id,
+                    option
                 );
                 Err(Error::new(ENOPROTOOPT))
             }
@@ -371,23 +352,22 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_sendmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         _msg_flags: MsgFlags,
         msg_stream: &[u8],
         ctx: &CallerCtx,
     ) -> Result<usize> {
         if msg_stream.is_empty() {
-            eprintln!("handle_sendmsg(id: {}): msg_stream is empty.", id);
+            eprintln!(
+                "handle_sendmsg(id: {}): msg_stream is empty.",
+                socket_rc.borrow().primary_id
+            );
             return Err(Error::new(EINVAL));
         }
 
-        let name = {
-            let socket_rc = scheme.get_socket(id)?;
-            let socket = socket_rc.borrow();
-            socket.path.clone()
-        };
-        let (remote_id, remote_rc) = Self::get_connected_peer(scheme, id)?;
+        let name = socket_rc.borrow().path.clone();
+        let (remote_id, remote_rc) = Self::get_connected_peer(scheme, socket_rc)?;
 
         let bytes_written = Self::sendmsg_inner(
             &scheme.proc_creds_capability,
@@ -401,12 +381,11 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_recvmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         _msg_flags: MsgFlags,
         msg_stream: &mut [u8],
     ) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
         let mut socket = socket_rc.borrow_mut();
 
         if let Some(message) = socket.messages.pop_front() {
@@ -423,46 +402,25 @@ impl super::scheme::Socket for Socket {
         }
     }
 
-    fn handle_unbind(scheme: &mut UdsScheme<Self>, id: usize) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
-        let mut socket = socket_rc.borrow_mut();
-
-        if socket.state != State::Bound {
+    fn handle_unbind(&mut self) -> Result<usize> {
+        if self.state != State::Bound {
             return Err(Error::new(EINVAL));
         }
 
-        socket.state = State::Unbound;
-        socket.path = None;
+        self.state = State::Unbound;
+        self.path = None;
 
         Ok(0)
     }
 
-    fn handle_get_token(scheme: &UdsScheme<Self>, id: usize, payload: &mut [u8]) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
-        let Some(token) = socket_rc.borrow().issued_token else {
-            return Err(Error::new(EINVAL));
-        };
-        let token_bytes = token.to_le_bytes();
-        let token_bytes_len = token_bytes.len();
-        if payload.len() < token_bytes_len {
-            eprintln!(
-                "handle_get_token(id: {}): Payload buffer is too small for token.",
-                id
-            );
-            return Err(Error::new(ENOBUFS));
-        }
-        payload[..token_bytes_len].copy_from_slice(&token_bytes);
-        return Ok(token_bytes_len);
-    }
-
     fn handle_get_peer_name(
         scheme: &UdsScheme<Self>,
-        id: usize,
+        socket: &RefCell<Self>,
         payload: &mut [u8],
     ) -> Result<usize> {
-        let (_, socket_rc) = Self::get_connected_peer(scheme, id)?;
-        let socket_borrow = socket_rc.borrow();
-        match socket_borrow.path.as_ref() {
+        let (_, peer_socket) = Self::get_connected_peer(scheme, socket)?;
+        let peer_borrow = peer_socket.borrow();
+        match peer_borrow.path.as_ref() {
             Some(path_string) => scheme.fpath_inner(path_string, payload),
             None => {
                 let empty_path = "".to_string();
@@ -529,17 +487,15 @@ impl super::scheme::Socket for Socket {
         })
     }
 
-    fn handle_recvfd(scheme: &mut UdsScheme<Self>, id: usize) -> Result<OpenResult> {
-        let socket_rc = scheme.get_socket(id)?;
-        let mut socket = socket_rc.borrow_mut();
-        let fd = socket.fds.pop_front().ok_or(Error::new(EWOULDBLOCK))?;
+    fn handle_recvfd(&mut self) -> Result<OpenResult> {
+        let fd = self.fds.pop_front().ok_or(Error::new(EWOULDBLOCK))?;
 
         Ok(OpenResult::OtherScheme { fd })
     }
 
     fn write_inner(
-        scheme: &mut UdsScheme<Self>,
-        sender_id: usize,
+        scheme: &UdsScheme<Self>,
+        sender_rc: &RefCell<Self>,
         buf: &[u8],
         ctx: &CallerCtx,
     ) -> Result<usize> {
@@ -548,8 +504,7 @@ impl super::scheme::Socket for Socket {
         }
 
         let name = {
-            let socket_rc = scheme.get_socket(sender_id)?;
-            let socket = socket_rc.borrow();
+            let socket = sender_rc.borrow();
             if matches!(socket.state, State::Closed) {
                 return Err(Error::new(EPIPE));
             }
@@ -558,7 +513,7 @@ impl super::scheme::Socket for Socket {
         };
 
         // Assume writing to the connected socket if the given id is the primary id
-        let (remote_id, remote_rc) = Self::get_connected_peer(scheme, sender_id)?;
+        let (remote_id, remote_rc) = Self::get_connected_peer(scheme, sender_rc)?;
         let mut remote = remote_rc.borrow_mut();
         let message = DataPacket::new(
             buf.to_vec(),
@@ -574,7 +529,11 @@ impl super::scheme::Socket for Socket {
         Ok(buf.len())
     }
 
-    fn sendfd_inner(scheme: &mut UdsScheme<Self>, sendfd_request: &SendFdRequest) -> Result<usize> {
+    fn sendfd_inner(
+        scheme: &UdsScheme<Self>,
+        socket: &RefCell<Self>,
+        sendfd_request: &SendFdRequest,
+    ) -> Result<usize> {
         if sendfd_request.num_fds() == 0 {
             return Ok(0);
         }
@@ -586,8 +545,7 @@ impl super::scheme::Socket for Socket {
             eprintln!("sendfd_inner: obtain_fd failed with error: {:?}", e);
             return Err(e);
         }
-        let socket_id = sendfd_request.id();
-        let (remote_id, remote_rc) = Self::get_connected_peer(scheme, socket_id)?;
+        let (remote_id, remote_rc) = Self::get_connected_peer(scheme, socket)?;
         {
             let mut remote = remote_rc.borrow_mut();
             for new_fd in &new_fds {
@@ -600,15 +558,14 @@ impl super::scheme::Socket for Socket {
     }
 
     fn recvfd_inner(
-        scheme: &mut UdsScheme<Self>,
+        scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         recvfd_request: &RecvFdRequest,
     ) -> Result<OpenResult> {
         if recvfd_request.num_fds() == 0 {
             return Ok(OpenResult::OtherSchemeMultiple { num_fds: 0 });
         }
 
-        let socket_id = recvfd_request.id();
-        let socket_rc = scheme.get_socket(socket_id)?;
         let mut socket = socket_rc.borrow_mut();
 
         if socket.fds.len() < recvfd_request.num_fds() {
@@ -630,16 +587,8 @@ impl super::scheme::Socket for Socket {
         })
     }
 
-    fn read_inner(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
-        buf: &mut [u8],
-        flags: u32,
-    ) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
-        let mut socket = socket_rc.borrow_mut();
-
-        if let Some(message) = socket.messages.pop_front() {
+    fn read_inner(&mut self, buf: &mut [u8], flags: u32) -> Result<usize> {
+        if let Some(message) = self.messages.pop_front() {
             let full_len = message.len();
             let copy_len = cmp::min(buf.len(), full_len);
             buf[..copy_len].copy_from_slice(&message.payload[..copy_len]);
@@ -679,5 +628,9 @@ impl super::scheme::Socket for Socket {
 
     fn set_flags(&mut self, flags: usize) {
         self.flags = flags;
+    }
+
+    fn issued_token(&self) -> Option<u64> {
+        self.issued_token
     }
 }
