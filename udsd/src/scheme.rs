@@ -66,15 +66,15 @@ pub trait Socket: Sized {
     ) -> Result<usize>;
 
     fn handle_sendmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket: &RefCell<Self>,
         msg_flags: MsgFlags,
         msg_stream: &[u8],
         ctx: &CallerCtx,
     ) -> Result<usize>;
     fn handle_recvmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket: &RefCell<Self>,
         msg_flags: MsgFlags,
         msg_stream: &mut [u8],
     ) -> Result<usize>;
@@ -99,7 +99,7 @@ pub trait Socket: Sized {
         id: usize,
         ctx: &CallerCtx,
     ) -> Result<OpenResult>;
-    fn handle_recvfd(scheme: &mut UdsScheme<Self>, id: usize) -> Result<OpenResult>;
+    fn handle_recvfd(&mut self) -> Result<OpenResult>;
 
     fn write_inner(
         scheme: &UdsScheme<Self>,
@@ -311,7 +311,7 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
             ),
             SocketCall::SendMsg => S::handle_sendmsg(
                 self,
-                id,
+                socket,
                 metadata
                     .get(1)
                     .map(|x| MsgFlags(*x as _))
@@ -321,7 +321,7 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
             ),
             SocketCall::RecvMsg => S::handle_recvmsg(
                 self,
-                id,
+                socket,
                 metadata
                     .get(1)
                     .map(|x| MsgFlags(*x as _))
@@ -353,7 +353,7 @@ impl<'sock, S: Socket> SchemeSync for UdsScheme<'sock, S> {
             b"listen" => S::handle_listen(self, id, ctx),
             b"connect" => S::handle_connect_socketpair(self, id, ctx),
             // listen will generate a id for same socket
-            b"recvfd" => S::handle_recvfd(self, id),
+            b"recvfd" => self.get_socket(id)?.borrow_mut().handle_recvfd(),
             _ => Err(Error::new(EINVAL)),
         }
     }

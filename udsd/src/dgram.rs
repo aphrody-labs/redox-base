@@ -352,18 +352,20 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_sendmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         _msg_flags: MsgFlags,
         msg_stream: &[u8],
         ctx: &CallerCtx,
     ) -> Result<usize> {
         if msg_stream.is_empty() {
-            eprintln!("handle_sendmsg(id: {}): msg_stream is empty.", id);
+            eprintln!(
+                "handle_sendmsg(id: {}): msg_stream is empty.",
+                socket_rc.borrow().primary_id
+            );
             return Err(Error::new(EINVAL));
         }
 
-        let socket_rc = scheme.get_socket(id)?;
         let name = socket_rc.borrow().path.clone();
         let (remote_id, remote_rc) = Self::get_connected_peer(scheme, socket_rc)?;
 
@@ -379,12 +381,11 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_recvmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         _msg_flags: MsgFlags,
         msg_stream: &mut [u8],
     ) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
         let mut socket = socket_rc.borrow_mut();
 
         if let Some(message) = socket.messages.pop_front() {
@@ -486,10 +487,8 @@ impl super::scheme::Socket for Socket {
         })
     }
 
-    fn handle_recvfd(scheme: &mut UdsScheme<Self>, id: usize) -> Result<OpenResult> {
-        let socket_rc = scheme.get_socket(id)?;
-        let mut socket = socket_rc.borrow_mut();
-        let fd = socket.fds.pop_front().ok_or(Error::new(EWOULDBLOCK))?;
+    fn handle_recvfd(&mut self) -> Result<OpenResult> {
+        let fd = self.fds.pop_front().ok_or(Error::new(EWOULDBLOCK))?;
 
         Ok(OpenResult::OtherScheme { fd })
     }

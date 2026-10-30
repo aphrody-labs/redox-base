@@ -658,8 +658,8 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_sendmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket: &RefCell<Self>,
         msg_flags: MsgFlags,
         msg_stream: &[u8],
         ctx: &CallerCtx,
@@ -670,7 +670,6 @@ impl super::scheme::Socket for Socket {
         }
 
         let (bytes_written, remote_id) = {
-            let socket = scheme.get_socket(id)?;
             let name = socket.borrow().path.clone();
             let (remote_id, remote_rc) = Socket::get_connected_peer(scheme, socket)?;
             let mut socket = remote_rc.borrow_mut();
@@ -701,12 +700,11 @@ impl super::scheme::Socket for Socket {
     }
 
     fn handle_recvmsg(
-        scheme: &mut UdsScheme<Self>,
-        id: usize,
+        scheme: &UdsScheme<Self>,
+        socket_rc: &RefCell<Self>,
         msg_flags: MsgFlags,
         msg_stream: &mut [u8],
     ) -> Result<usize> {
-        let socket_rc = scheme.get_socket(id)?;
         let mut socket = socket_rc.borrow_mut();
         let flags = socket.flags;
         let connection = match &mut socket.state {
@@ -829,13 +827,10 @@ impl super::scheme::Socket for Socket {
         })
     }
 
-    fn handle_recvfd(scheme: &mut UdsScheme<Self>, id: usize) -> Result<OpenResult> {
-        let socket_rc = scheme.get_socket(id)?;
-        let mut socket = socket_rc.borrow_mut();
-
-        match socket.state {
+    fn handle_recvfd(&mut self) -> Result<OpenResult> {
+        match self.state {
             State::Established | State::Accepted => {
-                let connection = socket.require_connected_connection(MsgFlags::default())?;
+                let connection = self.require_connected_connection(MsgFlags::default())?;
                 let fd = connection.fds.pop_front().ok_or(Error::new(EWOULDBLOCK))?;
                 Ok(OpenResult::OtherScheme { fd })
             }
